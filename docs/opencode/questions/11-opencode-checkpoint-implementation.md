@@ -72,6 +72,28 @@ checkpoint 直接嵌入在单轮处理器里（`SessionProcessor`）：
 - 配置可通过 `cfg.snapshot === false` 关闭
 - `acp` 客户端路径下会跳过 snapshot 逻辑
 
+## 7) Shadow Git 实现流程（含是否依赖本地 git）
+
+### 流程拆解
+
+1. 项目初始化时，opencode 先向上查找 `.git` 目录，识别当前项目是否是 git 项目  
+2. 如果是 git 项目，创建/复用 shadow git 目录：`<data>/snapshot/<project.id>`  
+3. 每次 step 开始时执行 `track`：`git add .` + `git write-tree`，得到 checkpoint hash  
+4. 每次 step 结束时执行 `patch`：`git diff --name-only <hash> -- .`，得到变更文件列表  
+5. 用户触发 revert 时，按 patch 顺序执行 `git checkout <hash> -- <file>` 恢复文件  
+6. 用户触发 unrevert 时，执行 `read-tree + checkout-index` 回到 revert 前整体状态  
+
+### 是否需要本地 git 环境
+
+- **需要。** Shadow Git 是通过调用本地 `git` 命令实现的（不是内置纯 TS 实现）。  
+- 若本机没有可用 git，项目会降级为 `fake_vcs/global` 路径，snapshot/checkpoint/revert 相关能力不可用。  
+- 即使项目目录里有 `.git`，若执行 `git` 命令失败，也无法完成 checkpoint 流程。
+
+### 快速自检建议
+
+- `git --version`（确认本机可执行 git）
+- 在项目目录执行 `git rev-parse --show-toplevel`（确认仓库可识别）
+
 ---
 
 一句话总结：**opencode 的 checkpoint 本质是“每个 step 的 tree hash + patch 记录 + 会话级 revert 协调”的 shadow-git 机制。**
