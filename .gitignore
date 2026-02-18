@@ -4,4 +4,27 @@ codex/
 opencode/
 .DS_Store
 
+!docs/kimi-cli
+!docs/gemini-cli
+!docs/codex
+!docs/opencode
 
+.env
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Distribution
+build/
+dist/
+*.egg-info/
