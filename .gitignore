@@ -2,13 +2,14 @@ kimi-cli/
 gemini-cli/
 codex/
 opencode/
+SWE-agent/
 .DS_Store
 
 !docs/kimi-cli
 !docs/gemini-cli
 !docs/codex
 !docs/opencode
-
+!docs/SWE-agent
 .env
 
 # Python bytecode
