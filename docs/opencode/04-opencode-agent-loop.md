@@ -1,11 +1,208 @@
 # Agent Loop（opencode）
 
-本文基于 `opencode` 源码实现，说明 opencode 如何将「模型流式输出 + 工具调用 + 任务编排 + 上下文压缩」组织成一个可控的 Agent Loop。  
+本文基于 `opencode` 源码实现，说明 opencode 如何将「模型流式输出 + 工具调用 + 任务编排 + 上下文压缩」组织成一个可控的 Agent Loop。
 目标读者是开发者，重点在架构原理与关键控制点。
 
 ---
 
-## 1. Agent Loop 的核心定义
+## 1. 先看全局（流程图）
+
+### 1.1 主路径流程图
+
+```text
++------------------------+
+| SessionPrompt.prompt() |
++-----------+------------+
+            |
+            v
++------------------------+
+| createUserMessage()    |
+| - 写入 DB              |
+| - 广播 Bus 事件        |
++-----------+------------+
+            |
+            v
++------------------------+
+| loop() while(true)     |
++-----------+------------+
+            |
+            v
++------------------------+
+| 从 DB 读取消息流       |
+| - 定位 lastUser        |
+| - 定位 lastFinished    |
+| - 定位 tasks           |
++-----------+------------+
+            |
+            v
++------------------------+
+| 退出条件检查           |
+| (finish reason 检查)   |
++-----------+------------+
+       Yes  |          No
+            v           |
+    +-------+--------+  |
+    | return 结束     |<-+
+    +-----------------+
+            |
+            v
++------------------------+
+| tasks 分支判断         |
++-----------+------------+
+            |
+    +-------+--------+--------+
+    v       v                v
+ Subtask  Compaction      Normal
+ (3.1)     (3.2)          (3.3)
+    |       |                |
+    +-------+--------+--------+
+                     |
+                     v
+         +-----------+-----------+
+         | SessionProcessor.process()
+         | - LLM.stream()        |
+         | - 处理工具调用         |
+         +-----------+-----------+
+                     |
+                     v
+         +-----------+-----------+
+         | 处理 finish reason    |
+         | - continue/stop/compact|
+         +-----------------------+
+                     |
+                     v
+         +-----------+-----------+
+         | 回到 loop() 头部      |
+         +-----------------------+
+```
+
+### 1.2 关键分支流程图
+
+```text
+[A] Subtask 分支（子 Agent 派发）
+
+task.type === "subtask"
+  |
+  v
+创建 assistant 消息 (mode: task.agent)
+  |
+  v
+记录 tool Part (type = TaskTool)
+  |
+  v
+TaskTool.execute()
+  |
+  +-- 创建独立 Session/消息链
+  |
+  v
+记录执行结果 (completed/error)
+  |
+  v
+有 command? --Yes--> 追加合成用户消息
+  |
+  v
+continue (回到 loop 头部)
+
+
+[B] Compaction 分支（上下文压缩）
+
+task.type === "compaction"
+  |
+  v
+SessionCompaction.process()
+  |
+  +-- compaction agent 读入历史
+  |
+  +-- 生成结构化摘要
+      (目标/进展/相关文件)
+  |
+  v
+写入 assistant 消息 (summary: true)
+  |
+  v
+auto: true? --Yes--> 注入 "Continue..."
+  |
+  v
+"continue" (回到 loop 头部)
+  |
+  +-- 此后 filterCompacted
+      跳过被压缩的历史
+
+
+[C] Doom Loop 检测分支
+
+processor.ts tool-call 事件
+  |
+  v
+检查最近 3 个 tool Part:
+  - type === "tool"
+  - tool 名相同
+  - input 完全相同
+  - status !== "pending"
+  |
+  +-- 命中? --Yes--> PermissionNext.ask({ permission: "doom_loop" })
+       |
+       v
+  用户选择: 继续 / 终止
+
+
+[D] 权限拒绝分支
+
+工具执行
+  |
+  v
+PermissionNext.RejectedError?
+  |
+  +-- Yes
+       |
+       v
+  blocked = true
+       |
+       v
+  process() returns "stop"
+       |
+       v
+  主循环退出
+
+
+[E] Normal 分支（正常推理）
+
+无待处理任务
+  |
+  v
+Agent 解析 + steps 上限检查
+  |
+  v
+insertReminders() 注入提示词
+  |
+  v
+resolveTools() 合并并过滤工具
+  |
+  v
+SessionProcessor.process()
+  |
+  v
+根据返回值决策:
+  - "continue" -> 继续 loop
+  - "stop"     -> 退出 loop
+  - "compact"  -> 创建 compaction 任务
+```
+
+---
+
+## 2. 阅读路径（30 秒 / 3 分钟 / 10 分钟）
+
+- **30 秒版**：只看 `1.1` + `2.1`（知道主循环是 while(true)，按 finish reason 退出）。
+- **3 分钟版**：看 `1.1` + `1.2` + `3` + `4`（知道 subtask/compaction/doom loop 分支）。
+- **10 分钟版**：通读 `3~11`（能定位工具不执行、不继续、context 变短等问题）。
+
+### 2.1 一句话定义
+
+opencode 的 Agent Loop 是"**任务驱动的多分支循环**"：主循环从消息流中定位任务，按优先级走 subtask/compaction/normal 分支；单轮流解析模型输出并处理工具；根据 finish reason 和状态决定继续、停止或压缩上下文。
+
+---
+
+## 3. Agent Loop 的核心定义
 
 在 opencode 中，**一次用户请求并不等于一次模型调用**。  
 只要模型持续发出工具调用（finish reason 为 `tool-calls`），系统就会：
@@ -24,9 +221,9 @@
 
 ---
 
-## 2. 从哪里进入循环
+## 4. 从哪里进入循环
 
-### 2.1 外部入口
+### 4.1 外部入口
 
 用户输入经过 CLI/UI 后，调用 `SessionPrompt.prompt()`：
 
@@ -34,7 +231,7 @@
 2. 若有文件附件、MCP 资源等，在此阶段展开并转为 `Part`；
 3. 若 `noReply === true` 则直接返回，否则调用 `loop({ sessionID })`。
 
-### 2.2 Loop 本体
+### 4.2 Loop 本体
 
 `loop()` 是一个无限 `while (true)` 循环，每次迭代：
 
@@ -52,11 +249,11 @@ lastAssistant.finish 存在
 
 ---
 
-## 3. Loop 内部的三条分支路径
+## 5. Loop 内部的三条分支路径
 
 每次迭代从 `tasks` 中取出待处理任务，按优先级依次判断：
 
-### 3.1 Subtask 分支（子 Agent 派发）
+### 5.1 Subtask 分支（子 Agent 派发）
 
 若取出 `task.type === "subtask"`，表示有待执行的子 Agent 任务：
 
@@ -68,7 +265,7 @@ lastAssistant.finish 存在
 
 子 Agent 的类型由 `task.agent`（如 `"explore"`、`"general"`）决定，其权限由该 agent 的 `PermissionNext.Ruleset` 控制。
 
-### 3.2 Compaction 分支（上下文压缩）
+### 5.2 Compaction 分支（上下文压缩）
 
 若取出 `task.type === "compaction"`，调用 `SessionCompaction.process()`：
 
@@ -78,7 +275,7 @@ lastAssistant.finish 存在
 4. 自动压缩（`auto: true`）场景下，注入一条合成用户消息："Continue if you have next steps..."；
 5. 返回 `"continue"` 后，主循环继续——此后历史消息的过滤器（`filterCompacted`）会跳过被压缩轮次之前的消息，实现滑动窗口效果。
 
-### 3.3 Normal 分支（正常模型推理）
+### 5.3 Normal 分支（正常模型推理）
 
 无待处理任务时，进入正常推理流程：
 
@@ -91,11 +288,11 @@ lastAssistant.finish 存在
 
 ---
 
-## 4. SessionProcessor：单轮流解析
+## 6. SessionProcessor：单轮流解析
 
 `SessionProcessor.create()` 返回一个带状态的对象，其 `process()` 方法内有一个内层 `while (true)` 循环，逐一处理 `LLM.stream()` 的全量事件流（`fullStream`）。
 
-### 4.1 事件处理映射
+### 6.1 事件处理映射
 
 | 事件类型 | 动作 |
 |---|---|
@@ -110,7 +307,7 @@ lastAssistant.finish 存在
 | `text-start/delta/end` | 维护 `text` Part，实时广播 delta，完成后触发 plugin hook |
 | `error` | 抛出异常，进入 catch 分支 |
 
-### 4.2 返回值含义
+### 6.2 返回值含义
 
 `process()` 返回三个字符串之一，交由 `loop()` 决策：
 
@@ -120,7 +317,7 @@ lastAssistant.finish 存在
 
 ---
 
-## 5. LLM 流封装
+## 7. LLM 流封装
 
 `LLM.stream()` 负责把 opencode 的逻辑层参数转成 AI SDK 的 `streamText()` 调用：
 
@@ -133,11 +330,11 @@ lastAssistant.finish 存在
 
 ---
 
-## 6. Agent 系统
+## 8. Agent 系统
 
 opencode 内置了若干预设 agent，通过配置文件可自定义扩展。
 
-### 6.1 内置 Agent
+### 8.1 内置 Agent
 
 | Agent | 模式 | 核心用途 |
 |---|---|---|
@@ -149,7 +346,7 @@ opencode 内置了若干预设 agent，通过配置文件可自定义扩展。
 | `title` | primary（hidden） | 自动生成会话标题，轻量模型 |
 | `summary` | primary（hidden） | 生成会话摘要 |
 
-### 6.2 Plan 模式工作流（实验性）
+### 8.2 Plan 模式工作流（实验性）
 
 当 `OPENCODE_EXPERIMENTAL_PLAN_MODE` 开启时，plan agent 的 `insertReminders` 会注入一套五阶段工作流 prompt：
 
@@ -161,15 +358,15 @@ opencode 内置了若干预设 agent，通过配置文件可自定义扩展。
 
 ---
 
-## 7. 终止与保护机制
+## 9. 终止与保护机制
 
-### 7.1 正常终止
+### 9.1 正常终止
 
 - 模型 finish reason 为 `stop` / `length` / `content-filter`（非 `tool-calls`/`unknown`）；
 - agent 设置了 `steps` 上限（如 `steps: 5`），达到上限时注入 `MAX_STEPS` 提示并强制不再提供工具；
 - `StructuredOutput` 工具被成功调用，立即退出并存储结构化结果。
 
-### 7.2 Doom Loop 检测
+### 9.2 Doom Loop 检测
 
 `processor.ts` 中，每次 `tool-call` 事件触发时，检查当前 assistant 消息的最近 3 个 tool Part：
 
@@ -183,19 +380,19 @@ opencode 内置了若干预设 agent，通过配置文件可自定义扩展。
 
 命中时调用 `PermissionNext.ask({ permission: "doom_loop", ... })`，用户可选择继续或终止。
 
-### 7.3 权限拒绝处理
+### 9.3 权限拒绝处理
 
 工具执行被拒绝（`PermissionNext.RejectedError` 或 `Question.RejectedError`）时：
 - `blocked = true`（除非配置了 `experimental.continue_loop_on_deny`）；
 - 本轮结束后 `process()` 返回 `"stop"`，主循环退出。
 
-### 7.4 用户中断
+### 9.4 用户中断
 
 `AbortController.signal` 贯穿整条链路。主循环每次迭代开头检查 `abort.aborted`，`LLM.stream` 每次 `fullStream` 迭代也调用 `abort.throwIfAborted()`。调用 `SessionPrompt.cancel()` 即可随时中止。
 
 ---
 
-## 8. 重试策略
+## 10. 重试策略
 
 `SessionRetry` 负责处理 API 错误的退避重试：
 
@@ -206,7 +403,7 @@ opencode 内置了若干预设 agent，通过配置文件可自定义扩展。
 
 ---
 
-## 9. 上下文压缩策略（Compaction）
+## 11. 上下文压缩策略（Compaction）
 
 `SessionCompaction` 提供两种机制控制 token 消耗：
 
@@ -226,7 +423,7 @@ opencode 内置了若干预设 agent，通过配置文件可自定义扩展。
 
 ---
 
-## 10. 一个简化时序
+## 12. 一个简化时序
 
 一次典型"会调用多个工具"的请求路径：
 
@@ -253,7 +450,7 @@ opencode 内置了若干预设 agent，通过配置文件可自定义扩展。
 
 ---
 
-## 11. 架构特点总结
+## 13. 架构特点总结
 
 opencode 的 Agent Loop 设计目标是「可持续推进 + 多 Agent 协作 + 安全可控 + 上下文韧性」：
 

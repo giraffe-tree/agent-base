@@ -2,8 +2,189 @@
 
 本文基于 `kimi-cli` 源码，说明一次用户请求进入后，Agent loop 如何驱动 LLM、工具调用、审批、上下文演进与结束判定。
 
+---
 
-## 1. 在哪里开始
+## 1. 先看全局（流程图）
+
+### 1.1 主路径流程图
+
+```text
++------------------------+
+| KimiSoul.run(user_input)
+| - 刷新 OAuth token
+| - 发送 TurnBegin 事件
++-----------+------------+
+            |
+            v
++------------------------+
+| slash command 检查     |
++-----------+------------+
+       |是command          |普通输入
+       v                  v
++----------------+   +------------------+
+| 走 command 处理 |   | max_ralph?       |
++----------------+   +--------+---------+
+                            |
+           +----------------+----------------+
+           |Yes                              |No
+           v                                 v
+  +--------+--------+                +--------+--------+
+  | Ralph 自动循环   |                | _turn() 创建    |
+  | FlowRunner       |                | checkpoint      |
+  +-----------------+                +--------+--------+
+                                              |
+                                              v
+                                     +--------+--------+
+                                     | 用户消息 append |
+                                     +--------+--------+
+                                              |
+                                              v
+                                     +--------+--------+
+                                     | _agent_loop()   |
+                                     | while 循环开始  |
+                                     +--------+--------+
+                                              |
+                                              v
+                              +---------------+---------------+
+                              | step_no += 1                  |
+                              | 检查 max_steps_per_turn       |
+                              +---------------+---------------+
+                                              |
+                                              v
+                              +---------------+---------------+
+                              | _step() 调用 kosong.step()    |
+                              | - LLM 推理 + 工具执行          |
+                              +---------------+---------------+
+                                              |
+                                              v
+                              +---------------+---------------+
+                              | _grow_context() 更新上下文    |
+                              | - append assistant 消息        |
+                              | - append tool results          |
+                              +---------------+---------------+
+                                              |
+                                              v
+                              +---------------+---------------+
+                              | 有 tool calls?                |
+                              +---------------+---------------+
+                                   Yes  |          No
+                                       v           |
+                               继续 loop  <---------+
+                                       |
+                                       v
+                               +-------+--------+
+                               | TurnEnd 事件    |
+                               +-----------------+
+```
+
+### 1.2 关键分支流程图
+
+```text
+[A] Context Compaction 分支
+
+_agent_loop() step 前
+  |
+  +-- 检查 token 预算
+       |
+       +-- context.token_count + reserved >= model.max_context_size?
+            |
+            +-- Yes
+                 |
+                 v
+            compact_context()
+                 |
+                 +-- CompactionBegin
+                 +-- 生成压缩消息(带重试)
+                 +-- 清空 context，建立新 checkpoint
+                 +-- append 压缩消息
+                 +-- CompactionEnd
+                 |
+                 v
+            继续 step
+
+
+[B] BackToTheFuture 分支（D-Mail）
+
+_step() 执行中
+  |
+  +-- DenwaRenji 有 pending D-Mail?
+       |
+       +-- Yes
+            |
+            v
+       抛出 BackToTheFuture(checkpoint_id, messages)
+            |
+            v
+       _agent_loop() 捕获
+            |
+            v
+       context.revert_to(checkpoint_id)
+            |
+            v
+       新建 checkpoint
+            |
+            v
+       append 注入消息(系统提示 + D-Mail)
+            |
+            v
+       继续 loop（改道执行）
+
+
+[C] Ralph 模式分支
+
+KimiSoul.run()
+  |
+  +-- max_ralph_iterations != 0?
+       |
+       +-- Yes
+            |
+            v
+       FlowRunner.ralph_loop(user_message, max_ralph_iterations)
+            |
+            v
+       动态构造流程：BEGIN -> R1(任务) -> R2(决策) -> CONTINUE/STOP
+            |
+            +-- R2 判定 CONTINUE -> 继续下一轮
+            |
+            +-- R2 判定 STOP -> 结束
+
+
+[D] 错误处理分支
+
+_step() 调用 kosong.step()
+  |
+  +-- 网络/超时/空响应?
+  |    |
+  |    +-- tenacity 重试(指数退避)
+  |
+  +-- HTTP 429/500/502/503?
+  |    |
+  |    +-- tenacity 重试
+  |
+  +-- step 异常?
+       |
+       v
+  发 StepInterrupted
+       |
+       v
+  终止当前 turn(异常上抛)
+```
+
+---
+
+## 2. 阅读路径（30 秒 / 3 分钟 / 10 分钟）
+
+- **30 秒版**：只看 `1.1` + `2.1`（知道 turn 内多 step 循环，无 tool calls 时结束）。
+- **3 分钟版**：看 `1.1` + `1.2` + `3` + `4`（知道 compaction、D-Mail 回滚、Ralph 模式）。
+- **10 分钟版**：通读 `3~9`（能定位 step 不继续、context 不增长等问题）。
+
+### 2.1 一句话定义
+
+Kimi CLI 的 Agent Loop 是“**可回滚的 step 循环**”：每次 step 包含 LLM 推理和工具执行；工具结果回注后继续 step；通过 checkpoint + revert 实现上下文回滚；直到无 tool calls 或达到 step 上限。
+
+---
+
+## 3. 在哪里开始
 
 `KimiCLI.create()` 完成 runtime、agent、context 初始化后，创建 `KimiSoul` 实例。  
 真正的“每次用户输入执行”从 `KimiSoul.run(user_input)` 开始。
@@ -18,7 +199,7 @@
 
 ---
 
-## 2. Turn 与 Step 的关系
+## 4. Turn 与 Step 的关系
 
 在 Kimi CLI 里：
 
@@ -34,11 +215,11 @@
 
 ---
 
-## 3. `_agent_loop()` 主循环
+## 5. `_agent_loop()` 主循环
 
 `_agent_loop()` 是每个 turn 的核心 while-loop。它会不断执行 step，直到满足停止条件。
 
-### 3.1 循环前置
+### 5.1 循环前置
 
 - 若 toolset 是 `KimiToolset`，先等待 MCP tools 就绪（`wait_for_mcp_tools`）
 - 启动审批转发协程 `_pipe_approval_to_wire()`：
@@ -49,7 +230,7 @@
 
 这层转发把“tool 执行审批”与“UI 展示审批”解耦。
 
-### 3.2 每次 step 的执行框架
+### 5.2 每次 step 的执行框架
 
 每轮循环都会：
 
@@ -64,7 +245,7 @@
 - 发 `StepInterrupted`
 - 终止当前 turn（异常上抛）
 
-### 3.3 context 压缩触发
+### 5.3 context 压缩触发
 
 step 前会判断 token 预算：
 
@@ -81,11 +262,11 @@ step 前会判断 token 预算：
 
 ---
 
-## 4. `_step()` 内部：一次完整 agent step
+## 6. `_step()` 内部：一次完整 agent step
 
 `_step()` 负责“向 LLM 发起一步 + 执行工具 + 更新上下文 + 决定是否继续”。
 
-### 4.1 调用 kosong.step（含重试）
+### 6.1 调用 kosong.step（含重试）
 
 使用 tenacity 包装 `kosong.step(...)`，可重试错误包括：
 
@@ -103,7 +284,7 @@ step 前会判断 token 预算：
 
 因此 UI 可以流式看到模型输出和工具结果。
 
-### 4.2 token 与状态更新
+### 6.2 token 与状态更新
 
 拿到 `StepResult` 后会：
 
@@ -111,7 +292,7 @@ step 前会判断 token 预算：
 - 用 `usage.input` 更新 step 前 token 估算
 - 计算并回填 context usage（占模型窗口比例）
 
-### 4.3 收集工具结果并增长上下文
+### 6.3 收集工具结果并增长上下文
 
 `await result.tool_results()` 会等待本 step 所有工具调用完成。  
 随后 `_grow_context(result, results)`（受 `asyncio.shield` 保护）：
@@ -122,7 +303,7 @@ step 前会判断 token 预算：
 
 `shield` 的意义是：即使外层被打断，也尽量保证“上下文演进”不被中途中断，避免状态不一致。
 
-### 4.4 step 停止条件
+### 6.4 step 停止条件
 
 `_step()` 有 3 种结果：
 
@@ -132,7 +313,7 @@ step 前会判断 token 预算：
 
 ---
 
-## 5. D-Mail 与“回到未来”（BackToTheFuture）
+## 7. D-Mail 与"回到未来"（BackToTheFuture）
 
 在 `_step()` 里若 `DenwaRenji` 有 pending D-Mail，会抛出 `BackToTheFuture(checkpoint_id, messages)`。
 
@@ -146,7 +327,7 @@ step 前会判断 token 预算：
 
 ---
 
-## 6. Ralph 模式（自动循环）
+## 8. Ralph 模式（自动循环）
 
 当 `max_ralph_iterations != 0` 时，`run()` 不走普通单次 `_turn(user_message)`，而是：
 
@@ -162,7 +343,7 @@ step 前会判断 token 预算：
 
 ---
 
-## 7. 一个简化时序
+## 9. 一个简化时序
 
 一次普通 turn 的主路径可概括为：
 
@@ -175,7 +356,7 @@ step 前会判断 token 预算：
 
 ---
 
-## 8. 关键控制参数
+## 10. 关键控制参数
 
 这些参数直接影响 loop 行为：
 
@@ -186,7 +367,7 @@ step 前会判断 token 预算：
 
 ---
 
-## 9. 总结
+## 11. 总结
 
 Kimi CLI 的 Agent loop 本质是一个“**可中断、可回滚、可扩展**”的 step 循环：
 

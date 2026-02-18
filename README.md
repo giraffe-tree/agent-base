@@ -9,7 +9,7 @@
 
 > 当前研究基线：所有上游仓库均来自 2026-02-08 从 GitHub clone 的当时最新分支。
 
-## 初始化
+## 初始化(可选)
 
 ```bash
 # export ALL_PROXY=http://localhost:7890
