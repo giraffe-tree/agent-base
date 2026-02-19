@@ -10,6 +10,9 @@ SWE-agent/
 !docs/codex
 !docs/opencode
 !docs/SWE-agent
+
+.claude
+.cursor
 .env
 
 # Python bytecode
