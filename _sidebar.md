@@ -1,15 +1,98 @@
 - **快速开始**
   - [项目介绍](/README.md)
 
-- **Codex CLI (Rust)**
-  - [Agent Loop 机制](docs/codex/04-codex-agent-loop.md)
-  - [MCP 集成](docs/codex/06-codex-mcp-integration.md)
-
 - **跨项目对比**
+  - [CLI 入口](docs/comm/02-comm-cli-entry.md)
+  - [Session 运行时](docs/comm/03-comm-session-runtime.md)
   - [Agent Loop 共性](docs/comm/04-comm-agent-loop.md)
+  - [Tools 系统](docs/comm/05-comm-tools-system.md)
+  - [MCP 集成](docs/comm/06-comm-mcp-integration.md)
+  - [Memory Context](docs/comm/07-comm-memory-context.md)
+  - [UI 交互](docs/comm/08-comm-ui-interaction.md)
+  - [Web Server](docs/comm/09-comm-web-server.md)
+  - [Safety Control](docs/comm/10-comm-safety-control.md)
 
-- **其他项目**
-  - [Gemini CLI](docs/gemini-cli/01-gemini-cli-overview.md)
-  - [OpenCode](docs/opencode/01-opencode-overview.md)
-  - [Kimi CLI](docs/kimi-cli/01-kimi-cli-overview.md)
-  - [SWE-agent](docs/swe-agent/01-swe-agent-overview.md)
+- **Codex CLI (Rust)**
+  - [概览](docs/codex/01-codex-overview.md)
+  - [CLI 入口](docs/codex/02-codex-cli-entry.md)
+  - [Session 运行时](docs/codex/03-codex-session-runtime.md)
+  - [Agent Loop](docs/codex/04-codex-agent-loop.md)
+  - [Tools 系统](docs/codex/05-codex-tools-system.md)
+  - [MCP 集成](docs/codex/06-codex-mcp-integration.md)
+  - [Memory Context](docs/codex/07-codex-memory-context.md)
+  - [UI 交互](docs/codex/08-codex-ui-interaction.md)
+  - [Web Server](docs/codex/09-codex-web-server.md)
+  - [Safety Control](docs/codex/10-codex-safety-control.md)
+  - [Prompt 组织](docs/codex/11-codex-prompt-organization.md)
+  - **Questions**
+    - [并发 Tool 调用](docs/codex/questions/codex-tool-call-concurrency.md)
+    - [用户编辑冲突回退](docs/codex/questions/codex-revert-user-edit-conflict.md)
+
+- **Gemini CLI**
+  - [概览](docs/gemini-cli/01-gemini-cli-overview.md)
+  - [CLI 入口](docs/gemini-cli/02-gemini-cli-cli-entry.md)
+  - [Session 运行时](docs/gemini-cli/03-gemini-cli-session-runtime.md)
+  - [Session 管理](docs/gemini-cli/02-gemini-cli-session-management.md)
+  - [Agent Loop](docs/gemini-cli/04-gemini-cli-agent-loop.md)
+  - [Tools 系统](docs/gemini-cli/05-gemini-cli-tools-system.md)
+  - [MCP 集成](docs/gemini-cli/06-gemini-cli-mcp-integration.md)
+  - [Memory Context](docs/gemini-cli/07-gemini-cli-memory-context.md)
+  - [UI 交互](docs/gemini-cli/08-gemini-cli-ui-interaction.md)
+  - [Web Server](docs/gemini-cli/09-gemini-cli-web-server.md)
+  - [Safety Control](docs/gemini-cli/10-gemini-cli-safety-control.md)
+  - [Prompt 组织](docs/gemini-cli/11-gemini-cli-prompt-organization.md)
+  - **Questions**
+    - [并发 Tool 调用](docs/gemini-cli/questions/gemini-cli-tool-call-concurrency.md)
+    - [用户编辑冲突回退](docs/gemini-cli/questions/gemini-cli-revert-user-edit-conflict.md)
+
+- **OpenCode**
+  - [概览](docs/opencode/01-opencode-overview.md)
+  - [CLI 入口](docs/opencode/02-opencode-cli-entry.md)
+  - [Session 运行时](docs/opencode/03-opencode-session-runtime.md)
+  - [Session 管理](docs/opencode/02-opencode-session-management.md)
+  - [Agent Loop](docs/opencode/04-opencode-agent-loop.md)
+  - [Tools 系统](docs/opencode/05-opencode-tools-system.md)
+  - [MCP 集成](docs/opencode/06-opencode-mcp-integration.md)
+  - [Memory Context](docs/opencode/07-opencode-memory-context.md)
+  - [UI 交互](docs/opencode/08-opencode-ui-interaction.md)
+  - [Web Server](docs/opencode/09-opencode-web-server.md)
+  - [Safety Control](docs/opencode/10-opencode-safety-control.md)
+  - [Prompt 组织](docs/opencode/11-opencode-prompt-organization.md)
+  - **Questions**
+    - [并发 Tool 调用](docs/opencode/questions/opencode-tool-call-concurrency.md)
+    - [Checkpoint 实现](docs/opencode/questions/opencode-checkpoint-implementation.md)
+    - [用户编辑冲突回退](docs/opencode/questions/opencode-revert-user-edit-conflict.md)
+
+- **Kimi CLI**
+  - [概览](docs/kimi-cli/01-kimi-cli-overview.md)
+  - [CLI 入口](docs/kimi-cli/02-kimi-cli-cli-entry.md)
+  - [Session 运行时](docs/kimi-cli/03-kimi-cli-session-runtime.md)
+  - [Session 管理](docs/kimi-cli/02-kimi-cli-session-management.md)
+  - [Agent Loop](docs/kimi-cli/04-kimi-cli-agent-loop.md)
+  - [Tools 系统](docs/kimi-cli/05-kimi-cli-tools-system.md)
+  - [MCP 集成](docs/kimi-cli/06-kimi-cli-mcp-integration.md)
+  - [Memory Context](docs/kimi-cli/07-kimi-cli-memory-context.md)
+  - [UI 交互](docs/kimi-cli/08-kimi-cli-ui-interaction.md)
+  - [Web Server](docs/kimi-cli/09-kimi-cli-web-server.md)
+  - [Safety Control](docs/kimi-cli/10-kimi-cli-safety-control.md)
+  - [Prompt 组织](docs/kimi-cli/11-kimi-cli-prompt-organization.md)
+  - **Questions**
+    - [并发 Tool 调用](docs/kimi-cli/questions/kimi-cli-tool-call-concurrency.md)
+    - [Checkpoint 实现](docs/kimi-cli/questions/kimi-cli-checkpoint-implementation.md)
+    - [Checkpoint 无文件回滚权衡](docs/kimi-cli/questions/kimi-cli-checkpoint-no-file-rollback-tradeoffs.md)
+    - [用户编辑冲突回退](docs/kimi-cli/questions/kimi-cli-revert-user-edit-conflict.md)
+
+- **SWE-agent**
+  - [概览](docs/swe-agent/01-swe-agent-overview.md)
+  - [CLI 入口](docs/swe-agent/02-swe-agent-cli-entry.md)
+  - [Session 管理](docs/swe-agent/02-swe-agent-session-management.md)
+  - [Agent Loop](docs/swe-agent/04-swe-agent-agent-loop.md)
+  - [Tools 系统](docs/swe-agent/05-swe-agent-tools-system.md)
+  - [MCP 集成](docs/swe-agent/06-swe-agent-mcp-integration.md)
+  - [Memory Context](docs/swe-agent/07-swe-agent-memory-context.md)
+  - [Web Server](docs/swe-agent/09-swe-agent-web-server.md)
+  - [Safety Control](docs/swe-agent/10-swe-agent-safety-control.md)
+  - [Prompt 组织](docs/swe-agent/11-swe-agent-prompt-organization.md)
+  - **Questions**
+    - [并发 Tool 调用](docs/swe-agent/questions/swe-agent-tool-call-concurrency.md)
+    - [用户编辑冲突回退](docs/swe-agent/questions/swe-agent-revert-user-edit-conflict.md)
