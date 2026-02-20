@@ -1,8 +1,8 @@
 # AI Coding Agent 源码深度解析
 
-[研究项目](./docs)
-[研究基线](./docs)
-[覆盖项目](./docs)
+[![研究项目](https://img.shields.io/badge/类型-源码研究-blue)](./docs)
+[![研究基线](https://img.shields.io/badge/基线-2026--02--08-green)](./docs)
+[![覆盖项目](https://img.shields.io/badge/覆盖-5个主流Agent-orange)](./docs)
 
 > **面向谁？** 想深入理解 AI Coding Agent 内部机制的开发者、研究人员、架构师
 >
