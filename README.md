@@ -27,10 +27,10 @@
 
 | 机制             | 一句话说明                     | 入门文档                                                                 |
 | -------------- | ------------------------- | -------------------------------------------------------------------- |
-| **Agent Loop** | 核心执行循环（接收输入→推理→调用工具→返回结果） | `[04-*agent-loop.md](./docs/codex/04-codex-agent-loop.md)`           |
-| **MCP**        | 标准化外部工具接入协议（文件/数据库/API）   | `[06-*mcp-integration.md](./docs/codex/06-codex-mcp-integration.md)` |
-| **Memory**     | 对话历史管理、Token 压缩、持久化策略     | `[07-*memory-context.md](./docs/codex/07-codex-memory-context.md)`   |
-| **Safety**     | 权限控制、沙箱隔离、执行审批            | `[10-*safety-control.md](./docs/codex/10-codex-safety-control.md)`   |
+| **Agent Loop** | 核心执行循环（接收输入→推理→调用工具→返回结果） | [04-*agent-loop.md](./docs/codex/04-codex-agent-loop.md)           |
+| **MCP**        | 标准化外部工具接入协议（文件/数据库/API）   | [06-*mcp-integration.md](./docs/codex/06-codex-mcp-integration.md) |
+| **Memory**     | 对话历史管理、Token 压缩、持久化策略     | [07-*memory-context.md](./docs/codex/07-codex-memory-context.md)   |
+| **Safety**     | 权限控制、沙箱隔离、执行审批            | [10-*safety-control.md](./docs/codex/10-codex-safety-control.md)   |
 
 
 ---
@@ -52,12 +52,12 @@
 
 | 你想了解               | 直接看这里                                                                                          |
 | ------------------ | ---------------------------------------------------------------------------------------------- |
-| Agent Loop 如何循环执行？ | `[docs/codex/04-codex-agent-loop.md](./docs/codex/04-codex-agent-loop.md)`                     |
-| 如何安全地执行用户代码？       | `[docs/codex/10-codex-safety-control.md](./docs/codex/10-codex-safety-control.md)`             |
-| Token 超限怎么处理？      | `[docs/codex/07-codex-memory-context.md](./docs/codex/07-codex-memory-context.md)`             |
-| MCP 工具怎么注册调用？      | `[docs/codex/06-codex-mcp-integration.md](./docs/codex/06-codex-mcp-integration.md)`           |
-| Checkpoint/回滚怎么实现？ | `[docs/kimi-cli/07-kimi-cli-memory-context.md](./docs/kimi-cli/07-kimi-cli-memory-context.md)` |
-| 各项目架构对比？           | `[docs/comm/04-comm-agent-loop.md](./docs/comm/04-comm-agent-loop.md)`                         |
+| Agent Loop 如何循环执行？ | [docs/codex/04-codex-agent-loop.md](./docs/codex/04-codex-agent-loop.md)                     |
+| 如何安全地执行用户代码？       | [docs/codex/10-codex-safety-control.md](./docs/codex/10-codex-safety-control.md)             |
+| Token 超限怎么处理？      | [docs/codex/07-codex-memory-context.md](./docs/codex/07-codex-memory-context.md)             |
+| MCP 工具怎么注册调用？      | [docs/codex/06-codex-mcp-integration.md](./docs/codex/06-codex-mcp-integration.md)           |
+| Checkpoint/回滚怎么实现？ | [docs/kimi-cli/07-kimi-cli-memory-context.md](./docs/kimi-cli/07-kimi-cli-memory-context.md) |
+| 各项目架构对比？           | [docs/comm/04-comm-agent-loop.md](./docs/comm/04-comm-agent-loop.md)                         |
 
 
 ---
