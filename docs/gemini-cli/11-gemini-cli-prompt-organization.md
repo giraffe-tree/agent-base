@@ -300,7 +300,228 @@ function getCommandSnippet(command: string): string | null {
 
 ---
 
-## 7. 证据索引
+## 7. 实际示例
+
+### 示例 1：explain 命令 + react-expert 技能
+
+**场景设定**：用户在 React 项目目录下执行 `gemini explain src/components/UserProfile.tsx`，启用了 `react-expert` 技能。
+
+**运行时变量值**：
+```json
+{
+  "cwd": "/home/user/react-app",
+  "availableTools": [
+    {"name": "read", "description": "Read file contents"},
+    {"name": "search", "description": "Search across files"},
+    {"name": "git", "description": "Git operations"}
+  ],
+  "relevantFiles": [
+    "src/components/UserProfile.tsx",
+    "src/types/user.ts",
+    "src/api/user.ts"
+  ],
+  "skills": [
+    {
+      "name": "react-expert",
+      "content": "When working with React code:\n1. Explain component lifecycle and hooks usage\n2. Identify performance optimization opportunities\n3. Suggest modern React patterns (hooks over classes)\n4. Check for accessibility issues"
+    }
+  ],
+  "command": "explain"
+}
+```
+
+**完整渲染结果（发送给模型的 Prompt）**：
+
+```markdown
+You are Gemini, a helpful AI assistant.
+Current time: 2024-01-15T10:30:00.000Z
+Working directory: /home/user/react-app
+
+Always provide clear, concise explanations.
+Use code examples when helpful.
+
+Available tools:
+- read: Read file contents
+- search: Search across files
+- git: Git operations
+
+When working with React code:
+1. Explain component lifecycle and hooks usage
+2. Identify performance optimization opportunities
+3. Suggest modern React patterns (hooks over classes)
+4. Check for accessibility issues
+
+Explain the code in detail:
+- What does this component/function do?
+- What are its props/state?
+- How does it fit into the overall architecture?
+
+Relevant files:
+- src/components/UserProfile.tsx
+- src/types/user.ts
+- src/api/user.ts
+
+---
+
+User command: explain src/components/UserProfile.tsx
+```
+
+---
+
+### 示例 2：refactor 命令
+
+**场景设定**：用户使用 refactor 命令优化一个 JavaScript 函数。
+
+**运行时变量值**：
+```json
+{
+  "cwd": "/home/user/node-app",
+  "availableTools": [
+    {"name": "read", "description": "Read file contents"},
+    {"name": "write", "description": "Write file contents"},
+    {"name": "search", "description": "Search across files"}
+  ],
+  "relevantFiles": [
+    "src/utils/dataProcessor.js"
+  ],
+  "skills": [],
+  "command": "refactor"
+}
+```
+
+**完整渲染结果（发送给模型的 Prompt）**：
+
+```markdown
+You are Gemini, a helpful AI assistant.
+Current time: 2024-01-15T14:22:00.000Z
+Working directory: /home/user/node-app
+
+Always provide clear, concise explanations.
+Use code examples when helpful.
+
+Available tools:
+- read: Read file contents
+- write: Write file contents
+- search: Search across files
+
+Refactor the code to improve:
+- Readability and maintainability
+- Performance where applicable
+- Modern best practices
+
+Provide the refactored code with explanations of changes made.
+
+Relevant files:
+- src/utils/dataProcessor.js
+
+---
+
+User command: refactor src/utils/dataProcessor.js
+```
+
+---
+
+### 示例 3：无技能模式 vs 技能模式对比
+
+**场景设定**：同一请求，对比无技能和有 python-expert 技能时的 prompt 差异。
+
+**运行时变量值（无技能）**：
+```json
+{
+  "cwd": "/home/user/python-project",
+  "availableTools": [
+    {"name": "read", "description": "Read file contents"},
+    {"name": "bash", "description": "Execute shell commands"}
+  ],
+  "relevantFiles": ["main.py"],
+  "skills": [],
+  "command": "explain"
+}
+```
+
+**完整渲染结果（无技能模式）**：
+
+```markdown
+You are Gemini, a helpful AI assistant.
+Current time: 2024-01-15T09:00:00.000Z
+Working directory: /home/user/python-project
+
+Always provide clear, concise explanations.
+Use code examples when helpful.
+
+Available tools:
+- read: Read file contents
+- bash: Execute shell commands
+
+Explain the code in detail:
+- What does this component/function do?
+- What are its inputs/outputs?
+- How does it work?
+
+Relevant files:
+- main.py
+
+---
+
+User command: explain main.py
+```
+
+**运行时变量值（有 python-expert 技能）**：
+```json
+{
+  "cwd": "/home/user/python-project",
+  "availableTools": [
+    {"name": "read", "description": "Read file contents"},
+    {"name": "bash", "description": "Execute shell commands"}
+  ],
+  "relevantFiles": ["main.py"],
+  "skills": [
+    {
+      "name": "python-expert",
+      "content": "When working with Python code:\n1. Follow PEP 8 style guidelines\n2. Suggest type hints where appropriate\n3. Identify Pythonic patterns and anti-patterns\n4. Consider performance implications of data structure choices\n5. Recommend modern Python features (3.8+) when beneficial"
+    }
+  ],
+  "command": "explain"
+}
+```
+
+**完整渲染结果（有技能模式）**：
+
+```markdown
+You are Gemini, a helpful AI assistant.
+Current time: 2024-01-15T09:00:00.000Z
+Working directory: /home/user/python-project
+
+Always provide clear, concise explanations.
+Use code examples when helpful.
+
+Available tools:
+- read: Read file contents
+- bash: Execute shell commands
+
+When working with Python code:
+1. Follow PEP 8 style guidelines
+2. Suggest type hints where appropriate
+3. Identify Pythonic patterns and anti-patterns
+4. Consider performance implications of data structure choices
+5. Recommend modern Python features (3.8+) when beneficial
+
+Explain the code in detail:
+- What does this component/function do?
+- What are its inputs/outputs?
+- How does it work?
+
+Relevant files:
+- main.py
+
+---
+
+User command: explain main.py
+```
+
+---
+
+## 8. 证据索引
 
 - `gemini-cli` + `gemini-cli/packages/core/src/prompts/snippets.ts` + 核心代码片段定义
 - `gemini-cli` + `gemini-cli/packages/core/src/prompts/prompt_provider.ts` + PromptProvider 类实现
@@ -310,7 +531,7 @@ function getCommandSnippet(command: string): string | null {
 
 ---
 
-## 8. 边界与不确定性
+## 9. 边界与不确定性
 
 - 具体的 snippet 名称和组合顺序需以实码为准
 - 技能系统的元数据格式（Front Matter）需验证

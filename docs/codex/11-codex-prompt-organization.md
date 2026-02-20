@@ -191,7 +191,181 @@ struct TaskPrompt {
 
 ---
 
-## 7. 证据索引
+## 7. 实际示例
+
+### 示例 1：Agent 模式 - Bug 修复
+
+**场景设定**：用户在 `/home/user/my-project` 目录下使用 codex agent 模式，要求修复一个 bug："用户登录时返回 500 错误"。
+
+**运行时变量值**：
+```json
+{
+  "mode": "agent",
+  "cwd": "/home/user/my-project",
+  "files": ["app.py", "auth.py", "models.py"],
+  "tools": [
+    {"name": "read", "description": "Read a file's contents", "schema": {"path": {"type": "string"}}},
+    {"name": "write", "description": "Write content to a file", "schema": {"path": {"type": "string"}, "content": {"type": "string"}}},
+    {"name": "bash", "description": "Execute a shell command", "schema": {"command": {"type": "string"}}}
+  ]
+}
+```
+
+**完整渲染结果（发送给模型的 Prompt）**：
+
+```markdown
+You are Codex, a helpful AI assistant specialized in software development.
+You have access to tools that allow you to read, write, and execute code.
+Always prioritize user safety and code quality.
+
+You are in AGENT mode. You can:
+- Read and analyze code files
+- Write and modify code
+- Execute shell commands
+- Use tools autonomously to complete tasks
+
+Current working directory: /home/user/my-project
+
+The user wants you to fix a bug. Follow these steps:
+1. Analyze the error and relevant code
+2. Identify the root cause
+3. Implement a fix
+4. Verify the fix works
+
+Context files: app.py, auth.py, models.py
+
+Available tools:
+- read: Read a file's contents
+  Parameters: {"path": {"type": "string"}}
+- write: Write content to a file
+  Parameters: {"path": {"type": "string"}, "content": {"type": "string"}}
+- bash: Execute a shell command
+  Parameters: {"command": {"type": "string"}}
+
+---
+
+User message: 用户登录时返回 500 错误，请帮我修复这个问题。
+```
+
+---
+
+### 示例 2：Ask 模式 - 代码解释
+
+**场景设定**：用户在 `/home/user/web-app` 目录下使用 codex ask 模式，询问："解释一下这段代码的作用"。
+
+**运行时变量值**：
+```json
+{
+  "mode": "ask",
+  "cwd": "/home/user/web-app",
+  "files": ["middleware/auth.js"],
+  "tools": []
+}
+```
+
+**完整渲染结果（发送给模型的 Prompt）**：
+
+```markdown
+You are Codex, a helpful AI assistant specialized in software development.
+You have access to tools that allow you to read, write, and execute code.
+Always prioritize user safety and code quality.
+
+You are in ASK mode. You can only provide explanations and answer questions.
+You cannot modify files or execute commands in this mode.
+
+Current working directory: /home/user/web-app
+
+The user wants to understand some code. Provide a clear explanation of:
+1. What the code does
+2. How it works
+3. Key concepts involved
+
+Context files: middleware/auth.js
+
+---
+
+User message: 解释一下这段代码的作用
+
+```javascript
+// middleware/auth.js
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (token == null) return res.sendStatus(401);
+
+  jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, user) => {
+    if (err) return res.sendStatus(403);
+    req.user = user;
+    next();
+  });
+}
+```
+```
+
+---
+
+### 示例 3：多文件重构
+
+**场景设定**：用户在 `/home/user/api-service` 目录下要求重构数据库访问层，涉及多个文件。
+
+**运行时变量值**：
+```json
+{
+  "mode": "agent",
+  "cwd": "/home/user/api-service",
+  "files": ["db/connection.py", "db/queries.py", "models/user.py", "models/order.py"],
+  "tools": [
+    {"name": "read", "description": "Read a file's contents", "schema": {"path": {"type": "string"}}},
+    {"name": "write", "description": "Write content to a file", "schema": {"path": {"type": "string"}, "content": {"type": "string"}}},
+    {"name": "bash", "description": "Execute a shell command", "schema": {"command": {"type": "string"}}},
+    {"name": "search", "description": "Search for patterns in files", "schema": {"pattern": {"type": "string"}, "path": {"type": "string"}}}
+  ]
+}
+```
+
+**完整渲染结果（发送给模型的 Prompt）**：
+
+```markdown
+You are Codex, a helpful AI assistant specialized in software development.
+You have access to tools that allow you to read, write, and execute code.
+Always prioritize user safety and code quality.
+
+You are in AGENT mode. You can:
+- Read and analyze code files
+- Write and modify code
+- Execute shell commands
+- Use tools autonomously to complete tasks
+
+Current working directory: /home/user/api-service
+
+The user wants you to refactor code. Follow these steps:
+1. Analyze the current implementation
+2. Identify improvement opportunities
+3. Plan the refactoring approach
+4. Execute changes safely
+5. Verify functionality is preserved
+
+Context files: db/connection.py, db/queries.py, models/user.py, models/order.py
+
+Available tools:
+- read: Read a file's contents
+  Parameters: {"path": {"type": "string"}}
+- write: Write content to a file
+  Parameters: {"path": {"type": "string"}, "content": {"type": "string"}}
+- bash: Execute a shell command
+  Parameters: {"command": {"type": "string"}}
+- search: Search for patterns in files
+  Parameters: {"pattern": {"type": "string"}, "path": {"type": "string"}}}
+
+---
+
+User message: 帮我重构数据库访问层，把重复的连接代码提取出来
+```
+
+---
+
+## 8. 证据索引
 
 - `codex` + `codex/codex-rs/core/prompt.md` + 核心基础 prompt，定义系统身份和能力边界
 - `codex` + `codex/codex-rs/templates/` + Askama 模板目录，任务特定 prompt 模板
@@ -201,7 +375,7 @@ struct TaskPrompt {
 
 ---
 
-## 8. 边界与不确定性
+## 9. 边界与不确定性
 
 - 本文基于仓库内研究文档整理，实际代码实现可能有所调整
 - `codex-rs` 实码未完整收录，模板变量具体列表以实际源码为准

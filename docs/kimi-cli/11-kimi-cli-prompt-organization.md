@@ -320,7 +320,158 @@ def inject_context(prompt: str, context: dict) -> str:
 
 ---
 
-## 7. 证据索引
+## 7. 实际示例
+
+### 示例 1：code-reviewer 子 agent
+
+**场景设定**：用户使用 `kimi code-review` 命令审查 PR，涉及 `src/auth.js` 和 `src/utils.js`。
+
+**运行时变量值**：
+```json
+{
+  "cwd": "/home/user/project",
+  "home": "/home/user",
+  "tools": [
+    {"name": "read", "description": "Read file contents"},
+    {"name": "write", "description": "Write file contents"},
+    {"name": "bash", "description": "Execute shell commands"}
+  ],
+  "files": [
+    {"path": "src/auth.js", "status": "modified"},
+    {"path": "src/utils.js", "status": "added"}
+  ],
+  "diff": "diff --git a/src/auth.js b/src/auth.js\nindex 1234..5678 100644\n--- a/src/auth.js\n+++ b/src/auth.js\n@@ -10,5 +10,10 @@ function validateToken(token) {\n   return jwt.verify(token, secret);\n }\n\n+function refreshToken(token) {\n+  // TODO: implement refresh\n+  return token;\n+}\n+\n module.exports = { validateToken };",
+  "review_criteria": [
+    "Security vulnerabilities",
+    "Code style compliance",
+    "Test coverage",
+    "Performance impact"
+  ]
+}
+```
+
+**完整渲染结果（发送给模型的 Prompt）**：
+
+```markdown
+You are Kimi, a helpful AI assistant.
+
+Current directory: /home/user/project
+User home: /home/user
+
+You have access to the following tools:
+- read: Read file contents
+- write: Write file contents
+- bash: Execute shell commands
+
+Always be helpful and accurate.
+
+## Code Review Mode
+
+You are now in CODE REVIEW mode. Review the following changes:
+
+Files to review:
+- src/auth.js (modified)
+- src/utils.js (added)
+
+Diff:
+```
+diff --git a/src/auth.js b/src/auth.js
+index 1234..5678 100644
+--- a/src/auth.js
++++ b/src/auth.js
+@@ -10,5 +10,10 @@ function validateToken(token) {
+   return jwt.verify(token, secret);
+ }
+
++function refreshToken(token) {
++  // TODO: implement refresh
++  return token;
++}
++
+ module.exports = { validateToken };
+```
+
+Review criteria:
+- Security vulnerabilities
+- Code style compliance
+- Test coverage
+- Performance impact
+
+Provide your review as a structured report.
+```
+
+---
+
+### 示例 2：test-writer 子 agent
+
+**场景设定**：用户使用 `kimi test-write` 命令为现有函数生成单元测试。
+
+**运行时变量值**：
+```json
+{
+  "cwd": "/home/user/python-api",
+  "home": "/home/user",
+  "tools": [
+    {"name": "read", "description": "Read file contents"},
+    {"name": "write", "description": "Write file contents"},
+    {"name": "bash", "description": "Execute shell commands"}
+  ],
+  "files": [
+    {"path": "app/services/payment.py", "description": "Payment processing service"}
+  ],
+  "target_function": "process_refund",
+  "test_framework": "pytest",
+  "coverage_criteria": [
+    "Happy path",
+    "Invalid input handling",
+    "Edge cases (zero amount, negative amount)",
+    "Exception scenarios"
+  ]
+}
+```
+
+**完整渲染结果（发送给模型的 Prompt）**：
+
+```markdown
+You are Kimi, a helpful AI assistant.
+
+Current directory: /home/user/python-api
+User home: /home/user
+
+You have access to the following tools:
+- read: Read file contents
+- write: Write file contents
+- bash: Execute shell commands
+
+Always be helpful and accurate.
+
+## Test Writer Mode
+
+You are now in TEST WRITER mode. Generate comprehensive unit tests for the specified function.
+
+Target file: app/services/payment.py
+Target function: process_refund
+Test framework: pytest
+
+Test coverage requirements:
+- Happy path
+- Invalid input handling
+- Edge cases (zero amount, negative amount)
+- Exception scenarios
+
+Guidelines:
+1. Use pytest best practices
+2. Use mocks for external dependencies
+3. Follow AAA pattern (Arrange, Act, Assert)
+4. Include descriptive test names
+5. Add docstrings explaining what each test verifies
+
+Output the test code in a format ready to be written to a test file.
+```
+
+---
+
+## 8. 证据索引
 
 - `kimi-cli` + `kimi-cli/src/kimi_cli/prompts/*.md` + 基础 prompt 模板文件
 - `kimi-cli` + `kimi-cli/src/kimi_cli/prompts/system.md` + 系统身份定义
@@ -330,7 +481,7 @@ def inject_context(prompt: str, context: dict) -> str:
 
 ---
 
-## 8. 边界与不确定性
+## 9. 边界与不确定性
 
 - Agent 继承的具体合并策略（深度合并 vs 浅层覆盖）需验证
 - 模板变量的完整列表需以实码为准
