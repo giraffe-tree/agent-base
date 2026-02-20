@@ -9,7 +9,7 @@
   - [Agent Loop 共性](docs/comm/04-comm-agent-loop.md)
 
 - **其他项目**
-  - [Gemini CLI](docs/gemini-cli/)
-  - [OpenCode](docs/opencode/)
-  - [Kimi CLI](docs/kimi-cli/)
-  - [SWE-agent](docs/swe-agent/)
+  - [Gemini CLI](docs/gemini-cli/01-gemini-cli-overview.md)
+  - [OpenCode](docs/opencode/01-opencode-overview.md)
+  - [Kimi CLI](docs/kimi-cli/01-kimi-cli-overview.md)
+  - [SWE-agent](docs/swe-agent/01-swe-agent-overview.md)
