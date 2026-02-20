@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>AI Coding Agent 源码深度解析</title>
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+  <meta name="description" content="深度解析主流 AI Coding Agent 的实现机制">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0">
+  <link rel="stylesheet" href="//cdn.jsdelivr.net/npm/docsify@4/lib/themes/vue.css">
+  <style>
+    .sidebar { padding-top: 20px; }
+    .markdown-section { max-width: 90%; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <script>
+    window.$docsify = {
+      name: 'Agent Base',
+      repo: 'giraffe-tree/agent-base',
+      loadSidebar: true,        // 自动加载侧边栏
+      loadNavbar: true,         // 顶部导航
+      subMaxLevel: 3,           // 自动显示到三级标题
+      auto2top: true,
+      search: {
+        paths: 'auto',
+        placeholder: '搜索',
+        noData: '找不到结果'
+      },
+      // 文件树支持
+      alias: {
+        '/.*/_sidebar.md': '/_sidebar.md'
+      }
+    }
+  </script>
+  <!-- Docsify v4 -->
+  <script src="//cdn.jsdelivr.net/npm/docsify@4"></script>
+  <!-- 搜索插件 -->
+  <script src="//cdn.jsdelivr.net/npm/docsify/lib/plugins/search.min.js"></script>
+  <!-- 复制代码插件 -->
+  <script src="//cdn.jsdelivr.net/npm/docsify-copy-code/dist/docsify-copy-code.min.js"></script>
+</body>
+</html>
