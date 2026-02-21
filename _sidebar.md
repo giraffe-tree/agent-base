@@ -11,6 +11,7 @@
   - [UI 交互](docs/comm/08-comm-ui-interaction.md)
   - [Web Server](docs/comm/09-comm-web-server.md)
   - [Safety Control](docs/comm/10-comm-safety-control.md)
+  - [日志记录机制](docs/comm/12-comm-logging.md)
 
 - **Codex CLI (Rust)**
   - [概览](docs/codex/01-codex-overview.md)
@@ -24,6 +25,7 @@
   - [Web Server](docs/codex/09-codex-web-server.md)
   - [Safety Control](docs/codex/10-codex-safety-control.md)
   - [Prompt 组织](docs/codex/11-codex-prompt-organization.md)
+  - [日志记录机制](docs/codex/12-codex-logging.md)
   - **Questions**
     - [并发 Tool 调用](docs/codex/questions/codex-tool-call-concurrency.md)
     - [用户编辑冲突回退](docs/codex/questions/codex-revert-user-edit-conflict.md)
@@ -41,6 +43,7 @@
   - [Web Server](docs/gemini-cli/09-gemini-cli-web-server.md)
   - [Safety Control](docs/gemini-cli/10-gemini-cli-safety-control.md)
   - [Prompt 组织](docs/gemini-cli/11-gemini-cli-prompt-organization.md)
+  - [日志记录机制](docs/gemini-cli/12-gemini-cli-logging.md)
   - **Questions**
     - [并发 Tool 调用](docs/gemini-cli/questions/gemini-cli-tool-call-concurrency.md)
     - [用户编辑冲突回退](docs/gemini-cli/questions/gemini-cli-revert-user-edit-conflict.md)
@@ -58,6 +61,7 @@
   - [Web Server](docs/opencode/09-opencode-web-server.md)
   - [Safety Control](docs/opencode/10-opencode-safety-control.md)
   - [Prompt 组织](docs/opencode/11-opencode-prompt-organization.md)
+  - [日志记录机制](docs/opencode/12-opencode-logging.md)
   - **Questions**
     - [并发 Tool 调用](docs/opencode/questions/opencode-tool-call-concurrency.md)
     - [Checkpoint 实现](docs/opencode/questions/opencode-checkpoint-implementation.md)
@@ -76,6 +80,7 @@
   - [Web Server](docs/kimi-cli/09-kimi-cli-web-server.md)
   - [Safety Control](docs/kimi-cli/10-kimi-cli-safety-control.md)
   - [Prompt 组织](docs/kimi-cli/11-kimi-cli-prompt-organization.md)
+  - [日志记录机制](docs/kimi-cli/12-kimi-cli-logging.md)
   - **Questions**
     - [并发 Tool 调用](docs/kimi-cli/questions/kimi-cli-tool-call-concurrency.md)
     - [Checkpoint 实现](docs/kimi-cli/questions/kimi-cli-checkpoint-implementation.md)
@@ -93,6 +98,7 @@
   - [Web Server](docs/swe-agent/09-swe-agent-web-server.md)
   - [Safety Control](docs/swe-agent/10-swe-agent-safety-control.md)
   - [Prompt 组织](docs/swe-agent/11-swe-agent-prompt-organization.md)
+  - [日志记录机制](docs/swe-agent/12-swe-agent-logging.md)
   - **Questions**
     - [并发 Tool 调用](docs/swe-agent/questions/swe-agent-tool-call-concurrency.md)
     - [用户编辑冲突回退](docs/swe-agent/questions/swe-agent-revert-user-edit-conflict.md)
