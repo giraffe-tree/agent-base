@@ -12,6 +12,8 @@
   - [Web Server](docs/comm/09-comm-web-server.md)
   - [Safety Control](docs/comm/10-comm-safety-control.md)
   - [日志记录机制](docs/comm/12-comm-logging.md)
+  - **Questions**
+    - [工具调用错误处理](docs/comm/questions/comm-tool-error-handling.md)
 
 - **Codex CLI (Rust)**
   - [概览](docs/codex/01-codex-overview.md)
@@ -29,6 +31,7 @@
   - **Questions**
     - [并发 Tool 调用](docs/codex/questions/codex-tool-call-concurrency.md)
     - [用户编辑冲突回退](docs/codex/questions/codex-revert-user-edit-conflict.md)
+    - [工具调用错误处理](docs/codex/questions/codex-tool-error-handling.md)
 
 - **Gemini CLI**
   - [概览](docs/gemini-cli/01-gemini-cli-overview.md)
@@ -47,6 +50,7 @@
   - **Questions**
     - [并发 Tool 调用](docs/gemini-cli/questions/gemini-cli-tool-call-concurrency.md)
     - [用户编辑冲突回退](docs/gemini-cli/questions/gemini-cli-revert-user-edit-conflict.md)
+    - [工具调用错误处理](docs/gemini-cli/questions/gemini-cli-tool-error-handling.md)
 
 - **OpenCode**
   - [概览](docs/opencode/01-opencode-overview.md)
@@ -66,6 +70,7 @@
     - [并发 Tool 调用](docs/opencode/questions/opencode-tool-call-concurrency.md)
     - [Checkpoint 实现](docs/opencode/questions/opencode-checkpoint-implementation.md)
     - [用户编辑冲突回退](docs/opencode/questions/opencode-revert-user-edit-conflict.md)
+    - [工具调用错误处理](docs/opencode/questions/opencode-tool-error-handling.md)
 
 - **Kimi CLI**
   - [概览](docs/kimi-cli/01-kimi-cli-overview.md)
@@ -86,6 +91,7 @@
     - [Checkpoint 实现](docs/kimi-cli/questions/kimi-cli-checkpoint-implementation.md)
     - [Checkpoint 无文件回滚权衡](docs/kimi-cli/questions/kimi-cli-checkpoint-no-file-rollback-tradeoffs.md)
     - [用户编辑冲突回退](docs/kimi-cli/questions/kimi-cli-revert-user-edit-conflict.md)
+    - [工具调用错误处理](docs/kimi-cli/questions/kimi-cli-tool-error-handling.md)
 
 - **SWE-agent**
   - [概览](docs/swe-agent/01-swe-agent-overview.md)
@@ -102,3 +108,4 @@
   - **Questions**
     - [并发 Tool 调用](docs/swe-agent/questions/swe-agent-tool-call-concurrency.md)
     - [用户编辑冲突回退](docs/swe-agent/questions/swe-agent-revert-user-edit-conflict.md)
+    - [工具调用错误处理](docs/swe-agent/questions/swe-agent-tool-error-handling.md)
