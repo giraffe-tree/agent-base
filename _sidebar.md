@@ -105,6 +105,7 @@
     - [防止 Tool 无限循环](docs/kimi-cli/questions/kimi-cli-infinite-loop-prevention.md)
     - [上下文压缩机制](docs/kimi-cli/questions/kimi-cli-context-compaction.md)
     - [Plan and Execute 模式](docs/kimi-cli/questions/kimi-cli-plan-and-execute.md)
+    - [Flow 架构设计](docs/kimi-cli/questions/kimi-cli-flow-architecture.md)
 
 - **SWE-agent**
   - [概览](docs/swe-agent/01-swe-agent-overview.md)
