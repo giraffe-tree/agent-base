@@ -165,15 +165,15 @@ Cursor 的设计围绕 IDE 集成展开：LSP 提供语义理解，多 Agent 并
 | **项目感知** | `CLAUDE.md` + 自主探索 | `.cursor/rules/` + 代码索引 |
 | **会话持久化** | `claude -c` 恢复上一会话 | Composer 会话自动保存 |
 
-**Claude Code 的 6 层记忆系统**：
+**Claude Code 的 6 层持久化记忆**（详见 [Claude Code 分层记忆详解](../claude/07-claude-memory-context.md)）：
 
 ```
-Layer 1: System Prompt          ← Anthropic 内置
-Layer 2: CLAUDE.md (项目级)     ← 项目根目录
-Layer 3: CLAUDE.md (用户级)     ← ~/.claude/
-Layer 4: CLAUDE.md (企业级)     ← 组织配置
-Layer 5: Session Memory         ← 会话内积累
-Layer 6: Compact Summary        ← 自动压缩产物
+L1: Managed Policy     ← 企业/组织级策略 (/etc/claude-code/CLAUDE.md)
+L2: User Memory        ← 用户全局偏好 (~/.claude/CLAUDE.md)
+L3: Project Memory     ← 项目团队共享 (./CLAUDE.md)
+L4: Project Rules      ← 模块化规则 (./.claude/rules/*.md)
+L5: Local Memory       ← 个人项目偏好 (./CLAUDE.local.md, 不入 Git)
+L6: Auto Memory        ← Claude 自动发现的模式 (前 200 行加载)
 ```
 
 **Cursor 的上下文来源**：

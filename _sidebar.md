@@ -110,6 +110,16 @@
     - [Plan and Execute 模式](docs/kimi-cli/questions/kimi-cli-plan-and-execute.md)
     - [Flow 架构设计](docs/kimi-cli/questions/kimi-cli-flow-architecture.md)
 
+- **Claude Code**
+  - [Memory Context](docs/claude/07-claude-memory-context.md)
+  - **Questions**
+    - [消息上下文保留机制](docs/claude/questions/claude-message-context-retention.md)
+
+- **Cursor**
+  - **Questions**
+    - [state.vscdb Checkpoint 分析](docs/cursor/questions/cursor-state-vscdb-checkpoint-analysis.md)
+    - [Checkpoint 说明与 state.vscdb 对照](docs/cursor/questions/cursor-checkpoint-official-description-and-state-vscdb-mapping.md)
+
 - **SWE-agent**
   - [概览](docs/swe-agent/01-swe-agent-overview.md)
   - [CLI 入口](docs/swe-agent/02-swe-agent-cli-entry.md)
