@@ -125,15 +125,124 @@
 
 ---
 
-## 6. 失败处理与已知边界
+## 6. 欺骗性 URL 检测 (2026-02)
 
-- 拒绝/违规：统一以策略违规响应返回，不执行实际副作用工具。
-- 非交互环境：`ASK_USER` 可能无法确认，系统按配置降级到拒绝路径。
-- 已知边界：仓库中可见 `safety checker` 相关代码路径，但主运行时是否默认注入需按版本核对，文档落地时应标注“以当前代码路径为准”。
+Gemini CLI 新增对欺骗性 URL（Deceptive URL）的检测和提示功能。
+
+### 6.1 检测机制
+
+```typescript
+// gemini-cli/packages/cli/src/ui/utils/urlSecurityUtils.ts:25-30
+
+function containsDeceptiveMarkers(hostname: string): boolean {
+  return (
+    // Punycode 标记
+    hostname.toLowerCase().includes('xn--') ||
+    // 非 ASCII 字符
+    /[^\x00-\x7F]/.test(hostname)
+  );
+}
+```
+
+### 6.2 检测流程
+
+```text
+URL 字符串输入
+       │
+       ▼
+┌─────────────────┐
+│ URL.parse()     │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────────────┐
+│ containsDeceptiveMarkers │
+│ - 检查 'xn--' (Punycode) │
+│ - 检查非 ASCII 字符      │
+└────────┬────────────────┘
+         │
+    ┌────┴────┐
+    ▼         ▼
+┌───────┐  ┌────────┐
+| 是    │  │ 否     │
+└───┬───┘  └────────┘
+    │
+    ▼
+┌─────────────────────────┐
+│ DeceptiveUrlDetails     │
+│ - originalUrl (Unicode) │
+│ - punycodeUrl (ASCII)   │
+└─────────────────────────┘
+```
+
+### 6.3 用户提示
+
+当检测到欺骗性 URL 时，在工具确认界面显示：
+- 原始 Unicode 形式的 URL
+- 对应的 Punycode ASCII 形式
+- 安全警告提示
 
 ---
 
-## 7. 证据索引（项目名 + 文件路径 + 关键职责）
+## 7. Unicode 字符过滤 (2026-02)
+
+Gemini CLI 实现了全面的 Unicode 字符过滤，防止终端显示被恶意操控。
+
+### 7.1 过滤范围
+
+```typescript
+// gemini-cli/packages/cli/src/ui/utils/textUtils.ts:120-134
+
+export function stripUnsafeCharacters(str: string): string {
+  const strippedAnsi = stripAnsi(str);
+  const strippedVT = stripVTControlCharacters(strippedAnsi);
+
+  // 过滤以下字符:
+  // - C0 控制字符 (0x00-0x1F) 除 TAB(0x09), LF(0x0A), CR(0x0D)
+  // - C1 控制字符 (0x80-0x9F)
+  // - BiDi 控制字符 (U+200E, U+200F, U+202A-U+202E, U+2066-U+2069)
+  // - 零宽字符 (U+200B ZWSP, U+FEFF BOM)
+  return strippedVT.replace(
+    /[\x00-\x08\x0B\x0C\x0E-\x1F\x80-\x9F\u200E\u200F\u202A-\u202E\u2066-\u2069\u200B\uFEFF]/g,
+    '',
+  );
+}
+```
+
+### 7.2 字符分类
+
+| 类别 | 范围 | 处理方式 |
+|------|------|----------|
+| C0 控制字符 | 0x00-0x1F (除 0x09, 0x0A, 0x0D) | 移除 |
+| C1 控制字符 | 0x80-0x9F | 移除 |
+| BiDi 覆盖字符 | U+202A-U+202E, U+2066-U+2069 | 移除 |
+| 零宽空格 | U+200B | 移除 |
+| BOM | U+FEFF | 移除 |
+| **保留** | | |
+| 可打印 ASCII | 0x20-0x7E | 保留 |
+| Tab | 0x09 | 保留 |
+| 换行 | 0x0A, 0x0D | 保留 |
+| Unicode 文字 | U+00A0 及以上 | 保留 |
+| ZWJ (表情符号) | U+200D | 保留 |
+| ZWNJ | U+200C | 保留 |
+
+### 7.3 应用场景
+
+1. **工具确认界面**: 过滤工具参数和输出中的危险字符
+2. **终端输出**: 清理 shell 命令输出
+3. **历史记录**: 保存前进行过滤
+
+---
+
+## 8. 失败处理与已知边界
+
+- 拒绝/违规：统一以策略违规响应返回，不执行实际副作用工具。
+- 非交互环境：`ASK_USER` 可能无法确认，系统按配置降级到拒绝路径。
+- 已知边界：仓库中可见 `safety checker` 相关代码路径，但主运行时是否默认注入需按版本核对，文档落地时应标注”以当前代码路径为准”。
+
+---
+
+## 9. 证据索引（项目名 + 文件路径 + 关键职责）
 
 - `gemini-cli` + `gemini-cli/schemas/settings.schema.json` + 安全策略相关配置项 schema。
 - `gemini-cli` + `gemini-cli/packages/cli/src/config/config.ts` + `effectiveSettings` 汇总与 core 配置注入。
@@ -146,5 +255,7 @@
 - `gemini-cli` + `gemini-cli/packages/core/src/tools/shell.ts` + shell 执行前路径校验与确认信息构建。
 - `gemini-cli` + `gemini-cli/packages/core/src/tools/mcp-client-manager.ts` + MCP 服务启用与连接治理。
 - `gemini-cli` + `gemini-cli/packages/core/src/tools/mcp-tool.ts` + MCP 工具调用侧确认与执行路径。
+- `gemini-cli` + `gemini-cli/packages/cli/src/ui/utils/urlSecurityUtils.ts` + 欺骗性 URL 检测实现。
+- `gemini-cli` + `gemini-cli/packages/cli/src/ui/utils/textUtils.ts` + Unicode 字符过滤实现。
 
 

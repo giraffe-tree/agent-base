@@ -1,7 +1,7 @@
 # AI Coding Agent 源码深度解析
 
 [![研究项目](https://img.shields.io/badge/类型-源码研究-blue)](./docs)
-[![研究基线](https://img.shields.io/badge/基线-2026--02--08-green)](./docs)
+[![研究基线](https://img.shields.io/badge/基线-2026--02--22-green)](./docs)
 [![覆盖项目](https://img.shields.io/badge/覆盖-5个主流Agent-orange)](./docs)
 
 > **面向谁？** 想深入理解 AI Coding Agent 内部机制的开发者、研究人员、架构师
@@ -154,7 +154,7 @@ git clone https://github.com/anomalyco/opencode.git
 
 ## 研究基线
 
-- **时间**：2026-02-08
+- **时间**：2026-02-22
 - **来源**：各项目 GitHub 当时最新分支
 - **方法**：源码阅读 + 关键流程图解 + 跨项目对比
 

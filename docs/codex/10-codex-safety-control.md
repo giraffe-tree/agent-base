@@ -127,17 +127,134 @@
 
 ---
 
-## 6. 证据索引（项目名 + 文件路径 + 关键职责）
+## 6. Linux Proxy-Only 网络沙箱 (2026-02)
+
+Codex 新增 Linux 专用代理沙箱模式，通过 TCP-UDS-TCP 桥接实现仅代理网络访问。
+
+### 6.1 架构设计
+
+```text
+主机网络命名空间                    沙箱网络命名空间
+┌─────────────────┐                ┌─────────────────┐
+│ 代理服务器       │◄──────────────►│ 本地桥接        │
+│ (127.0.0.1:xxx) │   TCP 连接     │ (127.0.0.1:yyy) │
+└────────┬────────┘                └────────┬────────┘
+         │                                   │
+         │    主机桥接进程 (host bridge)     │
+         │    - Unix Domain Socket 监听      │
+         │    - TCP 连接到代理服务器          │
+         └───────────────────────────────────┘
+
+沙箱内通过 UDS 与主机通信，避免直接访问网络
+```
+
+### 6.2 代码实现
+
+```rust
+// codex/codex-rs/linux-sandbox/src/proxy_routing.rs:70-119
+
+/// 准备主机代理路由配置
+pub(crate) fn prepare_host_proxy_route_spec() -> io::Result<String> {
+    let env: HashMap<String, String> = std::env::vars().collect();
+    let plan = plan_proxy_routes(&env);
+
+    // 创建 UDS 目录
+    let socket_dir = create_proxy_socket_dir()?;
+
+    // 为每个唯一端点创建主机桥接进程
+    for (endpoint, socket_path) in &socket_by_endpoint {
+        host_bridge_pids.push(spawn_host_bridge(*endpoint, socket_path)?);
+    }
+
+    // 生成路由配置 JSON
+    serde_json::to_string(&ProxyRouteSpec { routes }).map_err(io::Error::other)
+}
+```
+
+### 6.3 Seccomp 模式配合
+
+代理沙箱可与 Seccomp 模式配合使用，提供多层防护：
+
+1. **网络层**: 仅允许通过 UDS 与主机代理通信
+2. **系统调用层**: Seccomp 过滤器限制可用系统调用
+
+### 6.4 支持的代理环境变量
+
+```rust
+// proxy_routing.rs:26-41
+const PROXY_ENV_KEYS: &[&str] = &[
+    “HTTP_PROXY”, “HTTPS_PROXY”, “ALL_PROXY”, “FTP_PROXY”,
+    “YARN_HTTP_PROXY”, “YARN_HTTPS_PROXY”,
+    “NPM_CONFIG_HTTP_PROXY”, “NPM_CONFIG_HTTPS_PROXY”, “NPM_CONFIG_PROXY”,
+    “BUNDLE_HTTP_PROXY”, “BUNDLE_HTTPS_PROXY”,
+    “PIP_PROXY”,
+    “DOCKER_HTTP_PROXY”, “DOCKER_HTTPS_PROXY”,
+];
+```
+
+---
+
+## 7. Reject 审批策略 (2026-02)
+
+Codex 新增 RejectConfig 配置，用于自动拒绝特定类型的审批请求。
+
+### 7.1 RejectConfig 定义
+
+```typescript
+// codex/codex-rs/app-server-protocol/schema/typescript/RejectConfig.ts
+
+export type RejectConfig = {
+    /**
+     * Reject approval prompts related to sandbox escalation.
+     */
+    sandbox_approval: boolean,
+    /**
+     * Reject prompts triggered by execpolicy `prompt` rules.
+     */
+    rules: boolean,
+    /**
+     * Reject MCP elicitation prompts.
+     */
+    mcp_elicitations: boolean,
+};
+```
+
+### 7.2 使用场景
+
+| 配置项 | 用途 | 典型场景 |
+|--------|------|----------|
+| `sandbox_approval` | 拒绝沙箱升级请求 | 禁止 AI 请求更高权限 |
+| `rules` | 拒绝执行策略触发的确认 | 自动拒绝敏感命令 |
+| `mcp_elicitations` | 拒绝 MCP 工具授权请求 | 限制外部工具使用 |
+
+### 7.3 与 TurnContext 集成
+
+RejectConfig 作为 `TurnContext` 的一部分，在 turn 开始时注入，影响整个 turn 的审批行为：
+
+```rust
+// TurnContext 字段示意
+pub struct TurnContext {
+    // ... 其他字段
+    pub reject_config: Option<RejectConfig>,
+}
+```
+
+---
+
+## 8. 证据索引（项目名 + 文件路径 + 关键职责）
 
 - `codex` + `docs/codex/04-codex-agent-loop.md` + turn 主链路、`TurnContext` 字段注入与运行边界。
 - `codex` + `docs/codex/05-codex-tools-system.md` + `ToolsConfig`、`ToolRouter/ToolRegistry` 门控与错误分级。
 - `codex` + `docs/codex/06-codex-mcp-integration.md` + MCP 配置面与 `maybe_request_mcp_tool_approval()` 审批分支。
 - `codex` + `docs/codex/questions/codex-tool-call-concurrency.md` + 并发工具调用控制与 mutating 工具串行化。
+- `codex` + `codex/codex-rs/linux-sandbox/src/proxy_routing.rs` + Linux Proxy-Only 沙箱 TCP-UDS-TCP 桥接实现。
+- `codex` + `codex/codex-rs/app-server-protocol/schema/typescript/RejectConfig.ts` + Reject 审批策略配置定义。
 
 ---
 
-## 7. 边界与不确定性
+## 9. 边界与不确定性
 
 - 本文结论基于仓库内研究文档中的源码引用，不是直接在本仓库编译运行 `codex-rs` 得出。
-- 若后续引入 `codex` 实码镜像，建议补一节“配置键值到 Rust 结构体字段”的逐项映射核对。
+- 若后续引入 `codex` 实码镜像，建议补一节”配置键值到 Rust 结构体字段”的逐项映射核对。
+- Proxy-Only 沙箱仅适用于 Linux 平台，macOS/Windows 使用其他沙箱机制。
 

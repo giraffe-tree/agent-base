@@ -431,7 +431,43 @@ enum ToolErrorType {
 
 ---
 
-## 10. 排障速查
+## 10. read_file 行号机制变更 (2026-02)
+
+**重要变更**: `start_line` 和 `end_line` 参数已从 0-based 改为 **1-based**。
+
+### 10.1 变更详情
+
+- `start_line`: 必须 >= 1
+- `end_line`: 必须 >= 1 且 >= start_line
+- 错误提示明确告知用户使用 1-based 行号
+
+```typescript
+// gemini-cli/packages/core/src/tools/read-file.ts:213-225
+if (params.start_line !== undefined && params.start_line < 1) {
+  return 'start_line must be at least 1';
+}
+if (params.end_line !== undefined && params.end_line < 1) {
+  return 'end_line must be at least 1';
+}
+if (
+  params.start_line !== undefined &&
+  params.end_line !== undefined &&
+  params.start_line > params.end_line
+) {
+  return 'start_line cannot be greater than end_line';
+}
+```
+
+### 10.2 影响范围
+
+- 所有使用 `read_file` 工具的对话
+- 与 `grep_search` 工具的流水线集成 (pipelining)
+
+代码位置: `gemini-cli/packages/core/src/tools/read-file.ts`
+
+---
+
+## 11. 排障速查
 
 - **工具未找到**: 检查 `getTool` 的别名解析和 MCP 全限定名匹配
 - **参数验证失败**: 查看 `SchemaValidator.validate` 错误输出
