@@ -33,6 +33,7 @@
     - [用户编辑冲突回退](docs/codex/questions/codex-revert-user-edit-conflict.md)
     - [工具调用错误处理](docs/codex/questions/codex-tool-error-handling.md)
     - [防止 Tool 无限循环](docs/codex/questions/codex-infinite-loop-prevention.md)
+    - [上下文压缩机制](docs/codex/questions/codex-context-compaction.md)
 
 - **Gemini CLI**
   - [概览](docs/gemini-cli/01-gemini-cli-overview.md)
@@ -53,6 +54,7 @@
     - [用户编辑冲突回退](docs/gemini-cli/questions/gemini-cli-revert-user-edit-conflict.md)
     - [工具调用错误处理](docs/gemini-cli/questions/gemini-cli-tool-error-handling.md)
     - [防止 Tool 无限循环](docs/gemini-cli/questions/gemini-cli-infinite-loop-prevention.md)
+    - [上下文压缩机制](docs/gemini-cli/questions/gemini-cli-context-compaction.md)
 
 - **OpenCode**
   - [概览](docs/opencode/01-opencode-overview.md)
@@ -74,6 +76,7 @@
     - [用户编辑冲突回退](docs/opencode/questions/opencode-revert-user-edit-conflict.md)
     - [工具调用错误处理](docs/opencode/questions/opencode-tool-error-handling.md)
     - [防止 Tool 无限循环](docs/opencode/questions/opencode-infinite-loop-prevention.md)
+    - [上下文压缩机制](docs/opencode/questions/opencode-context-compaction.md)
 
 - **Kimi CLI**
   - [概览](docs/kimi-cli/01-kimi-cli-overview.md)
@@ -96,6 +99,7 @@
     - [用户编辑冲突回退](docs/kimi-cli/questions/kimi-cli-revert-user-edit-conflict.md)
     - [工具调用错误处理](docs/kimi-cli/questions/kimi-cli-tool-error-handling.md)
     - [防止 Tool 无限循环](docs/kimi-cli/questions/kimi-cli-infinite-loop-prevention.md)
+    - [上下文压缩机制](docs/kimi-cli/questions/kimi-cli-context-compaction.md)
 
 - **SWE-agent**
   - [概览](docs/swe-agent/01-swe-agent-overview.md)
@@ -114,3 +118,4 @@
     - [用户编辑冲突回退](docs/swe-agent/questions/swe-agent-revert-user-edit-conflict.md)
     - [工具调用错误处理](docs/swe-agent/questions/swe-agent-tool-error-handling.md)
     - [防止 Tool 无限循环](docs/swe-agent/questions/swe-agent-infinite-loop-prevention.md)
+    - [上下文压缩机制](docs/swe-agent/questions/swe-agent-context-compaction.md)
