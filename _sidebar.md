@@ -12,6 +12,7 @@
   - [Web Server](docs/comm/09-comm-web-server.md)
   - [Safety Control](docs/comm/10-comm-safety-control.md)
   - [日志记录机制](docs/comm/12-comm-logging.md)
+  - [Plan and Execute 模式](docs/comm/comm-plan-and-execute.md)
   - **Questions**
     - [工具调用错误处理](docs/comm/questions/comm-tool-error-handling.md)
 
@@ -34,6 +35,7 @@
     - [工具调用错误处理](docs/codex/questions/codex-tool-error-handling.md)
     - [防止 Tool 无限循环](docs/codex/questions/codex-infinite-loop-prevention.md)
     - [上下文压缩机制](docs/codex/questions/codex-context-compaction.md)
+    - [Plan and Execute 模式](docs/codex/questions/codex-plan-and-execute.md)
 
 - **Gemini CLI**
   - [概览](docs/gemini-cli/01-gemini-cli-overview.md)
@@ -55,6 +57,7 @@
     - [工具调用错误处理](docs/gemini-cli/questions/gemini-cli-tool-error-handling.md)
     - [防止 Tool 无限循环](docs/gemini-cli/questions/gemini-cli-infinite-loop-prevention.md)
     - [上下文压缩机制](docs/gemini-cli/questions/gemini-cli-context-compaction.md)
+    - [Plan and Execute 模式](docs/gemini-cli/questions/gemini-cli-plan-and-execute.md)
 
 - **OpenCode**
   - [概览](docs/opencode/01-opencode-overview.md)
@@ -77,6 +80,7 @@
     - [工具调用错误处理](docs/opencode/questions/opencode-tool-error-handling.md)
     - [防止 Tool 无限循环](docs/opencode/questions/opencode-infinite-loop-prevention.md)
     - [上下文压缩机制](docs/opencode/questions/opencode-context-compaction.md)
+    - [Plan and Execute 模式](docs/opencode/questions/opencode-plan-and-execute.md)
 
 - **Kimi CLI**
   - [概览](docs/kimi-cli/01-kimi-cli-overview.md)
@@ -100,6 +104,7 @@
     - [工具调用错误处理](docs/kimi-cli/questions/kimi-cli-tool-error-handling.md)
     - [防止 Tool 无限循环](docs/kimi-cli/questions/kimi-cli-infinite-loop-prevention.md)
     - [上下文压缩机制](docs/kimi-cli/questions/kimi-cli-context-compaction.md)
+    - [Plan and Execute 模式](docs/kimi-cli/questions/kimi-cli-plan-and-execute.md)
 
 - **SWE-agent**
   - [概览](docs/swe-agent/01-swe-agent-overview.md)
@@ -119,3 +124,4 @@
     - [工具调用错误处理](docs/swe-agent/questions/swe-agent-tool-error-handling.md)
     - [防止 Tool 无限循环](docs/swe-agent/questions/swe-agent-infinite-loop-prevention.md)
     - [上下文压缩机制](docs/swe-agent/questions/swe-agent-context-compaction.md)
+    - [Plan and Execute 模式](docs/swe-agent/questions/swe-agent-plan-and-execute.md)
