@@ -14,6 +14,7 @@
   - [日志记录机制](docs/comm/12-comm-logging.md)
   - [Plan and Execute 模式](docs/comm/comm-plan-and-execute.md)
   - [ACP 是什么？（入门指南）](docs/comm/comm-what-is-acp.md)
+  - [Claude Code vs Cursor 本质区别](docs/comm/comm-claude-code-vs-cursor.md)
   - [未来突破：第一性原理分析](docs/comm/comm-future-breakthrough-first-principles.md)
   - **Questions**
     - [工具调用错误处理](docs/comm/questions/comm-tool-error-handling.md)
