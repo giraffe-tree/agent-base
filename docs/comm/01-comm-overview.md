@@ -1,277 +1,193 @@
-# 跨 Agent 概述对比
+# Code Agent 全局认知
 
-## 1. 概念定义
+## TL;DR
 
-Agent CLI 是一类将大型语言模型（LLM）与本地环境（文件系统、Shell、网络等）连接起来的命令行工具。它们允许用户通过自然语言与 AI 交互，让 AI 能够读取文件、执行命令、修改代码并自主完成软件开发任务。
-
-### 核心能力
-
-- **代码理解与生成**：分析现有代码库，生成新代码
-- **环境交互**：通过工具调用与本地环境（Shell、文件系统）交互
-- **多轮推理**：通过 Agent Loop 持续迭代直到任务完成
-- **上下文管理**：管理对话历史、文件上下文和工具执行结果
+Code Agent = LLM + 工具调用循环 + 本地环境。它不是"更聪明的代码补全"，而是一个能自主规划、执行、观察、修正的工程执行器。
 
 ---
 
-## 2. 各 Agent 实现
+## 1. 为什么要有 Code Agent？
 
-### 2.1 SWE-agent
+**传统 LLM 的局限：**
 
-**实现概述**
+一次调用只能"思考"，不能"行动"。你把代码问题发给 LLM，它给你一个答案 —— 但如果答案需要先读文件、跑测试、再根据结果修正，单次调用就做不到了。
 
-SWE-agent 是由普林斯顿大学 NLP 组开发的学术型代码 Agent，专注于自动化软件工程任务（如 GitHub Issue 修复）。采用 Python/Pydantic 技术栈，强调可复现性和研究友好性。
+**Code Agent 解决什么：**
 
-**关键代码位置**
+```
+你的问题 → [多轮循环] → 完成的任务
+               ↑
+         每轮：LLM 思考 → 调用工具 → 观察结果 → 继续
+```
 
-| 组件 | 文件路径 | 关键职责 |
-|------|----------|----------|
-| 入口 | `sweagent/run/run.py` | CLI 入口和命令解析 |
-| Agent Loop | `sweagent/agent/agents.py` | 主循环逻辑 |
-| 工具系统 | `sweagent/tools/` | Bundle 配置驱动工具 |
-| 环境管理 | `sweagent/environment/` | Docker 容器化执行 |
-| 模型接口 | `sweagent/agent/models/` | 多模型支持 |
-
-**技术特点**
-- 使用 Pydantic 进行配置验证
-- Docker 容器隔离执行环境
-- Bundle 系统模块化工具定义
-- 支持多种模型输出格式解析
-
-### 2.2 Codex (OpenAI)
-
-**实现概述**
-
-Codex 是 OpenAI 官方推出的 Rust 实现 Agent CLI，注重性能和安全沙箱。采用 Rust/tokio 技术栈，提供原生性能和严格的权限控制。
-
-**关键代码位置**
-
-| 组件 | 文件路径 | 关键职责 |
-|------|----------|----------|
-| 入口 | `codex-rs/cli/src/main.rs` | CLI 入口 |
-| Agent Loop | `codex-rs/core/src/agent_loop.rs` | 主循环和 Turn 管理 |
-| 工具系统 | `codex-rs/core/src/tools/` | Handler 注册模式 |
-| 沙箱系统 | `codex-rs/core/src/sandbox/` | 安全执行环境 |
-| 会话管理 | `codex-rs/core/src/session.rs` | Session 生命周期 |
-
-**技术特点**
-- Rust/tokio 高性能异步
-- 原生安全沙箱（macOS Seatbelt / Linux Landlock）
-- MCP 工具集成支持
-- Hook 扩展机制
-
-### 2.3 Gemini CLI
-
-**实现概述**
-
-Gemini CLI 是 Google 官方的 TypeScript 实现，基于 Gemini API。采用 TypeScript/Node 技术栈，提供丰富的 IDE 集成和智能体能力。
-
-**关键代码位置**
-
-| 组件 | 文件路径 | 关键职责 |
-|------|----------|----------|
-| 入口 | `packages/cli/src/index.ts` | CLI 入口 |
-| Agent Loop | `packages/core/src/core/client.ts` | GeminiClient 主循环 |
-| Turn 处理 | `packages/core/src/core/turn.ts` | 单轮流解析 |
-| 工具系统 | `packages/core/src/tools/` | 声明式工具定义 |
-| Scheduler | `packages/core/src/scheduler/` | 工具执行状态机 |
-
-**技术特点**
-- 递归 continuation 驱动循环
-- Scheduler 状态机管理工具执行
-- 内置 Loop Detection 防止无限循环
-- 模型路由自动选择
-
-### 2.4 Kimi CLI
-
-**实现概述**
-
-Kimi CLI 是月之暗面（Moonshot AI）推出的 Python 实现 Agent，采用 asyncio 技术栈，注重上下文管理和多 Agent 协作。
-
-**关键代码位置**
-
-| 组件 | 文件路径 | 关键职责 |
-|------|----------|----------|
-| 入口 | `kimi-cli/src/kimi_cli/main.py` | CLI 入口 |
-| Agent Loop | `kimi-cli/src/kimi_cli/agent/soul.py` | KimiSoul 主循环 |
-| 会话管理 | `kimi-cli/src/kimi_cli/session.py` | Session 状态 |
-| 工具系统 | `kimi-cli/src/kimi_cli/tools/` | 模块化工具 |
-| ACP 集成 | `kimi-cli/src/kimi_cli/acp/` | 多 Agent 协议 |
-
-**技术特点**
-- Python/asyncio 异步
-- Checkpoint + revert 上下文回滚机制
-- D-Mail 跨时间线消息系统
-- Ralph 自动迭代模式
-
-### 2.5 OpenCode
-
-**实现概述**
-
-OpenCode 是由 Saunders 开发的 TypeScript 实现，基于 Vercel AI SDK。注重 Agent 系统、权限控制和上下文压缩。
-
-**关键代码位置**
-
-| 组件 | 文件路径 | 关键职责 |
-|------|----------|----------|
-| 入口 | `packages/opencode/src/main.ts` | CLI 入口 |
-| Agent Loop | `packages/opencode/src/session/prompt.ts` | SessionPrompt 主循环 |
-| 处理器 | `packages/opencode/src/session/processor.ts` | 单轮事件处理 |
-| 工具系统 | `packages/opencode/src/tool/` | Zod Schema 定义 |
-| 权限系统 | `packages/opencode/src/session/permission.ts` | PermissionNext |
-
-**技术特点**
-- TypeScript/Vercel AI SDK
-- Zod 类型安全的工具定义
-- 多 Agent 系统（build/plan/explore 等）
-- 上下文压缩（Compaction）机制
+这个"多轮循环 + 工具调用"就是 Agent 的核心。
 
 ---
 
-## 3. 相同点总结
+## 2. Code Agent 的整体架构
 
-### 3.1 架构共性
+```mermaid
+graph TB
+    User["用户输入(自然语言需求)"]
+    LLM["LLM(推理引擎)"]
+    AgentLoop["Agent Loop(控制器)"]
+    Tools["工具系统(执行器)"]
+    Env["本地环境(文件系统 / Shell / 网络)"]
+    Context["上下文管理(记忆)"]
 
-| 维度 | 共性描述 |
-|------|----------|
-| **Agent Loop** | 都实现了"模型推理 → 工具调用 → 结果回注 → 继续推理"的循环 |
-| **工具系统** | 都支持文件操作、Shell 执行、代码搜索等核心工具 |
-| **上下文管理** | 都管理对话历史和工具执行结果 |
-| **流式输出** | 都支持模型输出的实时流式展示 |
-| **安全控制** | 都有某种形式的权限确认机制 |
+    User -->|"发送请求"| AgentLoop
+    AgentLoop -->|"构建 prompt"| LLM
+    LLM -->|"返回思考 + 工具调用"| AgentLoop
+    AgentLoop -->|"解析工具调用"| Tools
+    Tools -->|"执行并返回结果"| AgentLoop
+    AgentLoop -->|"结果写入历史"| Context
+    Context -->|"历史消息"| LLM
+    Tools <-->|"读写文件、执行命令"| Env
+    AgentLoop -->|"任务完成时"| User
+```
 
-### 3.2 工具共性
+**五个核心组件，缺一不可：**
 
-所有 Agent 都提供以下核心工具类别：
-
-- **文件操作**：read、write、edit、glob、grep
-- **Shell 执行**：bash/command 执行
-- **代码搜索**：语义搜索或文本搜索
-- **网络访问**：web search、URL fetch
-- **任务完成**：submit/done 标记
-
-### 3.3 交互模式共性
-
-- 命令行界面作为主入口
-- 交互式 REPL 模式
-- 单次命令执行模式
-- 会话历史持久化
-
----
-
-## 4. 不同点对比
-
-### 4.1 技术栈对比
-
-| Agent | 语言 | 运行时 | 配置格式 |
-|-------|------|--------|----------|
-| SWE-agent | Python | 同步/异步 | Pydantic + YAML |
-| Codex | Rust | tokio 异步 | Rust struct |
-| Gemini CLI | TypeScript | Node.js | TypeScript 对象 |
-| Kimi CLI | Python | asyncio | Pydantic |
-| OpenCode | TypeScript | Bun/Node | Zod Schema |
-
-### 4.2 Agent Loop 机制对比
-
-| Agent | 循环模式 | 核心组件 | 特点 |
-|-------|----------|----------|------|
-| SWE-agent | Step 循环 | `Agent` 类 | 基于历史记录的 step 推进 |
-| Codex | Turn 循环 | `AgentLoop` + `Turn` | actor 模型消息传递 |
-| Gemini CLI | 递归 continuation | `GeminiClient` + `Turn` | 递归驱动，Scheduler 状态机 |
-| Kimi CLI | Step 循环 + checkpoint | `KimiSoul` + `_agent_loop` | 可回滚的 step 循环 |
-| OpenCode | while(true) 循环 | `SessionPrompt.loop` | 任务驱动的多分支循环 |
-
-### 4.3 沙箱/安全机制对比
-
-| Agent | 沙箱技术 | 权限控制 | 特点 |
-|-------|----------|----------|------|
-| SWE-agent | Docker 容器 | 命令过滤 | 容器隔离 |
-| Codex | Seatbelt/Landlock + network sandbox | 策略引擎 | 原生系统级沙箱 |
-| Gemini CLI | 无（直接执行） | 策略 + 用户确认 | 审批流程 |
-| Kimi CLI | 无（直接执行） | 用户确认 | 简单确认机制 |
-| OpenCode | 无（直接执行） | PermissionNext 系统 | 细粒度权限 |
-
-### 4.4 上下文管理对比
-
-| Agent | 管理方式 | 压缩机制 | 特点 |
-|-------|----------|----------|------|
-| SWE-agent | 基于 token 限制 | 无内置压缩 | 窗口滑动 |
-| Codex | Conversation 窗口 | 无内置压缩 | 模型级窗口管理 |
-| Gemini CLI | Session 管理 | `tryCompressChat` | 动态压缩 |
-| Kimi CLI | Context + checkpoint | `compact_context` | 显式压缩 + 回滚 |
-| OpenCode | Message DB | `SessionCompaction` | compaction + prune |
-
-### 4.5 工具系统对比
-
-| Agent | 定义方式 | 扩展性 | MCP 支持 |
-|-------|----------|--------|----------|
-| SWE-agent | YAML Bundle | Bundle 配置 | 否 |
-| Codex | Handler trait | 动态注册 | 是 |
-| Gemini CLI | 声明式类 | 内置 + 发现 + MCP | 是 |
-| Kimi CLI | Python 类 | 模块化 | ACP 协议 |
-| OpenCode | Zod Schema | 动态注册 + 插件 | 是 |
-
-### 4.6 多 Agent 协作对比
-
-| Agent | 协作机制 | 子 Agent | 特点 |
-|-------|----------|----------|------|
-| SWE-agent | 否 | 否 | 单 Agent |
-| Codex | 否 | 否 | 单 Agent |
-| Gemini CLI | 否 | 否 | 单 Agent（IDE 扩展除外） |
-| Kimi CLI | ACP 协议 | `CreateSubagent` + `Task` | 支持子 Agent |
-| OpenCode | Subtask 机制 | 多 Agent 系统 | explore/build/plan |
+| 组件 | 职责 | 类比 |
+|------|------|------|
+| **LLM** | 推理：下一步该做什么 | 大脑 |
+| **Agent Loop** | 协调循环，直到任务完成 | 操作系统调度器 |
+| **工具系统** | 执行具体操作（读写文件、运行命令） | 手和工具 |
+| **上下文管理** | 管理历史消息，不超出 token 限制 | 短期记忆 |
+| **本地环境** | 实际的文件系统、Shell、网络 | 操作台 |
 
 ---
 
-## 5. 源码索引
+## 3. 一次完整的任务执行流程
 
-### 5.1 入口文件
+以"帮我给这个函数加单元测试"为例：
 
-| Agent | 文件路径 | 说明 |
-|-------|----------|------|
-| SWE-agent | `sweagent/run/run.py:1` | CLI 入口 |
-| Codex | `codex-rs/cli/src/main.rs:1` | CLI 入口 |
-| Gemini CLI | `packages/cli/src/index.ts:1` | CLI 入口 |
-| Kimi CLI | `kimi-cli/src/kimi_cli/main.py:1` | CLI 入口 |
-| OpenCode | `packages/opencode/src/main.ts:1` | CLI 入口 |
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant L as Agent Loop
+    participant M as LLM
+    participant T as 工具
 
-### 5.2 Agent Loop 核心
+    U->>L: "给 utils.py 的 parse_date 加单测"
+    L->>M: [系统提示 + 用户消息]
+    M-->>L: 思考："先读一下 utils.py"<br/>→ 工具调用: read_file("utils.py")
+    L->>T: 执行 read_file
+    T-->>L: 文件内容
+    L->>M: [历史 + 文件内容]
+    M-->>L: 思考："需要检查现有测试文件"<br/>→ 工具调用: glob("test_*.py")
+    L->>T: 执行 glob
+    T-->>L: ["test_utils.py"]
+    L->>M: [历史 + 文件列表]
+    M-->>L: 思考："写测试代码"<br/>→ 工具调用: write_file("test_utils.py", ...)
+    L->>T: 执行 write_file
+    T-->>L: 写入成功
+    L->>M: [历史 + 写入结果]
+    M-->>L: "已完成，新增了 3 个测试用例"（无工具调用）
+    L->>U: 输出最终结果
+```
 
-| Agent | 文件路径 | 说明 |
-|-------|----------|------|
-| SWE-agent | `sweagent/agent/agents.py:200` | `DefaultAgent` 类 |
-| Codex | `codex-rs/core/src/agent_loop.rs:150` | `AgentLoop` 结构体 |
-| Gemini CLI | `packages/core/src/core/client.ts:100` | `GeminiClient.sendMessageStream` |
-| Kimi CLI | `kimi-cli/src/kimi_cli/agent/soul.py:300` | `KimiSoul._agent_loop` |
-| OpenCode | `packages/opencode/src/session/prompt.ts:200` | `SessionPrompt.loop` |
-
-### 5.3 工具系统核心
-
-| Agent | 文件路径 | 说明 |
-|-------|----------|------|
-| SWE-agent | `sweagent/tools/tools.py:1` | `ToolConfig` 类 |
-| Codex | `codex-rs/core/src/tools/registry.rs:50` | `ToolRegistry` 结构体 |
-| Gemini CLI | `packages/core/src/tools/tools.ts:80` | `ToolRegistry` 类 |
-| Kimi CLI | `kimi-cli/src/kimi_cli/tools/__init__.py:50` | 工具初始化 |
-| OpenCode | `packages/opencode/src/tool/tool.ts:75` | `Tool.define` 工厂函数 |
-
-### 5.4 会话/上下文管理
-
-| Agent | 文件路径 | 说明 |
-|-------|----------|------|
-| SWE-agent | `sweagent/agent/agents.py:80` | `AgentConfig` 配置 |
-| Codex | `codex-rs/core/src/session.rs:100` | `Session` 结构体 |
-| Gemini CLI | `packages/core/src/core/client.ts:80` | `GeminiClient` 会话 |
-| Kimi CLI | `kimi-cli/src/kimi_cli/session.py:100` | `Session` 类 |
-| OpenCode | `packages/opencode/src/session/session.ts:100` | Session 状态 |
+**关键点：** LLM 从不直接操作文件。它只输出"我想做什么"，由工具系统实际执行。
 
 ---
 
-## 6. 选择建议
+## 4. 五个项目的定位
 
-| 场景 | 推荐 Agent | 理由 |
-|------|-----------|------|
-| 学术研究/可复现性 | SWE-agent | Docker 隔离，配置驱动，学术友好 |
-| 性能敏感/企业安全 | Codex | Rust 高性能，原生沙箱 |
-| IDE 集成/智能体 | Gemini CLI | Google 官方，IDE 支持好 |
-| 多 Agent 协作 | Kimi CLI | ACP 协议，子 Agent 支持 |
-| Agent 系统实验 | OpenCode | 多 Agent 架构，权限系统完善 |
+本仓库分析了 5 个主流 Code Agent 项目，它们解决同一个问题，但在工程取舍上各有侧重：
+
+```mermaid
+graph LR
+    subgraph 学术研究
+        SWE["SWE-agent\nPython + Docker\n最强可复现性"]
+    end
+    subgraph 系统安全
+        Codex["Codex\nRust + tokio\n原生沙箱"]
+    end
+    subgraph 生态集成
+        Gemini["Gemini CLI\nTypeScript + Node\nIDE 集成优先"]
+    end
+    subgraph 多Agent协作
+        Kimi["Kimi CLI\nPython + asyncio\nCheckpoint 回滚"]
+    end
+    subgraph 可扩展性
+        OpenCode["OpenCode\nTypeScript + Bun\n插件 + 多 Agent"]
+    end
+```
+
+| 项目 | 语言 | 核心特点 | 适合研究的问题 |
+|------|------|----------|----------------|
+| **SWE-agent** | Python | Docker 隔离，配置驱动，学术标杆 | 工具系统设计、评估框架 |
+| **Codex** | Rust | 原生 Seatbelt/Landlock 沙箱，actor 模型 | 安全架构、高性能并发 |
+| **Gemini CLI** | TypeScript | 递归 continuation 驱动，Scheduler 状态机 | Loop 控制流设计 |
+| **Kimi CLI** | Python | Checkpoint + revert 回滚机制 | 上下文状态管理 |
+| **OpenCode** | TypeScript | 多 Agent 系统，Zod 类型安全工具 | 可扩展工具系统 |
+
+---
+
+## 5. 核心机制导航
+
+理解 Code Agent，需要依次掌握以下模块（建议阅读顺序）：
+
+```
+01-comm-overview.md       ← 你在这里（整体认知）
+        ↓
+04-comm-agent-loop.md     ← 最核心：循环如何驱动
+        ↓
+05-comm-tools-system.md   ← 工具如何定义和执行
+        ↓
+07-comm-memory-context.md ← 上下文如何管理
+        ↓
+06-comm-mcp-integration.md ← 如何集成外部工具
+        ↓
+10-comm-safety-control.md  ← 如何防止危险操作
+        ↓
+03-comm-session-runtime.md ← Session 生命周期
+```
+
+---
+
+## 6. 架构共性 vs 实现差异
+
+### 所有项目共有的核心流程
+
+无论语言和实现如何不同，每个项目都实现了以下循环（伪代码）：
+
+```python
+# 所有 Code Agent 的本质
+while task_not_done:
+    response = llm.call(context)          # 问 LLM 下一步
+    if response.has_tool_calls:
+        for call in response.tool_calls:
+            result = tools.execute(call)  # 执行工具
+            context.append(result)        # 结果写入历史
+    else:
+        break                             # 没有工具调用 = 任务完成
+```
+
+- SWE-agent 实现：`sweagent/agent/agents.py:390` (`run()` 方法)
+- Kimi CLI 实现：`kimi-cli/packages/kosong/src/kosong/__main__.py:47` (`agent_loop()`)
+- Gemini CLI 实现：`gemini-cli/packages/core/src/core/client.ts:789` (`sendMessageStream()`)
+- OpenCode 实现：`opencode/packages/opencode/src/session/prompt.ts:294` (`while(true)` 循环)
+- Codex 实现：`codex/codex-rs/core/src/agent/control.rs:55` (`spawn_agent()`)
+
+### 各项目的关键差异维度
+
+| 维度 | 差异点 | 影响 |
+|------|--------|------|
+| **Loop 驱动方式** | 迭代 vs 递归 vs actor 消息 | 并发安全性、调试难度 |
+| **工具定义方式** | YAML vs Rust trait vs Zod Schema | 类型安全性、扩展成本 |
+| **上下文策略** | 内存 vs SQLite vs Checkpoint | 持久化能力、回滚能力 |
+| **安全模型** | Docker vs 系统沙箱 vs 确认机制 | 隔离强度 vs 性能损耗 |
+| **工具扩展** | Bundle vs MCP vs 插件 | 第三方集成生态 |
+
+---
+
+## 7. 关键代码入口索引
+
+| 项目 | 入口文件 | Agent Loop 核心 | 工具系统核心 |
+|------|----------|-----------------|--------------|
+| SWE-agent | `sweagent/run/run.py` | `sweagent/agent/agents.py:390` | `sweagent/tools/tools.py` |
+| Codex | `codex-rs/cli/src/main.rs` | `codex-rs/core/src/agent/control.rs:55` | `codex-rs/core/src/tools/` |
+| Gemini CLI | `packages/cli/src/index.ts` | `packages/core/src/core/client.ts:789` | `packages/core/src/tools/` |
+| Kimi CLI | `src/kimi_cli/main.py` | `packages/kosong/src/kosong/__main__.py:47` | `packages/kosong/src/kosong/tooling/` |
+| OpenCode | `packages/opencode/src/main.ts` | `packages/opencode/src/session/prompt.ts:274` | `packages/opencode/src/tool/` |

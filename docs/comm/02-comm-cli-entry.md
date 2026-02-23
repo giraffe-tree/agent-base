@@ -1,20 +1,113 @@
-# CLI 入口与启动流程对比
+# CLI 入口与启动流程
 
-## 1. 概念定义
+## TL;DR
 
-CLI（Command Line Interface）入口是用户与 Agent 交互的第一个接触点。它负责解析命令行参数、初始化配置、建立与 LLM 的连接，并启动主交互循环。
-
-### 核心职责
-
-- **参数解析**：解析命令行参数（子命令、选项、路径等）
-- **配置加载**：从文件、环境变量或交互式输入加载配置
-- **身份验证**：管理 API Key、OAuth Token 等凭证
-- **运行时初始化**：创建 Agent 实例、加载工具、建立会话
-- **模式分发**：根据参数选择 REPL、单次执行或服务器模式
+CLI 入口负责五件事：解析参数 → 加载配置 → 验证身份 → 初始化组件 → 分发到运行模式（REPL / 单次执行 / 批量 / 服务器）。各项目的差异主要在于"支持哪些运行模式"和"配置从哪里来"。
 
 ---
 
-## 2. 各 Agent 实现
+## 1. 启动流程通用结构
+
+```mermaid
+flowchart TD
+    A["用户输入命令\ncli --model gpt-4 '帮我重构'"] --> B["解析 CLI 参数\n（argparse/clap/commander/typer）"]
+    B --> C["加载配置\n（~/.config + 环境变量 + 命令行覆盖）"]
+    C --> D["身份验证\n（API Key / OAuth）"]
+    D --> E["初始化组件\n（工具注册 / MCP Server / Session）"]
+    E --> F{运行模式?}
+    F -->|"有输入参数"| G["单次执行模式"]
+    F -->|"无输入参数"| H["REPL 交互模式"]
+    F -->|"--batch"| I["批量处理模式"]
+    F -->|"--server"| J["HTTP 服务模式"]
+```
+
+**设计动机：** 入口层的核心职责是"把外部输入翻译成内部配置"。好的入口设计应该让配置来源透明（命令行 > 环境变量 > 配置文件）、运行模式可扩展。
+
+---
+
+## 2. 各项目实现
+
+### 核心差异概览
+
+| 项目 | CLI 库 | 支持的运行模式 | 认证方式 |
+|------|--------|---------------|----------|
+| SWE-agent | `argparse` | run / run-batch / eval | API Key（环境变量）|
+| Codex | `clap` (Rust) | TUI / 直接执行 / REPL | API Key（配置文件）|
+| Gemini CLI | `commander` | chat / ide | OAuth（keychain 存储）|
+| Kimi CLI | `typer` | REPL + ralph 自动迭代 | OAuth（配置文件）|
+| OpenCode | 自定义 | REPL / 单次 / server | API Key |
+
+### 2.1 SWE-agent（任务批处理导向）
+
+**入口**：`sweagent/run/run.py`
+
+```
+main()
+├── run         → RunSingleCommandHandler → Docker 启动 → Agent 循环
+├── run-batch   → RunBatchCommandHandler → 并行多任务 → 报告汇总
+└── eval        → 评估模式，对比 ground truth
+```
+
+启动最慢（需要等待 Docker 容器就绪），但支持批量评估 —— 适合学术实验。
+
+### 2.2 Codex（极简，快速启动）
+
+**入口**：`codex-rs/cli/src/main.rs`
+
+启动流程：解析参数（`flags.rs`）→ 直接进入 TUI 或执行单条指令。
+
+不需要显式子命令：`codex` 启动 TUI，`codex "做什么"` 直接执行，`-m` 指定模型。
+
+**工程取舍：** 极简 CLI 设计降低了学习成本，但也限制了高级配置能力。
+
+### 2.3 Kimi CLI（ralph 模式）
+
+**入口**：`kimi-cli/src/kimi_cli/main.py`
+
+Ralph 模式（`--ralph`）是 Kimi CLI 的特色：不等待用户输入，Agent 自主循环执行直到任务完成或达到迭代上限。这更接近"自动 Agent"而不是"交互式助手"。
+
+---
+
+## 3. 配置加载策略
+
+**通用优先级**（所有项目相同）：
+
+```
+命令行参数 > 环境变量 > 项目级配置文件 > 用户级配置文件 > 内置默认值
+```
+
+**配置位置**：
+
+| 项目 | 配置文件路径 | 格式 |
+|------|------------|------|
+| Codex | `~/.codex/config.toml` | TOML |
+| Gemini CLI | `~/.gemini/settings.json` | JSON |
+| Kimi CLI | `~/.kimi/config.yaml` | YAML |
+| OpenCode | `~/.opencode/config.json` | JSON |
+
+---
+
+## 4. 设计意图与工程取舍
+
+**为什么配置有三个来源（命令行 / 环境变量 / 文件）？**
+
+这是 12-Factor App 原则：
+- **命令行** 适合临时覆盖（调试时用不同模型）
+- **环境变量** 适合 CI/CD 场景（不把密钥写进文件）
+- **配置文件** 适合持久化的个人偏好
+
+**运行模式的 trade-off：**
+
+| 模式 | 优势 | 劣势 |
+|------|------|------|
+| REPL 交互 | 灵活，支持多轮对话 | 不适合自动化 |
+| 单次执行 | 可脚本化 | 上下文不保留 |
+| 批量模式 | 高吞吐量 | 需要提前准备输入 |
+| 服务器模式 | 支持远程调用 | 额外安全风险 |
+
+---
+
+## 5. 各 Agent 实现细节
 
 ### 2.1 SWE-agent
 

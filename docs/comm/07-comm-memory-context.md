@@ -1,388 +1,214 @@
-# 记忆与上下文管理对比
+# 记忆与上下文管理
 
-## 1. 概念定义
+## TL;DR
 
-**记忆（Memory）** 是 Agent 在会话过程中积累和保留的信息，包括对话历史、工具执行结果、文件状态等。
-
-**上下文（Context）** 是每次模型调用时传递给 LLM 的完整信息集合，包括系统提示、历史消息、当前输入等。
-
-### 核心挑战
-
-- **上下文窗口限制**：LLM 有最大 token 限制
-- **信息检索**：如何快速找到相关信息
-- **状态持久化**：如何保存和恢复会话状态
-- **压缩与摘要**：如何处理超长上下文
+LLM 的"记忆"就是每次调用时传入的消息历史。上下文管理的核心问题是：token 有上限，历史会越来越长，必须设计策略应对溢出。五个项目提供了三种截然不同的策略：**滑动窗口**（最简单）、**动态压缩**（LLM 自己做摘要）、**Checkpoint 回滚**（LLM 主动截断冗余）。
 
 ---
 
-## 2. 各 Agent 实现
+## 1. 为什么上下文管理是个难题
 
-### 2.1 SWE-agent
+### Token 窗口限制
 
-**实现概述**
-
-SWE-agent 使用简单的列表存储历史记录，基于 token 数量进行窗口管理，无内置压缩机制。
-
-**架构图**
+LLM 每次调用都有 token 上限（比如 128K tokens）。随着任务执行，消息历史不断累积：
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  Agent History (历史记录)                                 │
-│  ├── list[dict]                    消息列表             │
-│  │   ├── {"role": "system", ...}                        │
-│  │   ├── {"role": "user", ...}                          │
-│  │   ├── {"role": "assistant", ...}                     │
-│  │   └── {"role": "user", ...}  (observation)           │
-│  └── token_count                   估算 token 数        │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  Window Management (窗口管理)                             │
-│  ├── 滑动窗口                      保留最近 N 条        │
-│  └── 系统提示始终保留              不受窗口影响         │
-└─────────────────────────────────────────────────────────┘
+初始状态:
+[系统提示(2K)] [用户消息(0.5K)]  → 总计 2.5K，远低于限制
+
+执行 20 步后:
+[系统提示(2K)] [消息历史(50K)] [工具结果(30K)]  → 总计 82K，接近上限
+
+执行 40 步后:
+[系统提示(2K)] [消息历史(100K)] [工具结果(60K)] → 总计 162K，超出限制！
 ```
 
-**关键代码位置**
+**超出限制的后果：** LLM 调用直接失败，或被强制截断（丢失重要上下文）。
 
-| 组件 | 文件路径 | 行号 | 说明 |
-|------|----------|------|------|
-| History | `sweagent/agent/agents.py` | 250 | 历史记录 |
-| Token Count | `sweagent/agent/models/` | - | Token 估算 |
+### 上下文管理的三个核心问题
 
-**特点**
-
-- 简单直接，易于理解
-- 无压缩机制，依赖窗口滑动
-- 适合短会话任务
-
-### 2.2 Codex
-
-**实现概述**
-
-Codex 使用 SQLite 存储会话数据，支持 Conversation 和 Item 两层结构，无内置上下文压缩。
-
-**架构图**
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  SQLite Storage (存储层)                                  │
-│  ┌─────────────────────────────────────────────────────┐│
-│  │ conversations 表                                    ││
-│  │ - id, created_at, updated_at                        ││
-│  └─────────────────────────────────────────────────────┘│
-│  ┌─────────────────────────────────────────────────────┐│
-│  │ items 表                                            ││
-│  │ - id, conversation_id, type, content                ││
-│  │ - Type: message, function_call, function_output     ││
-│  └─────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  Conversation Window (上下文窗口)                         │
-│  ├── 加载最近 N 条 Item                               │
-│  ├── 转换为 LLM 消息格式                              │
-│  └── 发送到模型                                       │
-└─────────────────────────────────────────────────────────┘
+```mermaid
+graph LR
+    A["Token 超限"] --> B["如何检测?"]
+    A --> C["如何压缩?"]
+    A --> D["压缩后如何保证不丢失关键信息?"]
 ```
 
-**关键代码位置**
+---
 
-| 组件 | 文件路径 | 行号 | 说明 |
-|------|----------|------|------|
-| Storage | `codex-rs/core/src/storage/sqlite.rs` | 1 | SQLite 存储 |
-| Conversation | `codex-rs/core/src/conversation.rs` | 1 | 会话结构 |
+## 2. 三种主流策略
 
-**特点**
+### 策略一：滑动窗口（SWE-agent / Codex）
 
-- 持久化存储，支持会话恢复
-- SQL 查询能力
-- 依赖模型级窗口管理
+**最简单**的方案：只保留最近的 N 条消息，旧的直接丢弃。
 
-### 2.3 Gemini CLI
-
-**实现概述**
-
-Gemini CLI 使用动态压缩机制，包括 `tryCompressChat` 和 `tryMaskToolOutputs`，支持会话级和 prompt 级状态管理。
-
-**架构图**
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  GeminiClient (会话管理)                                  │
-│  ├── sessionTurnCount              会话轮次计数         │
-│  ├── maxSessionTurns               最大轮次限制         │
-│  └── chatHistory                   聊天历史             │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  Compression (压缩机制)                                   │
-│  ├── tryCompressChat()             压缩历史             │
-│  ├── tryMaskToolOutputs()          遮罩大输出           │
-│  └── ContextWindowWillOverflow     溢出预警             │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  IDE Context (可选)                                       │
-│  └── 追加 editor context           代码上下文           │
-└─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph before["添加前"]
+        direction LR
+        M1["msg 1"] --> M2["msg 2"] --> M3["msg 3"] --> M4["msg 4"]
+    end
+    subgraph after["超限后"]
+        direction LR
+        M2b["msg 2"] --> M3b["msg 3"] --> M4b["msg 4"] --> M5["msg 5"]
+    end
+    before -->|"添加 msg 5\n触发滑动"| after
+    M1 -->|"丢弃"| X["❌"]
 ```
 
-**关键代码位置**
+**SWE-agent 实现**（`sweagent/agent/agents.py:390`）：
+- 依赖模型层（OpenAI API）处理 token 截断，自身不做显式压缩
+- `history` 是 Python list，线性追加
 
-| 组件 | 文件路径 | 行号 | 说明 |
-|------|----------|------|------|
-| Client | `packages/core/src/core/client.ts` | 80 | 会话管理 |
-| Compression | `packages/core/src/core/compression.ts` | - | 压缩逻辑 |
+**Codex 实现**：
+- 使用 SQLite 持久化消息（`codex-rs/core/src/tools/`），支持会话恢复
+- 同样依赖模型的 context window 管理，不做主动压缩
 
-**压缩策略**
+**适用场景：** 短任务、每次任务相对独立、不需要长期记忆  
+**风险：** 丢弃旧消息可能丢失关键约束或早期决策
 
-- **智能压缩**：保留重要消息，移除冗余
-- **输出遮罩**：隐藏大体积工具输出
-- **溢出预警**：提前检测上下文溢出
+---
 
-### 2.4 Kimi CLI
+### 策略二：动态压缩（Gemini CLI / OpenCode）
 
-**实现概述**
+**当上下文快满时，触发 LLM 自动生成摘要，替换掉详细历史。**
 
-Kimi CLI 提供最强大的上下文管理能力，包括 Checkpoint 回滚机制和显式压缩功能。
-
-**架构图**
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  Context (上下文管理)                                     │
-│  ├── history: list[Message]        消息历史             │
-│  ├── token_count: int              Token 计数           │
-│  └── checkpoints: list[Checkpoint] 检查点列表           │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  Checkpoint System (检查点系统)                           │
-│  ├── checkpoint()                  创建检查点           │
-│  ├── revert_to(id)                 回滚到检查点         │
-│  └── BackToTheFuture               D-Mail 异常          │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  Compaction (上下文压缩)                                  │
-│  ├── compact_context()             压缩上下文           │
-│  ├── 生成压缩消息                  LLM 生成摘要         │
-│  └── 重建 checkpoint               新起点               │
-└─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    A["每轮循环入口"] --> B["检查 token 使用量"]
+    B --> C{是否超过阈值?}
+    C -->|否| D["正常继续"]
+    C -->|是| E["触发压缩"]
+    E --> F["调用 LLM:\n'请总结以下对话历史...'"]
+    F --> G["摘要文本\n(比原历史小 10x)"]
+    G --> H["用摘要替换旧历史"]
+    H --> D
 ```
 
-**关键代码位置**
-
-| 组件 | 文件路径 | 行号 | 说明 |
-|------|----------|------|------|
-| Context | `kimi-cli/src/kimi_cli/context.py` | 1 | 上下文类 |
-| Checkpoint | `kimi-cli/src/kimi_cli/checkpoint.py` | 1 | 检查点 |
-| Compaction | `kimi-cli/src/kimi_cli/agent/soul.py` | 350 | 压缩逻辑 |
-
-**D-Mail 机制**
-
-```python
-# 抛出异常触发回滚
-raise BackToTheFuture(
-    checkpoint_id=checkpoint_id,
-    messages=[system_prompt, dmail_content]
-)
-
-# Agent Loop 捕获并处理
-try:
-    outcome = await self._step()
-except BackToTheFuture as e:
-    # 回滚到检查点
-    self.context.revert_to(e.checkpoint_id)
-    # 创建新检查点
-    self.context.checkpoint()
-    # 注入 D-Mail
-    self.context.append(SystemMessage(content=e.messages))
-```
-
-### 2.5 OpenCode
-
-**实现概述**
-
-OpenCode 使用 SQLite 存储消息和 Part，提供 Compaction 和 Prune 两种上下文管理机制。
-
-**架构图**
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  SQLite DB (数据层)                                       │
-│  ┌─────────────────────────────────────────────────────┐│
-│  │ sessions 表                                         ││
-│  └─────────────────────────────────────────────────────┘│
-│  ┌─────────────────────────────────────────────────────┐│
-│  │ messages 表                                         ││
-│  │ - id, sessionID, type, finish                       ││
-│  └─────────────────────────────────────────────────────┘│
-│  ┌─────────────────────────────────────────────────────┐│
-│  │ parts 表                                            ││
-│  │ - id, messageID, type, status                       ││
-│  │ - type: text, tool, reasoning                       ││
-│  └─────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  Compaction (上下文压缩)                                  │
-│  ├── SessionCompaction.process()   压缩处理             │
-│  ├── compaction agent              无工具权限           │
-│  └── 生成结构化摘要                目标/进展/文件       │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  Prune (输出裁剪)                                         │
-│  ├── SessionCompaction.prune()     裁剪旧输出           │
-│  └── 保护受保护工具                skill 等             │
-└─────────────────────────────────────────────────────────┘
-```
-
-**关键代码位置**
-
-| 组件 | 文件路径 | 行号 | 说明 |
-|------|----------|------|------|
-| Session | `packages/opencode/src/session/session.ts` | 100 | 会话 |
-| Message | `packages/opencode/src/session/message.ts` | 1 | 消息 |
-| Compaction | `packages/opencode/src/session/compaction.ts` | 1 | 压缩 |
-
-**Compaction 触发条件**
+**Gemini CLI 实现**（`gemini-cli/packages/core/src/core/client.ts:577`）：
 
 ```typescript
-// 已用 token >= (模型上下文窗口 - reserved buffer)
-const isOverflow = () => {
-    return usedTokens >= (maxContextWindow - reservedBuffer);
-};
+// 每轮推理前检查
+const compressed = await this.tryCompressChat(prompt_id, false);
+if (compressed.compressionStatus === CompressionStatus.COMPRESSED) {
+    yield { type: GeminiEventType.ChatCompressed, value: compressed };
+}
 
-// 默认 reserved = min(20000, maxOutputTokens)
+// 还有另一层保险：遮罩大体积工具输出
+await this.tryMaskToolOutputs(this.getHistory());  // client.ts:586
 ```
 
----
+`tryCompressChat()` 在 `client.ts:1045`，调用 `compressionService.compress()` 生成摘要。
 
-## 3. 相同点总结
+**OpenCode 实现**（`opencode/packages/opencode/src/session/compaction.ts:32`）：
 
-### 3.1 通用结构
+```typescript
+// 判断是否超限
+export async function isOverflow(input: { tokens, model }) {
+    const reserved = config.compaction?.reserved
+        ?? Math.min(COMPACTION_BUFFER, maxOutputTokens(input.model))
+    return input.tokens.total >= (model.contextWindow - reserved)
+}
+```
 
-所有 Agent 都管理以下信息：
+OpenCode 还有额外的 `prune()` 策略（`compaction.ts:58`）：不触发全量摘要，而是从后往前扫描工具输出，把超过 40K token 的部分标记为"已压缩"，保留消息结构但截断内容。
 
-| 信息类型 | 说明 |
-|----------|------|
-| 系统提示 | Agent 的角色和行为定义 |
-| 用户消息 | 用户的输入 |
-| 助手响应 | LLM 的回复 |
-| 工具调用 | 工具执行请求和结果 |
-| Token 计数 | 上下文使用量估算 |
-
-### 3.2 通用策略
-
-| 策略 | 说明 |
-|------|------|
-| 窗口滑动 | 保留最近的消息，丢弃旧的 |
-| 系统提示保护 | 始终保留系统提示 |
-| Token 估算 | 估算上下文使用量 |
+**两者的关键差异：**
+- Gemini CLI：调用独立 LLM 生成摘要（需要额外 API 调用，但摘要质量更好）
+- OpenCode：先 prune（快速截断），再用专用 `compaction` Agent 生成结构化摘要（`compaction.ts:109`）
 
 ---
 
-## 4. 不同点对比
+### 策略三：Checkpoint + D-Mail 回滚（Kimi CLI）
 
-### 4.1 存储方式
+**最独特的策略：让 LLM 自己决定"哪些历史可以丢"，主动发送回滚信号。**
 
-| Agent | 存储介质 | 持久化 | 查询能力 |
-|-------|----------|--------|----------|
-| SWE-agent | 内存 | 可选文件 | 无 |
-| Codex | SQLite | 自动 | SQL |
-| Gemini CLI | 内存 | 可选 | 无 |
-| Kimi CLI | 内存 | 无 | 无 |
-| OpenCode | SQLite | 自动 | SQL + 索引 |
+```mermaid
+sequenceDiagram
+    participant L as Agent Loop
+    participant C as Context
+    participant LLM as LLM
 
-### 4.2 上下文粒度
+    L->>C: checkpoint() # 步骤 N 前打点
+    Note over C: 记录 CHECKPOINT 0
 
-| Agent | 存储单位 | 粒度 | 特点 |
-|-------|----------|------|------|
-| SWE-agent | Message | 粗 | 简单 |
-| Codex | Item | 中 | 类型化 |
-| Gemini CLI | Content/Thought/ToolCall | 细 | 事件驱动 |
-| Kimi CLI | Message | 中 | 可回滚 |
-| OpenCode | Part | 最细 | 灵活 |
+    L->>LLM: 执行了很多步骤...
+    Note right of LLM: 读了一个 100KB 的文件\n大部分内容没用
 
-### 4.3 压缩机制
+    LLM-->>L: 调用 SendDMail 工具:\n{checkpoint_id: 0, message: "文件摘要: 只有第 5 行有用"}
+    L->>C: revert_to(0)  # 回滚到 CHECKPOINT 0
+    L->>C: append(dmail_message)  # 注入摘要
+    Note over C: 上下文从 50K 变回 5K
+    L->>LLM: 继续执行（更精简的上下文）
+```
 
-| Agent | 压缩方式 | 触发条件 | 特点 |
-|-------|----------|----------|------|
-| SWE-agent | 无 | - | 依赖窗口滑动 |
-| Codex | 无 | - | 依赖模型窗口 |
-| Gemini CLI | 动态压缩 | Token 阈值 | 智能压缩 |
-| Kimi CLI | 显式压缩 | Token 阈值 | 生成摘要 |
-| OpenCode | Compaction + Prune | Token 阈值 | 滑动窗口 |
+**关键代码位置：**
+- `context.py:68`：`checkpoint()` —— 在历史中插入 `CHECKPOINT N` 标记
+- `context.py:80`：`revert_to(checkpoint_id)` —— 截断到指定检查点
+- `denwarenji.py:8`：`DMail` 结构体 —— LLM 调用的 D-Mail 工具参数
 
-### 4.4 状态恢复
+**D-Mail 的工程意图**（`kimi-cli/src/kimi_cli/tools/dmail/dmail.md`）：
+> "Unlike D-Mail in Steins;Gate, the D-Mail you send here will not revert the filesystem or any external state. You are basically **folding the recent messages in your context into a single message**."
 
-| Agent | 回滚能力 | 实现方式 | 应用场景 |
-|-------|----------|----------|----------|
-| SWE-agent | 否 | - | - |
-| Codex | 否 | - | - |
-| Gemini CLI | 否 | - | - |
-| Kimi CLI | 是 | Checkpoint | D-Mail |
-| OpenCode | 否 | - | - |
+即：文件系统修改不回滚，只有 **LLM 看到的历史** 被压缩。这是"逻辑回滚"而非"物理回滚"。
 
-### 4.5 Token 管理
-
-| Agent | 估算方式 | 预留空间 | 溢出处理 |
-|-------|----------|----------|----------|
-| SWE-agent | 字符估算 | 无 | 截断 |
-| Codex | 模型计算 | 无 | 依赖模型 |
-| Gemini CLI | 模型计算 | 有 | 压缩 |
-| Kimi CLI | 模型计算 | 有 | 压缩 |
-| OpenCode | 模型计算 | 有 | compaction |
+**适用场景：** 长任务中有明确的"探索—确认"模式（先探索多个方向，发现有用信息后，抛弃探索过程，只保留结论）。
 
 ---
 
-## 5. 源码索引
+## 3. 存储方式对比
 
-### 5.1 上下文定义
+上下文管理还涉及持久化：任务中断后能否恢复？
 
-| Agent | 文件路径 | 行号 | 说明 |
-|-------|----------|------|------|
-| SWE-agent | `sweagent/agent/agents.py` | 250 | history 列表 |
-| Codex | `codex-rs/core/src/conversation.rs` | 1 | Conversation |
-| Gemini CLI | `packages/core/src/core/client.ts` | 80 | chatHistory |
-| Kimi CLI | `kimi-cli/src/kimi_cli/context.py` | 1 | Context |
-| OpenCode | `packages/opencode/src/session/session.ts` | 100 | SessionV2 |
+```mermaid
+graph TD
+    subgraph memory["内存存储（无持久化）"]
+        A1["SWE-agent\nlist[dict]"]
+        A2["Gemini CLI\nchatHistory"]
+        A3["Kimi CLI\nfile backend + in-memory"]
+    end
+    subgraph sqlite["SQLite 持久化"]
+        B1["Codex\nconversations + items 表"]
+        B2["OpenCode\nsessions + messages + parts 表"]
+    end
 
-### 5.2 压缩/管理
+    memory -->|"进程退出即消失"| X1["❌ 无法跨会话恢复"]
+    sqlite -->|"进程退出后仍保留"| X2["✅ 支持会话恢复"]
+```
 
-| Agent | 文件路径 | 行号 | 说明 |
-|-------|----------|------|------|
-| Gemini CLI | `packages/core/src/core/compression.ts` | 1 | tryCompressChat |
-| Kimi CLI | `kimi-cli/src/kimi_cli/agent/soul.py` | 350 | compact_context |
-| OpenCode | `packages/opencode/src/session/compaction.ts` | 1 | SessionCompaction |
-
-### 5.3 存储/持久化
-
-| Agent | 文件路径 | 行号 | 说明 |
-|-------|----------|------|------|
-| Codex | `codex-rs/core/src/storage/sqlite.rs` | 1 | SQLite 存储 |
-| OpenCode | `packages/opencode/src/db/` | - | Drizzle ORM |
+**Kimi CLI 的特殊机制**（`context.py:17`）：使用文件作为"弱持久化"后端，每次操作 append-only 写入日志文件，支持 `restore()` 从文件重建历史（`context.py:24`）。既不是纯内存，也不是完整 SQLite，是轻量的中间方案。
 
 ---
 
-## 6. 选择建议
+## 4. 核心工程取舍对比
 
-| 场景 | 推荐 Agent | 理由 |
-|------|-----------|------|
-| 简单任务 | SWE-agent | 轻量，无复杂管理 |
-| 会话恢复 | Codex/OpenCode | SQLite 持久化 |
-| 长上下文 | Gemini CLI | 动态压缩 |
-| 需要回滚 | Kimi CLI | Checkpoint 机制 |
-| 细粒度控制 | OpenCode | Part 级别管理 |
-| 上下文压缩 | Kimi CLI/OpenCode | 显式压缩策略 |
+| 维度 | 滑动窗口 | 动态压缩 | Checkpoint 回滚 |
+|------|----------|----------|-----------------|
+| **实现复杂度** | 低 | 中 | 高 |
+| **信息损失** | 高（整条消息丢弃） | 中（摘要质量取决于 LLM） | 低（LLM 自己选择保留什么） |
+| **额外 API 调用** | 无 | 有（压缩需要 LLM） | 有（D-Mail 也是工具调用） |
+| **适合任务类型** | 短任务、独立任务 | 长任务、通用 | 探索性长任务 |
+| **调试友好度** | 高 | 中 | 低（需要理解回滚逻辑） |
+
+**选择参考：**
+- 做快速原型或短任务 → 滑动窗口（SWE-agent 风格）
+- 需要长上下文支持但不想复杂化 → 动态压缩（Gemini CLI 风格）
+- 任务有大量探索阶段（读文件、搜索、尝试方案）→ Checkpoint 回滚（Kimi CLI 风格）
+
+---
+
+## 5. 关键代码索引
+
+| 项目 | 文件 | 行号 | 说明 |
+|------|------|------|------|
+| SWE-agent | `sweagent/agent/agents.py` | 390 | 历史追加（`history.append()`） |
+| Kimi CLI | `src/kimi_cli/soul/context.py` | 16 | `Context` 类 —— 上下文管理核心 |
+| Kimi CLI | `src/kimi_cli/soul/context.py` | 68 | `checkpoint()` —— 创建检查点 |
+| Kimi CLI | `src/kimi_cli/soul/context.py` | 80 | `revert_to()` —— 回滚到检查点 |
+| Kimi CLI | `src/kimi_cli/soul/denwarenji.py` | 8 | `DMail` —— D-Mail 数据结构 |
+| Gemini CLI | `packages/core/src/core/client.ts` | 577 | `tryCompressChat()` 触发点 |
+| Gemini CLI | `packages/core/src/core/client.ts` | 586 | `tryMaskToolOutputs()` —— 输出遮罩 |
+| Gemini CLI | `packages/core/src/core/client.ts` | 1045 | `tryCompressChat()` 实现 |
+| OpenCode | `packages/opencode/src/session/compaction.ts` | 32 | `isOverflow()` —— 溢出检测 |
+| OpenCode | `packages/opencode/src/session/compaction.ts` | 58 | `prune()` —— 工具输出裁剪 |
+| OpenCode | `packages/opencode/src/session/compaction.ts` | 109 | compaction agent 触发 |

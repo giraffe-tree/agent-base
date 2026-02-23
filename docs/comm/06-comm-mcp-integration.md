@@ -1,351 +1,171 @@
-# MCP 集成对比
+# MCP 集成
 
-## 1. 概念定义
+## TL;DR
 
-**MCP（Model Context Protocol）** 是 Anthropic 推出的开放协议，用于标准化 AI 模型与外部工具、数据源之间的集成。它允许 Agent 动态发现和调用外部服务提供的工具。
-
-### 核心概念
-
-- **MCP Server**：提供工具服务的外部进程
-- **MCP Client**：与 Server 通信的客户端
-- **Tool**：Server 暴露的具体功能
-- **Transport**：通信方式（stdio、HTTP、SSE）
+MCP（Model Context Protocol）是一个开放协议，让 Agent 能够通过标准化接口动态发现和调用外部工具，而不需要把所有工具都内置到 Agent 本身。本质是把工具系统的"扩展能力"从 Agent 代码中解耦出来。
 
 ---
 
-## 2. 各 Agent 实现
+## 1. 为什么需要 MCP？
 
-### 2.1 SWE-agent
-
-**实现概述**
-
-SWE-agent 目前**不支持 MCP 协议**。它使用自有的 Bundle 系统进行工具管理。
-
-| 特性 | 支持情况 |
-|------|----------|
-| MCP Client | 否 |
-| MCP Server | 否 |
-| 替代方案 | Bundle 配置 |
-
-### 2.2 Codex
-
-**实现概述**
-
-Codex 通过 `McpClientManager` 实现 MCP 集成，支持从配置启动 MCP Server 并动态发现工具。
-
-**架构图**
+**没有 MCP 时的问题：**
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  Session (会话层)                                         │
-│  ├── mcp_client_manager: Arc<McpClientManager>          │
-│  └── parse_mcp_tool_name()      MCP 工具名解析          │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  McpClientManager (管理层)                                │
-│  ├── start_configured_mcp_servers()  启动配置服务       │
-│  ├── start_extension()               加载扩展服务       │
-│  ├── maybe_discover_mcp_server()     发现并注册工具     │
-│  └── stop()                          清理连接           │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  MCP Servers (外部服务)                                   │
-│  ├── Server 1 (stdio)               本地进程            │
-│  ├── Server 2 (http)                HTTP 服务           │
-│  └── Server 3 (sse)                 SSE 服务            │
-└─────────────────────────────────────────────────────────┘
+想用数据库工具 → 修改 Agent 源码 → 重新构建
+想用 Jira 工具  → 修改 Agent 源码 → 重新构建
+想用内部 API   → 修改 Agent 源码 → 重新构建
 ```
 
-**关键代码位置**
+每次添加工具都需要修改核心代码，不适合企业场景（工具由不同团队维护）。
 
-| 组件 | 文件路径 | 行号 | 说明 |
-|------|----------|------|------|
-| McpClientManager | `codex-rs/core/src/mcp/` | - | MCP 管理 |
-| ToolRouter MCP | `codex-rs/core/src/tools/router.rs` | 100 | 工具解析 |
-| Session MCP | `codex-rs/core/src/session.rs` | 100 | 会话集成 |
-
-**MCP 工具调用流程**
-
-```rust
-// 1. 解析 MCP 工具名
-if let Some((server, tool)) = session.parse_mcp_tool_name(&name).await {
-    return Ok(Some(ToolCall {
-        tool_name: name,
-        call_id,
-        payload: ToolPayload::Mcp { server, tool, raw_arguments: arguments },
-    }));
-}
-
-// 2. Handler 执行
-async fn handle(&self,
-    invocation: ToolInvocation
-) -> Result<ToolOutput, FunctionCallError> {
-    if let ToolPayload::Mcp { server, tool, raw_arguments } = &invocation.payload {
-        // 调用 MCP Server
-        let result = self.mcp_client.call_tool(
-            server,
-            tool,
-            raw_arguments
-        ).await?;
-
-        return Ok(ToolOutput::Mcp { result: Ok(result) });
-    }
-    // ...
-}
-```
-
-### 2.3 Gemini CLI
-
-**实现概述**
-
-Gemini CLI 通过 `McpClientManager` 和 `DiscoveredMCPTool` 实现 MCP 集成，支持三层工具来源（Built-in、Discovered、MCP）。
-
-**架构图**
+**MCP 解决什么：**
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  ToolRegistry (工具注册层)                                │
-│  ├── allKnownTools: Map            工具映射             │
-│  ├── discoverAllTools()            发现工具             │
-│  └── sortTools()                   排序 (MCP 优先级 2)  │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  McpClientManager (MCP 管理层)                            │
-│  ├── startConfiguredMcpServers()   启动配置服务         │
-│  ├── startExtension()              加载扩展             │
-│  ├── maybeDiscoverMcpServer()      发现并注册           │
-│  └── clients: Map<string, McpClient>  客户端映射         │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  DiscoveredMCPTool (MCP 工具包装)                         │
-│  └── 包装 MCP 工具为 DeclarativeTool                    │
-└─────────────────────────────────────────────────────────┘
+想用数据库工具 → 启动数据库 MCP Server → Agent 自动发现 → 立即可用
+想用 Jira 工具  → 启动 Jira MCP Server → Agent 自动发现 → 立即可用
 ```
 
-**关键代码位置**
+MCP 把"工具提供者"和"Agent 执行者"分离。工具以独立进程或服务的形式存在，Agent 通过协议与之通信。
 
-| 组件 | 文件路径 | 行号 | 说明 |
-|------|----------|------|------|
-| McpClientManager | `packages/core/src/mcp/` | - | MCP 管理器 |
-| DiscoveredMCPTool | `packages/core/src/tools/` | - | MCP 工具类 |
-| ToolRegistry | `packages/core/src/tools/registry.ts` | 50 | 工具注册 |
+---
 
-**发现状态机**
+## 2. MCP 协议架构
+
+```mermaid
+graph LR
+    subgraph AgentProcess["Agent 进程"]
+        AL["Agent Loop"]
+        MC["MCP Client"]
+        TR["Tool Registry\n内置工具 + MCP 工具"]
+    end
+    subgraph MCPServers["MCP Server（独立进程）"]
+        S1["数据库 MCP Server\n工具: query_db, insert_row"]
+        S2["文件系统 MCP Server\n工具: read_file, write_file"]
+        S3["内部 API MCP Server\n工具: create_ticket, get_status"]
+    end
+
+    AL -->|"工具调用请求"| TR
+    TR -->|"内置工具"| AL
+    TR -->|"MCP 工具调用"| MC
+    MC <-->|"stdio / HTTP / SSE"| S1
+    MC <-->|"stdio / HTTP / SSE"| S2
+    MC <-->|"stdio / HTTP / SSE"| S3
+    S1 --> AL
+    S2 --> AL
+    S3 --> AL
+```
+
+**三种传输方式：**
+- **stdio**：启动本地子进程，通过标准输入/输出通信（最常用，无网络依赖）
+- **HTTP**：调用远程 HTTP 服务
+- **SSE**：通过 Server-Sent Events 接收流式工具结果
+
+---
+
+## 3. 各项目的 MCP 实现
+
+### Codex：`McpConnectionManager` 管理多个 Server
+
+**架构**（`codex-rs/core/src/mcp_connection_manager.rs`）：
+
+```
+McpConnectionManager
+├── list_all_tools()     → 遍历所有 Server，返回工具列表
+├── call_tool(...)       → 路由到对应 Server 执行（行号: 916）
+└── parse_tool_name(...) → 解析 "server_name::tool_name" 格式（行号: 1001）
+```
+
+**工具命名约定**（`mcp_connection_manager.rs:1140`）：MCP 工具名格式为 `{server_name}_{tool_name}`，通过前缀路由到对应 Server。
+
+**与工具系统的集成**（`codex-rs/core/src/tools/handlers/mcp.rs`）：
+MCP 工具调用被包装成普通的 `ToolHandler`，从 Agent Loop 视角看，MCP 工具和内置工具完全一样。
+
+---
+
+### Gemini CLI：三层工具来源 + `McpClientManager`
+
+**关键设计**（`gemini-cli/packages/core/src/tools/mcp-client-manager.ts:28`）：
 
 ```typescript
-enum MCPDiscoveryState {
-    NOT_STARTED = 'not_started',
-    IN_PROGRESS = 'in_progress',
-    COMPLETED = 'completed',
+export class McpClientManager {
+    async startConfiguredMcpServers(): Promise<void>  // 行号: 313
+    // 从配置文件读取 MCP Server 列表，逐一连接并注册工具
 }
 ```
 
-### 2.4 Kimi CLI
-
-**实现概述**
-
-Kimi CLI 通过 **ACP（Agent Communication Protocol）** 协议实现多 Agent 协作，支持 MCP Server 作为工具来源。
-
-**架构图**
-
+工具有三个来源，按优先级排列：
 ```
-┌─────────────────────────────────────────────────────────┐
-│  KimiSoul (Agent 核心)                                    │
-│  └── toolset: KimiToolset           工具集合            │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  ACP Client (ACP 客户端)                                  │
-│  └── acp_mcp_servers_to_mcp_config() 配置转换           │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  MCP Servers (多种传输)                                   │
-│  ├── HTTP Transport                                     │
-│  ├── SSE Transport                                      │
-│  └── Stdio Transport                                    │
-└─────────────────────────────────────────────────────────┘
+Built-in (0)     → 内置工具（read_file、bash 等）
+Discovered (1)   → 在项目目录中发现的工具脚本
+MCP (2)          → 外部 MCP Server 提供的工具
 ```
 
-**关键代码位置**
+**发现流程**：Agent 启动时，`McpClientManager.startConfiguredMcpServers()` 连接所有配置的 Server，通过 MCP 协议的 `list_tools` 请求获取工具列表，包装成 `DiscoveredMCPTool`（继承 `DeclarativeTool`），注册到 `ToolRegistry`。
 
-| 组件 | 文件路径 | 行号 | 说明 |
-|------|----------|------|------|
-| ACP MCP | `kimi-cli/src/kimi_cli/acp/mcp.py` | - | MCP 配置转换 |
-| Kosong | `kimi-cli/src/kimi_cli/agent/kosong.py` | 50 | 工具初始化 |
-| MCPServer | `kimi-cli/src/kimi_cli/acp/schema.py` | - | Server 定义 |
+---
 
-**配置转换**
+### Kimi CLI：通过 ACP 层集成 MCP
 
+Kimi CLI 将 MCP 包装在 ACP（Agent Communication Protocol）层之下，对外暴露的是 ACP 接口而不是直接的 MCP 接口。
+
+**配置转换层**（`src/kimi_cli/tools/dmail/`）：
 ```python
-def acp_mcp_servers_to_mcp_config(mcp_servers: list[MCPServer]) -> MCPConfig:
-    """将 ACP MCP Server 配置转换为内部 MCPConfig。"""
-    for server in mcp_servers:
+# ACP MCP Server 配置 → 内部 MCP 配置
+def acp_mcp_servers_to_mcp_config(servers):
+    for server in servers:
         match server:
-            case acp.schema.HttpMcpServer():
-                return {"url": server.url, "transport": "http", ...}
-            case acp.schema.SseMcpServer():
-                return {"url": server.url, "transport": "sse", ...}
-            case acp.schema.McpServerStdio():
-                return {"command": server.command, "transport": "stdio", ...}
+            case HttpMcpServer():   return {"transport": "http", ...}
+            case SseMcpServer():    return {"transport": "sse",  ...}
+            case McpServerStdio():  return {"transport": "stdio",...}
 ```
 
-### 2.5 OpenCode
-
-**实现概述**
-
-OpenCode 通过 `ToolRegistry` 的自定义工具加载机制支持 MCP Server，将 MCP 工具作为外部工具源。
-
-**架构图**
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  ToolRegistry (工具注册层)                                │
-│  ├── state()                       初始化               │
-│  │   ├── 加载自定义工具                                    │
-│  │   └── 加载插件工具                                      │
-│  └── register(tool)                动态注册             │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  MCP Server (可选)                                        │
-│  └── mcp-server.ts                 MCP 服务器实现       │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  External Tools (外部工具)                                │
-└─────────────────────────────────────────────────────────┘
-```
-
-**关键代码位置**
-
-| 组件 | 文件路径 | 行号 | 说明 |
-|------|----------|------|------|
-| ToolRegistry | `packages/opencode/src/tool/registry.ts` | 1 | 工具注册 |
-| MCP Server | `packages/opencode/src/mcp/mcp-server.ts` | - | MCP 服务 |
+**工程意图：** ACP 是 Kimi CLI 设计的更高层协议（用于 Agent 间通信），MCP 只是 ACP 支持的一种工具来源。这允许 Kimi CLI 在 MCP 之外支持其他工具协议。
 
 ---
 
-## 3. 相同点总结
+### OpenCode：MCP 通过插件机制集成
 
-### 3.1 支持的传输方式
-
-| 传输方式 | Codex | Gemini CLI | Kimi CLI | OpenCode |
-|----------|-------|------------|----------|----------|
-| stdio | 是 | 是 | 是 | 是 |
-| HTTP | 是 | 是 | 是 | 是 |
-| SSE | - | 是 | 是 | 是 |
-
-### 3.2 通用功能
-
-支持 MCP 的 Agent 都具备：
-
-- **配置管理**：从配置文件读取 MCP Server 配置
-- **生命周期管理**：启动、连接、断开、清理
-- **工具发现**：动态获取 Server 提供的工具列表
-- **工具调用**：将 MCP 工具调用转发给 Server
-
-### 3.3 工具集成方式
-
-```text
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Agent     │────▶│ MCP Client  │────▶│ MCP Server  │
-│  Tool Call  │     │             │     │             │
-└──────┬──────┘     └─────────────┘     └──────┬──────┘
-       │                                        │
-       │◄───────────────────────────────────────│
-       │           工具执行结果                 │
-       ▼
-┌─────────────┐
-│  结果回注   │
-│  给 LLM     │
-└─────────────┘
-```
+OpenCode 提供了 MCP Server 实现（`packages/opencode/src/mcp/`），同时支持通过插件加载 MCP 工具。工具注册是动态的，MCP 工具与内置工具平等对待。
 
 ---
 
-## 4. 不同点对比
+## 4. 工程取舍
 
-### 4.1 MCP 支持情况
+### 为什么 SWE-agent 不用 MCP？
 
-| Agent | 支持状态 | 实现方式 | 备注 |
-|-------|----------|----------|------|
-| SWE-agent | 否 | - | 使用 Bundle 替代 |
-| Codex | 是 | McpClientManager | Rust 实现 |
-| Gemini CLI | 是 | McpClientManager | TypeScript |
-| Kimi CLI | 是 | ACP 协议 | HTTP/SSE/Stdio |
-| OpenCode | 是 | ToolRegistry 扩展 | 插件方式 |
+SWE-agent 的 Bundle 系统是另一种解耦方式：工具通过 YAML 配置文件定义，也能在不修改核心代码的情况下添加工具。对学术场景来说，Bundle 更直接、零依赖，不需要外部进程。
 
-### 4.2 工具优先级
+**两种扩展方式的对比：**
 
-| Agent | MCP 工具优先级 | 冲突处理 |
-|-------|----------------|----------|
-| SWE-agent | - | - |
-| Codex | 与内置工具平等 | 后注册优先 |
-| Gemini CLI | 2（最低） | Built-in < Discovered < MCP |
-| Kimi CLI | 与内置工具平等 | 配置决定 |
-| OpenCode | 与自定义工具平等 | 配置决定 |
+| 方式 | Bundle（SWE-agent）| MCP（其他项目）|
+|------|-------------------|----------------|
+| 工具部署 | 放一个 YAML 文件 | 启动一个独立进程/服务 |
+| 工具语言 | 只能是 shell 命令 | 任意语言 |
+| 实时发现 | 需要重启 Agent | 可以热重载 |
+| 网络工具 | 不支持 | 支持（HTTP/SSE） |
+| 适合场景 | 本地简单工具 | 企业级集成、第三方服务 |
 
-### 4.3 发现机制
+### MCP 的工程成本
 
-| Agent | 发现时机 | 状态管理 | 热重载 |
-|-------|----------|----------|--------|
-| Codex | 启动时 | 无显式状态 | 否 |
-| Gemini CLI | 启动/扩展加载 | MCPDiscoveryState | 部分支持 |
-| Kimi CLI | 启动时 | 无 | 否 |
-| OpenCode | 初始化时 | 无 | 是 |
+MCP 带来扩展能力的同时，也引入了额外复杂度：
 
-### 4.4 配置方式
-
-| Agent | 配置位置 | 格式 | 动态配置 |
-|-------|----------|------|----------|
-| Codex | ~/.codex/config.toml | TOML | 否 |
-| Gemini CLI | ~/.gemini/config.json | JSON | 否 |
-| Kimi CLI | ~/.kimi/config.yaml | YAML | 否 |
-| OpenCode | ~/.opencode/config.json | JSON | 是 |
+1. **生命周期管理**：需要管理 MCP Server 进程的启动、停止、崩溃重连
+2. **工具发现时机**：是启动时一次性发现，还是运行时动态发现？
+   - Gemini CLI：启动时全部发现（`startConfiguredMcpServers()`）
+   - OpenCode：初始化时加载，支持热更新
+3. **工具命名冲突**：多个 Server 可能有同名工具（Codex 用 `server_name_` 前缀解决）
+4. **错误隔离**：MCP Server 崩溃不应该导致整个 Agent 崩溃
 
 ---
 
-## 5. 源码索引
+## 5. 关键代码索引
 
-### 5.1 MCP 管理器
-
-| Agent | 文件路径 | 行号 | 说明 |
-|-------|----------|------|------|
-| Codex | `codex-rs/core/src/mcp/` | - | McpClientManager |
-| Gemini CLI | `packages/core/src/mcp/` | - | McpClientManager |
-| Kimi CLI | `kimi-cli/src/kimi_cli/acp/mcp.py` | 1 | 配置转换 |
-| OpenCode | `packages/opencode/src/mcp/` | - | MCP Server |
-
-### 5.2 MCP 工具调用
-
-| Agent | 文件路径 | 行号 | 说明 |
-|-------|----------|------|------|
-| Codex | `codex-rs/core/src/tools/router.rs` | 100 | ToolPayload::Mcp |
-| Gemini CLI | `packages/core/src/tools/` | - | DiscoveredMCPTool |
-| Kimi CLI | `kimi-cli/src/kimi_cli/agent/kosong.py` | 100 | MCP 工具初始化 |
-| OpenCode | `packages/opencode/src/tool/` | - | 外部工具加载 |
-
----
-
-## 6. 选择建议
-
-| 场景 | 推荐 Agent | 理由 |
-|------|-----------|------|
-| 纯 MCP 工具链 | Codex/Gemini CLI | 原生支持完善 |
-| 混合工具需求 | Gemini CLI | 三层工具来源 |
-| ACP 生态 | Kimi CLI | ACP 协议支持 |
-| 插件扩展 | OpenCode | 动态加载能力强 |
-| 学术研究 | SWE-agent | 虽然无 MCP，但 Bundle 灵活 |
+| 项目 | 文件 | 行号 | 说明 |
+|------|------|------|------|
+| Codex | `codex-rs/core/src/mcp_connection_manager.rs` | 916 | `call_tool()` —— MCP 工具调用分发 |
+| Codex | `codex-rs/core/src/mcp_connection_manager.rs` | 1001 | `parse_tool_name()` —— 解析 Server+工具名 |
+| Codex | `codex-rs/core/src/mcp_connection_manager.rs` | 725 | `list_all_tools()` —— 遍历所有工具 |
+| Codex | `codex-rs/core/src/tools/handlers/mcp.rs` | — | MCP Handler（包装为普通工具） |
+| Gemini CLI | `packages/core/src/tools/mcp-client-manager.ts` | 28 | `McpClientManager` 类定义 |
+| Gemini CLI | `packages/core/src/tools/mcp-client-manager.ts` | 313 | `startConfiguredMcpServers()` |
+| Gemini CLI | `packages/core/src/tools/mcp-tool.ts` | — | `DiscoveredMCPTool` 包装类 |
