@@ -420,11 +420,11 @@ async def send_dmail(
 
 | 问题 | 检查点 | 文件 |
 |------|-------|------|
-| 历史丢失 | 检查 `restore()` 的 JSON 解析 | `soul/context.py:24` |
-| Checkpoint 失败 | 检查文件权限和轮换 | `utils/path.py` |
-| 回滚失败 | 确认 checkpoint_id 存在 | `soul/context.py:80` |
-| 压缩失败 | 检查 LLM 调用和提示词 | `soul/compaction.py:46` |
-| Token 计数不准 | 检查 `_usage` 消息写入 | `soul/context.py:171` |
+| 历史丢失 | 检查 `restore()` 的 JSON 解析 | `src/kimi_cli/soul/context.py` |
+| Checkpoint 失败 | 检查文件权限和轮换 | `src/kimi_cli/utils/path.py` |
+| 回滚失败 | 确认 checkpoint_id 存在 | `src/kimi_cli/soul/context.py` |
+| 压缩失败 | 检查 LLM 调用和提示词 | `src/kimi_cli/soul/compaction.py` |
+| Token 计数不准 | 检查 `_usage` 消息写入 | `src/kimi_cli/soul/context.py` |
 
 ---
 

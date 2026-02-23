@@ -1,489 +1,127 @@
 # Prompt Organization（kimi-cli）
 
-结论先行：kimi-cli 采用"文件系统 + Jinja2 模板 + Agent 继承体系"的 prompt 组织方式，通过 `src/kimi_cli/prompts/*.md` 文件定义基础模板，支持子 Agent 配置继承（extend 机制），使用 `${}` 语法进行变量注入。
+> 面向第一次做 code agent 的开发者：先把“Prompt 从哪里来、何时被使用、如何注入运行时信息”这三件事搞清楚。
+
+本文基于：
+- `kimi-cli/src/kimi_cli/agentspec.py`
+- `kimi-cli/src/kimi_cli/soul/agent.py`
+- `kimi-cli/src/kimi_cli/prompts/__init__.py`
+- `kimi-cli/src/kimi_cli/soul/slash.py`
+- `kimi-cli/src/kimi_cli/soul/compaction.py`
 
 ---
 
-## 1. Prompt 组织流程图
+## 1. 全局图：Prompt 组装主链路
 
 ```text
-+------------------------+
-| Prompt 文件目录         |
-| (src/kimi_cli/prompts/) |
-+-----------+------------+
-            |
-            v
-+------------------------+
-| Agent 配置解析          |
-| (default.yaml)          |
-+-----------+------------+
-            |
-            v
-+------------------------+
-| 继承链解析              |
-| (extend: parent-agent)  |
-+-----------+------------+
-            |
-            v
-+------------------------+
-| 模板文件加载            |
-| (system.md, etc.)       |
-+-----------+------------+
-            |
-            v
-+------------------------+
-| 变量上下文组装          |
-| (state, env, config)    |
-+-----------+------------+
-            |
-            v
-+------------------------+
-| Jinja2 渲染             |
-| (${variable} 替换)      |
-+-----------+------------+
-            |
-            v
-+------------------------+
-| 最终 Prompt             |
-| (发送至模型)            |
-+------------------------+
+agent.yaml / custom agent.yaml
+  -> load_agent_spec() 递归解析 extend
+  -> 解析 system_prompt_path + system_prompt_args
+  -> _load_system_prompt()
+     - 读 system.md
+     - 注入 builtin args + spec args
+     - Jinja2 渲染 (${...})
+  -> 得到最终 system prompt
+  -> 交给 KimiSoul 作为本轮系统约束
 ```
+
+代码锚点：
+- 默认 agent 文件：`kimi-cli/src/kimi_cli/agentspec.py:20`
+- 入口 `load_agent_spec()`：`kimi-cli/src/kimi_cli/agentspec.py:70`
+- 递归继承与字段合并：`kimi-cli/src/kimi_cli/agentspec.py:123`
+- system prompt 渲染：`kimi-cli/src/kimi_cli/soul/agent.py:269`
+- Jinja 变量分隔符 `${...}`：`kimi-cli/src/kimi_cli/soul/agent.py:279`
 
 ---
 
-## 2. 分层架构详解
+## 2. 配置层：agent spec 怎么“继承 + 覆盖”
 
 ```text
-┌─────────────────────────────────────────────────────┐
-│ Layer 4: Runtime Context                             │
-│  - 动态状态变量                                       │
-│  - 对话历史摘要                                       │
-│  - 工具执行结果                                       │
-├─────────────────────────────────────────────────────┤
-│ Layer 3: Agent-Specific Layer                        │
-│  - 子 Agent 特定指令                                  │
-│  - 继承父 Agent 并覆盖/扩展                           │
-├─────────────────────────────────────────────────────┤
-│ Layer 2: Base Agent Layer                            │
-│  - 系统身份定义 (system.md)                           │
-│  - 基础能力和约束                                     │
-├─────────────────────────────────────────────────────┤
-│ Layer 1: Configuration Layer                         │
-│  - Agent 配置文件 (default.yaml)                      │
-│  - 继承关系定义                                       │
-└─────────────────────────────────────────────────────┘
+子 agent.yaml (extend: default)
+  -> 先加载父层 default/agent.yaml
+  -> 再按字段覆盖
+     - name / system_prompt_path / tools / exclude_tools / subagents: 直接覆盖
+     - system_prompt_args: 按 key 合并（不是整体替换）
 ```
+
+设计意图：
+- 让团队可以复用统一基线 prompt/toolset，再按项目局部覆盖。
+
+工程 trade-off：
+- 优点：复用强，迁移成本低。
+- 代价：继承层级深时，定位“最终生效值”需要展开合并链路。
+
+代码锚点：
+- `AgentSpec` 字段定义：`kimi-cli/src/kimi_cli/agentspec.py:31`
+- 解析并校验必填字段：`kimi-cli/src/kimi_cli/agentspec.py:78`
+- `system_prompt_args` 合并：`kimi-cli/src/kimi_cli/agentspec.py:133`
+- 相对路径转绝对路径：`kimi-cli/src/kimi_cli/agentspec.py:116`
 
 ---
 
-## 3. Prompt 文件位置
+## 3. 渲染层：运行时变量从哪里来
 
-| 文件路径 | 职责 |
-|---------|------|
-| `kimi-cli/src/kimi_cli/prompts/*.md` | 基础 prompt 模板文件 |
-| `kimi-cli/src/kimi_cli/prompts/system.md` | 系统身份定义 |
-| `kimi-cli/agents/default/` | 默认 Agent 配置目录 |
-| `kimi-cli/agents/default/system.md` | 默认 Agent 系统 prompt |
-| `kimi-cli/agents/default/config.yaml` | Agent 配置文件 |
-| `kimi-cli/agents/{custom}/` | 自定义 Agent 目录 |
+```text
+Runtime.create()
+  -> 收集 builtin args
+     - KIMI_NOW
+     - KIMI_WORK_DIR / KIMI_WORK_DIR_LS
+     - KIMI_AGENTS_MD
+     - KIMI_SKILLS
+  -> _load_system_prompt(template, spec_args, builtin_args)
+  -> template.render(asdict(builtin_args), **spec_args)
+```
+
+设计意图：
+- 把“环境事实”（目录、技能、时间）在 runtime 注入，而不是写死在 prompt 文件里。
+
+工程 trade-off：
+- 优点：同一套 prompt 可以跨项目复用。
+- 代价：模板变量写错会在运行期失败（`StrictUndefined`），需要测试覆盖。
+
+代码锚点：
+- builtin args 构造：`kimi-cli/src/kimi_cli/soul/agent.py:112`
+- 读取 `AGENTS.md`：`kimi-cli/src/kimi_cli/soul/agent.py:50`
+- 使用 `StrictUndefined`：`kimi-cli/src/kimi_cli/soul/agent.py:285`
+- 变量缺失时报错：`kimi-cli/src/kimi_cli/soul/agent.py:290`
 
 ---
 
-## 4. 加载与管理机制
+## 4. 流程模板层：`prompts/*.md` 的真实用途
 
-### 4.1 Agent 配置结构
+很多新手会把 `prompts/*.md` 误解为“主 system prompt”。当前代码不是这样。
 
-```yaml
-# agents/default/config.yaml
-name: default
-description: Default agent for general tasks
+```text
+prompts/init.md
+  -> /init slash command 使用
+  -> 临时 soul 执行一次 INIT 提示
 
-# 继承机制（可选）
-# extend: base
-
-# Prompt 配置
-prompt:
-  system: system.md
-  template_vars:
-    - cwd
-    - home
-    - files
-    - history
-
-# 工具配置
-tools:
-  - read
-  - write
-  - bash
-  - search
+prompts/compact.md
+  -> context compaction 使用
+  -> 把历史对话打包后附加 COMPACT 模板让模型摘要
 ```
 
-### 4.2 继承体系实现
-
-```python
-class AgentConfig:
-    """Agent 配置类，支持继承"""
-
-    def __init__(self, config_path: str):
-        self.raw_config = yaml.safe_load(open(config_path))
-        self.inherited_config = self._resolve_inheritance()
-
-    def _resolve_inheritance(self) -> dict:
-        """解析继承链，合并配置"""
-        if 'extend' not in self.raw_config:
-            return self.raw_config
-
-        parent_name = self.raw_config['extend']
-        parent_config = self._load_parent(parent_name)
-
-        # 子配置覆盖父配置
-        return self._merge_configs(parent_config, self.raw_config)
-
-    def _merge_configs(self, parent: dict, child: dict) -> dict:
-        """合并父配置和子配置"""
-        merged = deepcopy(parent)
-        for key, value in child.items():
-            if key == 'extend':
-                continue
-            if key in merged and isinstance(merged[key], dict):
-                merged[key].update(value)
-            else:
-                merged[key] = value
-        return merged
-```
-
-### 4.3 Prompt 文件加载
-
-```python
-class PromptLoader:
-    """Prompt 文件加载器"""
-
-    def __init__(self, agents_dir: str):
-        self.agents_dir = Path(agents_dir)
-        self.core_prompts_dir = Path(__file__).parent / 'prompts'
-
-    def load_system_prompt(self, agent_name: str) -> str:
-        """加载指定 Agent 的系统 prompt"""
-        agent_dir = self.agents_dir / agent_name
-        system_file = agent_dir / 'system.md'
-
-        if system_file.exists():
-            return system_file.read_text()
-
-        # 回退到默认
-        default_file = self.core_prompts_dir / 'system.md'
-        return default_file.read_text()
-```
+代码锚点：
+- 模板加载：`kimi-cli/src/kimi_cli/prompts/__init__.py:5`
+- `/init` 使用 `prompts.INIT`：`kimi-cli/src/kimi_cli/soul/slash.py:41`
+- compaction 使用 `prompts.COMPACT`：`kimi-cli/src/kimi_cli/soul/compaction.py:115`
 
 ---
 
-## 5. 模板与变量系统
+## 5. 新手最容易踩的 3 个坑
 
-### 5.1 Jinja2 模板语法（${} 风格）
+1. 把 `prompts/init.md` 当主 system prompt。
+2. 以为 `system_prompt_args` 会整体替换父层。
+3. 模板里写了 `${VAR}`，但 runtime 没提供，启动才报错。
 
-```markdown
-# system.md 示例
-
-You are Kimi, a helpful AI assistant.
-
-Current directory: ${cwd}
-User home: ${home}
-
-{% if files %}
-Relevant files:
-{% for file in files %}
-- ${file.path}: ${file.description}
-{% endfor %}
-{% endif %}
-
-{% if history %}
-Previous conversation:
-${history_summary}
-{% endif %}
-```
-
-### 5.2 变量类型
-
-| 变量名 | 类型 | 说明 |
-|-------|------|------|
-| `cwd` | string | 当前工作目录 |
-| `home` | string | 用户主目录 |
-| `files` | list | 相关文件列表 |
-| `history` | list | 对话历史 |
-| `history_summary` | string | 历史摘要 |
-| `tools` | list | 可用工具 |
-| `env` | dict | 环境变量 |
-
-### 5.3 变量注入流程
-
-```python
-class PromptRenderer:
-    """Prompt 渲染器"""
-
-    def __init__(self, config: AgentConfig):
-        self.config = config
-        self.jinja_env = Environment(
-            variable_start_string='${',
-            variable_end_string='}',
-        )
-
-    def render(self, template_str: str, context: dict) -> str:
-        """渲染模板"""
-        template = self.jinja_env.from_string(template_str)
-        return template.render(**context)
-
-    def build_context(self, runtime_state: dict) -> dict:
-        """构建渲染上下文"""
-        return {
-            'cwd': os.getcwd(),
-            'home': os.path.expanduser('~'),
-            'files': runtime_state.get('files', []),
-            'history': runtime_state.get('history', []),
-            'history_summary': self._summarize_history(),
-            'tools': self.config.get_tools(),
-            'env': dict(os.environ),
-        }
-```
+快速排查：
+- 先看最终 agent spec 合并是否符合预期：`kimi-cli/src/kimi_cli/agentspec.py:123`
+- 再看模板渲染入参：`kimi-cli/src/kimi_cli/soul/agent.py:289`
 
 ---
 
-## 6. Prompt 工程方法
+## 6. 关键结论
 
-### 6.1 多 Agent 架构
-
-```
-agents/
-├── default/
-│   ├── config.yaml
-│   └── system.md
-├── code-reviewer/
-│   ├── config.yaml
-│   │   └── extend: default
-│   └── system.md
-├── test-writer/
-│   ├── config.yaml
-│   │   └── extend: default
-│   └── system.md
-└── doc-writer/
-    ├── config.yaml
-    │   └── extend: default
-    └── system.md
-```
-
-### 6.2 子 Agent 覆盖示例
-
-```yaml
-# agents/code-reviewer/config.yaml
-name: code-reviewer
-extend: default
-description: Specialized agent for code review
-
-prompt:
-  system: system.md
-  template_vars:
-    - cwd
-    - files
-    - diff
-    - review_criteria
-```
-
-```markdown
-# agents/code-reviewer/system.md
-
-${parent_system_prompt}
-
-## Additional Instructions for Code Review
-
-When reviewing code:
-1. Check for security vulnerabilities
-2. Verify coding standards compliance
-3. Suggest performance improvements
-4. Ensure test coverage
-```
-
-### 6.3 动态上下文管理
-
-```python
-def get_relevant_files(query: str, max_files: int = 10) -> list:
-    """根据查询获取相关文件"""
-    # 使用向量搜索或关键词匹配
-    all_files = scan_project_files()
-    scored_files = score_relevance(all_files, query)
-    return scored_files[:max_files]
-
-def inject_context(prompt: str, context: dict) -> str:
-    """将上下文注入 prompt"""
-    files = get_relevant_files(context['query'])
-    context['files'] = files
-    return render_template(prompt, context)
-```
-
----
-
-## 7. 实际示例
-
-### 示例 1：code-reviewer 子 agent
-
-**场景设定**：用户使用 `kimi code-review` 命令审查 PR，涉及 `src/auth.js` 和 `src/utils.js`。
-
-**运行时变量值**：
-```json
-{
-  "cwd": "/home/user/project",
-  "home": "/home/user",
-  "tools": [
-    {"name": "read", "description": "Read file contents"},
-    {"name": "write", "description": "Write file contents"},
-    {"name": "bash", "description": "Execute shell commands"}
-  ],
-  "files": [
-    {"path": "src/auth.js", "status": "modified"},
-    {"path": "src/utils.js", "status": "added"}
-  ],
-  "diff": "diff --git a/src/auth.js b/src/auth.js\nindex 1234..5678 100644\n--- a/src/auth.js\n+++ b/src/auth.js\n@@ -10,5 +10,10 @@ function validateToken(token) {\n   return jwt.verify(token, secret);\n }\n\n+function refreshToken(token) {\n+  // TODO: implement refresh\n+  return token;\n+}\n+\n module.exports = { validateToken };",
-  "review_criteria": [
-    "Security vulnerabilities",
-    "Code style compliance",
-    "Test coverage",
-    "Performance impact"
-  ]
-}
-```
-
-**完整渲染结果（发送给模型的 Prompt）**：
-
-```markdown
-You are Kimi, a helpful AI assistant.
-
-Current directory: /home/user/project
-User home: /home/user
-
-You have access to the following tools:
-- read: Read file contents
-- write: Write file contents
-- bash: Execute shell commands
-
-Always be helpful and accurate.
-
-## Code Review Mode
-
-You are now in CODE REVIEW mode. Review the following changes:
-
-Files to review:
-- src/auth.js (modified)
-- src/utils.js (added)
-
-Diff:
-```
-diff --git a/src/auth.js b/src/auth.js
-index 1234..5678 100644
---- a/src/auth.js
-+++ b/src/auth.js
-@@ -10,5 +10,10 @@ function validateToken(token) {
-   return jwt.verify(token, secret);
- }
-
-+function refreshToken(token) {
-+  // TODO: implement refresh
-+  return token;
-+}
-+
- module.exports = { validateToken };
-```
-
-Review criteria:
-- Security vulnerabilities
-- Code style compliance
-- Test coverage
-- Performance impact
-
-Provide your review as a structured report.
-```
-
----
-
-### 示例 2：test-writer 子 agent
-
-**场景设定**：用户使用 `kimi test-write` 命令为现有函数生成单元测试。
-
-**运行时变量值**：
-```json
-{
-  "cwd": "/home/user/python-api",
-  "home": "/home/user",
-  "tools": [
-    {"name": "read", "description": "Read file contents"},
-    {"name": "write", "description": "Write file contents"},
-    {"name": "bash", "description": "Execute shell commands"}
-  ],
-  "files": [
-    {"path": "app/services/payment.py", "description": "Payment processing service"}
-  ],
-  "target_function": "process_refund",
-  "test_framework": "pytest",
-  "coverage_criteria": [
-    "Happy path",
-    "Invalid input handling",
-    "Edge cases (zero amount, negative amount)",
-    "Exception scenarios"
-  ]
-}
-```
-
-**完整渲染结果（发送给模型的 Prompt）**：
-
-```markdown
-You are Kimi, a helpful AI assistant.
-
-Current directory: /home/user/python-api
-User home: /home/user
-
-You have access to the following tools:
-- read: Read file contents
-- write: Write file contents
-- bash: Execute shell commands
-
-Always be helpful and accurate.
-
-## Test Writer Mode
-
-You are now in TEST WRITER mode. Generate comprehensive unit tests for the specified function.
-
-Target file: app/services/payment.py
-Target function: process_refund
-Test framework: pytest
-
-Test coverage requirements:
-- Happy path
-- Invalid input handling
-- Edge cases (zero amount, negative amount)
-- Exception scenarios
-
-Guidelines:
-1. Use pytest best practices
-2. Use mocks for external dependencies
-3. Follow AAA pattern (Arrange, Act, Assert)
-4. Include descriptive test names
-5. Add docstrings explaining what each test verifies
-
-Output the test code in a format ready to be written to a test file.
-```
-
----
-
-## 8. 证据索引
-
-- `kimi-cli` + `kimi-cli/src/kimi_cli/prompts/*.md` + 基础 prompt 模板文件
-- `kimi-cli` + `kimi-cli/src/kimi_cli/prompts/system.md` + 系统身份定义
-- `kimi-cli` + `kimi-cli/agents/default/` + 默认 Agent 配置
-- `kimi-cli` + `kimi-cli/agents/default/config.yaml` + Agent 配置和继承定义
-- `kimi-cli` + `docs/kimi-cli/04-kimi-cli-agent-loop.md` + Agent 循环中的 prompt 使用
-
----
-
-## 9. 边界与不确定性
-
-- Agent 继承的具体合并策略（深度合并 vs 浅层覆盖）需验证
-- 模板变量的完整列表需以实码为准
-- 子 Agent 配置文件的具体字段名可能有所调整
-
+- 主 prompt 入口：`agents/*/agent.yaml + system.md`。
+- `prompts/*.md` 是“流程模板”（`/init`、压缩），不是主 system prompt。
+- 继承合并在 `agentspec.py`，模板渲染在 `soul/agent.py`。

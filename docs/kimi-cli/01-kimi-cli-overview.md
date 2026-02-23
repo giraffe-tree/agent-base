@@ -41,7 +41,7 @@
                               │
 ┌─────────────────────────────────────────────────────────────┐
 │                   Shell/UI Layer                            │
-│  (kimi-cli/src/kimi_cli/shell/)                            │
+│  (kimi-cli/src/kimi_cli/ui/shell/)                         │
 │  ├─ 交互式界面                                              │
 │  ├─ 用户输入处理                                            │
 │  └─ Slash 命令解析                                          │
@@ -93,22 +93,22 @@
 
 | 层级 | 文件路径 | 核心职责 |
 |------|----------|----------|
-| CLI | `cli/__init__.py` | 命令解析、配置加载、模式选择 |
-| Shell | `shell/` | 交互式界面、用户输入、Slash 命令 |
-| Soul | `soul/kimisoul.py` | Agent 核心逻辑、循环控制 |
-| Agent | `soul/agent.py` | 代理定义、运行时管理 |
-| Tools | `soul/toolset.py` | 工具注册、执行、MCP 集成 |
-| Context | `soul/context.py` | 状态管理、检查点、历史记录 |
-| Model | `llm.py` | 模型调用、流式响应 |
+| CLI | `src/kimi_cli/cli/__init__.py` | 命令解析、配置加载、模式选择 |
+| Shell | `src/kimi_cli/ui/shell/` | 交互式界面、用户输入、Slash 命令 |
+| Soul | `src/kimi_cli/soul/kimisoul.py` | Agent 核心逻辑、循环控制 |
+| Agent | `src/kimi_cli/soul/agent.py` | 代理定义、运行时管理 |
+| Tools | `src/kimi_cli/soul/toolset.py` | 工具注册、执行、MCP 集成 |
+| Context | `src/kimi_cli/soul/context.py` | 状态管理、检查点、历史记录 |
+| Model | `src/kimi_cli/llm.py` | 模型调用、流式响应 |
 
 ### 核心组件列表
 
-1. **KimiSoul** (soul/kimisoul.py:89) - Agent 核心，管理主循环
-2. **KimiToolset** (soul/toolset.py:71) - 工具注册与执行
-3. **Context** (soul/context.py) - 会话上下文和检查点
-4. **Agent** (soul/agent.py) - 代理定义和运行时
-5. **LLM** (llm.py) - 模型调用封装
-6. **Runtime** (soul/agent.py) - 运行时上下文
+1. **KimiSoul** (`src/kimi_cli/soul/kimisoul.py`:89) - Agent 核心，管理主循环
+2. **KimiToolset** (`src/kimi_cli/soul/toolset.py`:71) - 工具注册与执行
+3. **Context** (`src/kimi_cli/soul/context.py`) - 会话上下文和检查点
+4. **Agent** (`src/kimi_cli/soul/agent.py`) - 代理定义和运行时
+5. **LLM** (`src/kimi_cli/llm.py`) - 模型调用封装
+6. **Runtime** (`src/kimi_cli/soul/agent.py`) - 运行时上下文
 
 ---
 
@@ -124,7 +124,7 @@ kimi-cli/src/kimi_cli/cli/__init__.py:54
 使用 `typer` 库进行命令解析：
 
 ```python
-# cli/__init__.py:34-41
+# src/kimi_cli/cli/__init__.py:34-41
 cli = typer.Typer(
     epilog="""Documentation: https://moonshotai.github.io/kimi-cli/""",
     add_completion=False,
@@ -150,7 +150,7 @@ def kimi(
 ### 启动流程
 
 ```
-cli/__init__.py:54 kimi()
+src/kimi_cli/cli/__init__.py:54 kimi()
        │
        ├─ 解析全局参数 (--model, --yolo, --work-dir 等)
        │
@@ -163,7 +163,7 @@ cli/__init__.py:54 kimi()
        └─ 调用对应模式的入口函数
            │
            Shell 模式:
-           └─ shell/__init__.py
+           └─ src/kimi_cli/ui/shell/__init__.py
                │
                ▼
            ┌─────────────────┐
@@ -661,7 +661,7 @@ class Context:
        │
        ▼
 ┌─────────────────┐
-│ kimi()          │  ──▶  cli/__init__.py:54
+│ kimi()          │  ──▶  src/kimi_cli/cli/__init__.py:54
 │ 参数解析        │
 └────────┬────────┘
          │
@@ -804,41 +804,41 @@ class StatusSnapshot(BaseModel):
 
 | 组件 | 文件路径 | 行号 | 说明 |
 |------|----------|------|------|
-| CLI 入口 | `cli/__init__.py` | 54 | kimi() 主函数 |
-| KimiSoul | `soul/kimisoul.py` | 89 | Agent 核心类 |
-| run() | `soul/kimisoul.py` | 182 | 用户输入处理 |
-| _turn() | `soul/kimisoul.py` | 210 | 单回合处理 |
-| KimiToolset | `soul/toolset.py` | 71 | 工具注册表 |
-| handle() | `soul/toolset.py` | 97 | 工具调用处理 |
-| Context | `soul/context.py` | - | 会话上下文 |
-| checkpoint() | `soul/context.py` | - | 检查点机制 |
-| Agent | `soul/agent.py` | - | 代理定义 |
-| LLM | `llm.py` | - | 模型封装 |
+| CLI 入口 | `src/kimi_cli/cli/__init__.py` | 54 | kimi() 主函数 |
+| KimiSoul | `src/kimi_cli/soul/kimisoul.py` | 89 | Agent 核心类 |
+| run() | `src/kimi_cli/soul/kimisoul.py` | 182 | 用户输入处理 |
+| _turn() | `src/kimi_cli/soul/kimisoul.py` | 210 | 单回合处理 |
+| KimiToolset | `src/kimi_cli/soul/toolset.py` | 71 | 工具注册表 |
+| handle() | `src/kimi_cli/soul/toolset.py` | 97 | 工具调用处理 |
+| Context | `src/kimi_cli/soul/context.py` | - | 会话上下文 |
+| checkpoint() | `src/kimi_cli/soul/context.py` | - | 检查点机制 |
+| Agent | `src/kimi_cli/soul/agent.py` | - | 代理定义 |
+| LLM | `src/kimi_cli/llm.py` | - | 模型封装 |
 
 ### 工具实现
 
 | 工具 | 文件路径 | 说明 |
 |------|----------|------|
-| Shell | `tools/shell.py` | Shell 命令执行 |
-| File | `tools/file.py` | 文件读写 |
-| Web Search | `tools/web_search.py` | 网络搜索 |
-| Browser | `tools/browser.py` | 浏览器操作 |
-| Code | `tools/code.py` | 代码分析 |
+| Shell | `src/kimi_cli/tools/shell/__init__.py` | Shell 命令执行 |
+| File | `src/kimi_cli/tools/file/` | 文件读写工具集合 |
+| Web | `src/kimi_cli/tools/web/` | 网络搜索与抓取 |
+| Multiagent | `src/kimi_cli/tools/multiagent/` | 子代理任务与创建 |
+| D-Mail/Think/Todo | `src/kimi_cli/tools/dmail/` 等 | 会话控制与辅助工具 |
 
 ### 配置类
 
 | 配置 | 文件路径 | 说明 |
 |------|----------|------|
-| GlobalConfig | `config.py` | 全局配置 |
-| LLMConfig | `llm.py` | 模型配置 |
-| AgentConfig | `soul/agent.py` | Agent 配置 |
+| Config | `src/kimi_cli/config.py` | 全局配置 |
+| LLM | `src/kimi_cli/llm.py` | 模型封装与能力 |
+| Runtime | `src/kimi_cli/soul/agent.py` | 运行时与 Agent 加载 |
 
 ### Wire 协议
 
 | 组件 | 文件路径 | 说明 |
 |------|----------|------|
-| Wire types | `wire/types.py` | 类型定义 |
-| Wire file | `wire/file.py` | 文件传输 |
+| Wire types | `src/kimi_cli/wire/types.py` | 类型定义 |
+| Wire file | `src/kimi_cli/wire/file.py` | Wire 日志落盘 |
 
 ---
 

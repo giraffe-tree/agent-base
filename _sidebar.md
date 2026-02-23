@@ -85,10 +85,11 @@
     - [Plan and Execute 模式](docs/opencode/questions/opencode-plan-and-execute.md)
 
 - **Kimi CLI**
+  - [新手开发者入门](docs/kimi-cli/00-kimi-cli-onboarding.md)
   - [概览](docs/kimi-cli/01-kimi-cli-overview.md)
   - [CLI 入口](docs/kimi-cli/02-kimi-cli-cli-entry.md)
-  - [Session 运行时](docs/kimi-cli/03-kimi-cli-session-runtime.md)
   - [Session 管理](docs/kimi-cli/02-kimi-cli-session-management.md)
+  - [Session 运行时](docs/kimi-cli/03-kimi-cli-session-runtime.md)
   - [Agent Loop](docs/kimi-cli/04-kimi-cli-agent-loop.md)
   - [Tools 系统](docs/kimi-cli/05-kimi-cli-tools-system.md)
   - [MCP 集成](docs/kimi-cli/06-kimi-cli-mcp-integration.md)

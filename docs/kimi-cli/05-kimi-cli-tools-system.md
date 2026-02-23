@@ -136,7 +136,7 @@ def extract_key_argument(
 | 工具类型 | 提取字段 | 示例输出 |
 |----------|----------|----------|
 | Shell | command | `ls -la` |
-| ReadFile | path | `src/main.py` |
+| ReadFile | path | `src/kimi_cli/app.py` |
 | Task | description | `修复登录 bug` |
 | SearchWeb | query | `Python asyncio` |
 | FetchURL | url | `https://example.com` |

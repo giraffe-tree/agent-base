@@ -335,7 +335,7 @@ config = MCPConfig.model_validate({
 
 | 问题 | 检查点 | 文件 |
 |------|-------|------|
-| MCP 配置无效 | 检查 `MCPConfig.model_validate()` 错误 | `cli/mcp.py:31` |
-| ACP 转换失败 | 检查 ACP 服务器返回的 type 字段 | `acp/mcp.py:27` |
-| 配置文件位置 | 查看 `~/.kimi/mcp.json` | `cli/mcp.py:14` |
-| 传输类型错误 | 确认 type 为 http/sse/stdio 之一 | `acp/mcp.py` |
+| MCP 配置无效 | 检查 `MCPConfig.model_validate()` 错误 | `src/kimi_cli/cli/mcp.py` |
+| ACP 转换失败 | 检查 ACP 服务器返回的 type 字段 | `src/kimi_cli/acp/mcp.py` |
+| 配置文件位置 | 查看 `~/.kimi/mcp.json` | `src/kimi_cli/cli/mcp.py` |
+| 传输类型错误 | 确认 type 为 http/sse/stdio 之一 | `src/kimi_cli/acp/mcp.py` |
