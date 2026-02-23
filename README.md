@@ -1,4 +1,4 @@
-# 6大开源 Code Agent 源码深度解析
+# Agent-Base 6大开源 Code Agent 源码深度解析
 
 [![研究项目](https://img.shields.io/badge/类型-源码研究-blue)](./docs)
 [![研究基线](https://img.shields.io/badge/基线-2026--02--22-green)](./docs)
