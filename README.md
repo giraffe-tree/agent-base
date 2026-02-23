@@ -188,14 +188,14 @@ Memory 管理    上下文压缩       Checkpoint 回滚
 </td>
 <td width="33%">
 
-**🎯 Cursor** (TypeScript)
-> *适合研究: VSCode 集成与状态管理*
+**🎯 Qwen Code** (TypeScript)
+> *适合研究: 工程化架构与错误处理*
 
-- 深度 IDE 集成架构
-- State.vscdb 状态存储
-- 官方 Checkpoint 实现
+- 基于 Gemini CLI 的架构演进
+- 完善的循环检测与错误恢复
+- 结构化 Agent 设计模式
 
-📄 [概览](./docs/cursor/01-cursor-README.md)
+📄 [概览](./docs/qwen-code/01-qwen-code-overview.md)
 
 </td>
 </tr>
@@ -203,12 +203,12 @@ Memory 管理    上下文压缩       Checkpoint 回滚
 
 ### 横向对比速览
 
-| 维度 | Codex | Gemini CLI | Kimi CLI | OpenCode | SWE-agent | Cursor |
+| 维度 | Codex | Gemini CLI | Kimi CLI | OpenCode | SWE-agent | Qwen Code |
 |:---|:---|:---|:---|:---|:---|:---|
 | **语言** | Rust | TypeScript | Python | TypeScript | Python | TypeScript |
-| **核心亮点** | 安全沙箱 | 状态机调度 | Checkpoint | 流式处理 | 学术追踪 | IDE 集成 |
-| **适合场景** | 企业级安全 | 复杂对话管理 | 状态可回滚 | 长任务执行 | 研究实验 | 日常开发 |
-| **Agent Loop** | 简单 while | 状态机驱动 | 带 checkpoint | 现代 async | 可配置处理器 | 事件驱动 |
+| **核心亮点** | 安全沙箱 | 状态机调度 | Checkpoint | 流式处理 | 学术追踪 | 工程化架构 |
+| **适合场景** | 企业级安全 | 复杂对话管理 | 状态可回滚 | 长任务执行 | 研究实验 | 生产环境 |
+| **Agent Loop** | 简单 while | 状态机驱动 | 带 checkpoint | 现代 async | 可配置处理器 | 增强状态机 |
 
 ### 📊 跨项目对比 (comm)
 
