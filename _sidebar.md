@@ -128,3 +128,21 @@
     - [防止 Tool 无限循环](docs/swe-agent/questions/swe-agent-infinite-loop-prevention.md)
     - [上下文压缩机制](docs/swe-agent/questions/swe-agent-context-compaction.md)
     - [Plan and Execute 模式](docs/swe-agent/questions/swe-agent-plan-and-execute.md)
+
+- **Qwen Code**
+  - [概览](docs/qwen-code/01-qwen-code-overview.md)
+  - [CLI 入口](docs/qwen-code/02-qwen-code-cli-entry.md)
+  - [Session 运行时](docs/qwen-code/03-qwen-code-session-runtime.md)
+  - [Agent Loop](docs/qwen-code/04-qwen-code-agent-loop.md)
+  - [Tools 系统](docs/qwen-code/05-qwen-code-tools-system.md)
+  - [MCP 集成](docs/qwen-code/06-qwen-code-mcp-integration.md)
+  - [Memory Context](docs/qwen-code/07-qwen-code-memory-context.md)
+  - [UI 交互](docs/qwen-code/08-qwen-code-ui-interaction.md)
+  - [Web Server](docs/qwen-code/09-qwen-code-web-server.md)
+  - [Safety Control](docs/qwen-code/10-qwen-code-safety-control.md)
+  - [Prompt 组织](docs/qwen-code/11-qwen-code-prompt-organization.md)
+  - [日志记录机制](docs/qwen-code/12-qwen-code-logging.md)
+  - **Questions**
+    - [工具调用错误处理](docs/qwen-code/questions/qwen-code-tool-error-handling.md)
+    - [上下文压缩机制](docs/qwen-code/questions/qwen-code-context-compaction.md)
+    - [循环检测机制](docs/qwen-code/questions/qwen-code-loop-detection.md)
