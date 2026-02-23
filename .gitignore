@@ -3,6 +3,7 @@ gemini-cli/
 codex/
 opencode/
 SWE-agent/
+qwen-code/
 .DS_Store
 
 !docs/kimi-cli
@@ -10,7 +11,7 @@ SWE-agent/
 !docs/codex
 !docs/opencode
 !docs/SWE-agent
-
+!docs/qwen-code
 .claude
 .cursor
 .env
