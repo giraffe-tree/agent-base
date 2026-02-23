@@ -40,31 +40,43 @@
   <!-- 复制代码插件 -->
   <script src="//cdn.jsdelivr.net/npm/docsify-copy-code/dist/docsify-copy-code.min.js"></script>
   <script src="//cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
-<script>
-  mermaid.initialize({
-    startOnLoad: false,
-    theme: "default",
-  });
-</script>
 
 <script>
-  // Docsify hook: 渲染 markdown 后，把 mermaid 代码块转成 <div class="mermaid">...</div>
+  mermaid.initialize({ startOnLoad: false });
+
   window.$docsify = window.$docsify || {};
-  window.$docsify.plugins = [].concat(window.$docsify.plugins || [], function (hook, vm) {
+  window.$docsify.plugins = (window.$docsify.plugins || []).concat(function (hook) {
     hook.doneEach(function () {
-      // 把 <pre><code class="language-mermaid">...</code></pre> 替换成 <div class="mermaid">...</div>
-      document.querySelectorAll('pre > code.language-mermaid').forEach((code) => {
-        const pre = code.parentElement;
+      // 1) 处理你这种：<pre data-lang="mermaid"><code class="lang-mermaid">...</code></pre>
+      document.querySelectorAll('pre[data-lang="mermaid"]').forEach((pre) => {
+        const code = pre.querySelector('code');
+        if (!code) return;
+
         const div = document.createElement('div');
         div.className = 'mermaid';
-        div.textContent = code.textContent;
+        div.textContent = code.textContent; // 保留原始文本（包括换行）
+
         pre.replaceWith(div);
       });
 
-      // 重新渲染
+      // 2) 兼容另一种：<pre><code class="lang-mermaid">...</code></pre>
+      document.querySelectorAll('pre > code.lang-mermaid').forEach((code) => {
+        const pre = code.parentElement;
+        // 如果上面已经替换过就跳过
+        if (!pre || pre.matches('pre[data-lang="mermaid"]')) return;
+
+        const div = document.createElement('div');
+        div.className = 'mermaid';
+        div.textContent = code.textContent;
+
+        pre.replaceWith(div);
+      });
+
+      // 3) 重新渲染本页所有 mermaid
       mermaid.run({ querySelector: ".mermaid" });
     });
   });
 </script>
+
 </body>
 </html>
