@@ -93,15 +93,18 @@ flowchart TD
 
 **Kimi CLI 实现**（`kimi-cli/packages/kosong/src/kosong/__main__.py:51`）：
 ```python
-while True:                          # 外层：等待用户输入
-    while True:                      # 内层：执行 agent loop
+while True:                              # 外层：等待用户输入
+    while True:                          # 内层：执行 agent loop
         result = await kosong.step(...)
-        if not result.tool_calls:    # 无工具调用 = 结束
+        tool_results = await result.tool_results()   # 等待工具执行完成
+        history.append(assistant_message)            # 追加助手消息
+        history.extend(tool_messages)                # 追加工具结果消息
+        if not result.tool_calls:        # 无工具调用 = 结束
             break
 ```
-两层 while：外层管对话，内层管单次任务执行。
+两层 while：外层管对话，内层管单次任务执行。工具结果的等待与历史追加均在内层循环中完成，而非 `step()` 内部。
 
-**工程取舍：** 简单清晰，易于调试；但难以处理并发工具执行（必须等待每个工具完成后才能继续）。
+**工程取舍：** 简单清晰，易于调试；`step()` 在 LLM 流式输出时并发派发多个工具调用（存入 futures），但 `tool_results()` 会按顺序逐一 await，实质是并发触发、顺序收集。
 
 ---
 
@@ -199,7 +202,7 @@ flowchart LR
 |------|-----------------|------------|----------|-------|
 | **循环结构** | while 迭代 | 递归调用 | while + 分支 | Actor 消息 |
 | **调试难度** | 低（线性执行） | 中（递归栈） | 高（状态扫描） | 高（channel） |
-| **并发工具执行** | 否 | 是（Scheduler） | 是 | 是（tokio） |
+| **并发工具执行** | 并发派发、顺序收集 | 是（Scheduler） | 是 | 是（tokio） |
 | **中途中断** | 需要标志位 | 困难 | AbortSignal | 天然支持 |
 | **上下文溢出处理时机** | 每步前检查 | 每轮入口 | 循环内动态分支 | 模型层管理 |
 
