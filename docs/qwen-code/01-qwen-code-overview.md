@@ -95,64 +95,20 @@ AI 编程助手需要解决的核心问题：
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 分层架构图
+### 2.2 核心组件职责
 
-```text
-┌─────────────────────────────────────────────────────────────────┐
-│                        CLI Layer                                │
-│  qwen-code/packages/cli/index.ts:1                              │
-│  ├─ 全局异常处理 (FatalError)                                     │
-│  ├─ main() 入口                                                 │
-│  └─ 子命令分发 (interactive/non-interactive)                    │
-└─────────────────────────────────────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    App Container Layer                          │
-│  qwen-code/packages/cli/src/gemini.tsx:209                      │
-│  ├─ 配置加载与验证                                               │
-│  ├─ 沙盒环境检查                                                 │
-│  ├─ 交互式/非交互式模式切换                                       │
-│  └─ React UI 渲染 (Ink)                                         │
-└─────────────────────────────────────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     GeminiClient Layer                          │
-│  qwen-code/packages/core/src/core/client.ts:78                  │
-│  ├─ sendMessageStream()  # Agent Loop 入口                       │
-│  ├─ processTurn()        # 单轮处理                              │
-│  └─ LoopDetectionService # 循环检测                              │
-└─────────────────────────────────────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                        Turn Layer                               │
-│  qwen-code/packages/core/src/core/turn.ts:221                   │
-│  ├─ Turn.run()           # 单轮流式处理                          │
-│  ├─ 事件流解析 (Content/ToolCall/Thought)                        │
-│  └─ 工具调用队列管理                                             │
-└─────────────────────────────────────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Tools Layer                                │
-│  qwen-code/packages/core/src/tools/                             │
-│  ├─ tool-registry.ts     # 工具注册与发现                        │
-│  ├─ mcp-client-manager.ts # MCP 客户端管理                       │
-│  ├─ coreToolScheduler.ts  # 工具调度执行                         │
-│  └─ handlers/            # 内置工具实现                          │
-└─────────────────────────────────────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     Services Layer                              │
-│  qwen-code/packages/core/src/services/                          │
-│  ├─ sessionService.ts    # JSONL 会话持久化                      │
-│  ├─ chatCompressionService.ts # 上下文压缩                       │
-│  └─ chatRecordingService.ts   # 聊天记录记录                     │
-└─────────────────────────────────────────────────────────────────┘
-```
+| 组件 | 职责 | 代码位置 |
+|-----|------|---------|
+| `CLI 入口` | 全局异常处理、主函数入口 | `packages/cli/index.ts:14` |
+| `主程序` | 配置加载、UI 渲染、模式分发 | `packages/cli/src/gemini.tsx:209` |
+| `初始化器` | 认证、主题、i18n 初始化 | `packages/cli/src/core/initializer.ts:33` |
+| `GeminiClient` | Agent Loop 主控、递归续跑 | `packages/core/src/core/client.ts:78` |
+| `Turn` | 单轮流式处理、事件解析 | `packages/core/src/core/turn.ts:221` |
+| `GeminiChat` | API 调用、流式响应处理 | `packages/core/src/core/geminiChat.ts` |
+| `ToolRegistry` | 工具注册、发现、冲突处理 | `packages/core/src/tools/tool-registry.ts:174` |
+| `McpClientManager` | MCP 客户端生命周期管理 | `packages/core/src/tools/mcp-client-manager.ts:29` |
+| `SessionService` | 会话列表、恢复、删除 | `packages/core/src/services/sessionService.ts:128` |
+| `ChatCompressionService` | 历史压缩、token 管理 | `packages/core/src/services/chatCompressionService.ts:78` |
 
 ### 2.3 核心组件职责
 
