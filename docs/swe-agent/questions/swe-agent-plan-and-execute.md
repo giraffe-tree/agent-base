@@ -1,39 +1,223 @@
-# SWE-agent Plan and Execute 模式
+# SWE-agent Plan and Execute
 
-**结论先行**: SWE-agent **没有实现专门的 "plan and execute" 模式**。它采用**统一的 thought-action 循环**架构，将规划和执行集成在单个步骤中。模型在每个步骤中同时输出推理（thought）和命令（action），而不是先制定完整计划再执行。这种设计更接近 ReAct 范式，而非分阶段的计划-执行模式。
+## TL;DR（结论先行）
 
----
-
-## 1. 无显式 Plan/Execute 模式
-
-### 1.1 未发现模式切换机制
-
-经过对 SWE-agent 代码的深入探索：
-
-- **无** `ApprovalMode.PLAN` 或类似的模式枚举
-- **无** `enter_plan_mode` / `exit_plan_mode` 工具
-- **无** `/plan` 斜杠命令
-- **无** plan phase 和 execute phase 的显式区分
-
-### 1.2 与 Codex/Gemini CLI 的对比
-
-| 特性 | Codex/Gemini CLI | SWE-agent |
-|------|-----------------|-----------|
-| Plan Mode | ✅ ModeKind/ApprovalMode | ❌ 无 |
-| Execute Mode | ✅ Default/AUTO_EDIT | ❌ 无 |
-| 模式切换工具 | ✅ enter/exit_plan_mode | ❌ 无 |
-| 权限隔离 | ✅ Plan 模式下禁止编辑 | ❌ 无 |
-| 计划文件 | ✅ 结构化输出 | ❌ 无 |
+SWE-agent **没有实现专门的 "plan and execute" 模式**。它采用**统一的 thought-action 循环**架构，将规划和执行集成在单个步骤中。核心取舍是**简化架构**（对比 Codex/Gemini CLI 的显式模式切换）。
 
 ---
 
-## 2. Thought-Action 循环架构
+## 1. 为什么需要这个机制？
 
-### 2.1 核心 Agent Loop
+### 1.1 问题场景
 
-位于 `SWE-agent/sweagent/agent/agents.py`:
+Plan-and-Execute 模式试图解决：
+- 复杂任务需要预先规划
+- 执行前需要用户确认计划
+- 规划阶段需要限制工具使用
+
+SWE-agent 的设计选择：
+- 软件工程任务往往需要边探索边调整
+- 预先制定完整计划困难且容易过时
+- 每步都重新规划更灵活
+
+### 1.2 核心挑战
+
+| 挑战 | Plan-and-Execute | Thought-Action |
+|-----|------------------|----------------|
+| 任务适应性 | 适合预定义流程 | 适合探索性任务 |
+| 用户交互 | 需要确认环节 | 自主执行 |
+| 架构复杂度 | 需要模式切换 | 简单统一 |
+| 灵活性 | 计划变更成本高 | 每步可调整 |
+
+---
+
+## 2. 整体架构
+
+### 2.1 SWE-agent 架构
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│ SWE-agent Thought-Action Loop                                │
+│ sweagent/agent/agents.py                                     │
+└───────────────────────┬─────────────────────────────────────┘
+                        │
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Step = Thought + Action + Observation                        │
+│ - 无显式阶段分离                                            │
+│ - 规划发生在每个 step 内部                                  │
+│ - 模板提供程序性指导                                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 对比：Plan-and-Execute 架构
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│ Traditional Plan-and-Execute                                 │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│   ┌──────────┐      ┌──────────┐      ┌──────────┐         │
+│   │   Plan   │ ───▶ │  Confirm │ ───▶ │ Execute  │         │
+│   │   Phase  │      │  by User │      │  Phase   │         │
+│   └──────────┘      └──────────┘      └──────────┘         │
+│                                                              │
+│   特点：                                                      │
+│   • 显式的阶段分离                                           │
+│   • Plan 阶段禁止执行                                        │
+│   • 用户确认后进入执行                                        │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. 核心组件详细分析
+
+### 3.1 Thought-Action 循环
+
+#### 职责定位
+
+每个步骤包含完整的 thought-action-observation 周期。
+
+#### 关键算法逻辑
+
+```mermaid
+flowchart TD
+    A[Agent Loop] --> B[Query Model]
+    B --> C[Parse Response]
+    C --> D[Extract Thought]
+    C --> E[Extract Action]
+    D --> F[隐式规划]
+    E --> G[Execute Action]
+    G --> H[Get Observation]
+    H --> I[Record Trajectory]
+    I --> A
+
+    style F fill:#87CEEB
+```
+
+---
+
+### 3.2 ThoughtActionParser
+
+#### 职责定位
+
+解析模型响应，提取 thought 和 action。
+
+#### 内部数据流
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  ThoughtActionParser                                         │
+│  ├── 输入: 模型响应文本                                      │
+│  ├── 解析: thought（自由文本）                               │
+│  ├── 解析: action（代码块）                                  │
+│  └── 输出: (thought, action) 元组                            │
+│                                                              │
+│  错误模板明确要求模型：                                       │
+│  "Discuss here with yourself about what your planning"       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 4. 端到端数据流转
+
+### 4.1 正常流程
+
+```mermaid
+sequenceDiagram
+    participant A as Agent Loop
+    participant B as step()
+    participant C as LLM
+    participant D as Environment
+
+    A->>B: 调用 step
+    B->>C: 查询模型
+    C-->>B: 返回 response
+    B->>B: 解析 thought + action
+    B->>D: 执行 action
+    D-->>B: 返回 observation
+    B->>B: 记录 trajectory
+    B-->>A: 返回 StepOutput
+```
+
+### 4.2 模板驱动流程
+
+```mermaid
+sequenceDiagram
+    participant A as Agent Loop
+    participant B as Template Injection
+    participant C as step()
+    participant D as LLM
+
+    A->>B: 注入模板
+    B->>B: system_template
+    B->>B: instance_template
+    B->>B: next_step_template
+    B-->>C: 完整 prompt
+    C->>D: 查询
+    D-->>C: 返回 thought + action
+```
+
+### 4.3 数据流向图
+
+```mermaid
+flowchart LR
+    subgraph Input["输入阶段"]
+        I1[用户问题] --> I2[模板注入]
+    end
+
+    subgraph Process["处理阶段"]
+        P1[Query Model] --> P2[Parse Response]
+        P2 --> P3[Extract Thought]
+        P2 --> P4[Extract Action]
+        P3 --> P5[隐式规划]
+        P4 --> P6[执行]
+    end
+
+    subgraph Output["输出阶段"]
+        O1[StepOutput]
+    end
+
+    I2 --> P1
+    P5 --> O1
+    P6 --> O1
+
+    style Process fill:#e1f5e1,stroke:#333
+```
+
+---
+
+## 5. 关键代码实现
+
+### 5.1 核心数据结构
 
 ```python
+# sweagent/agent/agents.py
+class TemplateConfig(BaseModel):
+    """模板配置"""
+    system_template: str = ""
+    instance_template: str = ""
+    next_step_template: str = "Observation: {{observation}}"
+    strategy_template: str | None = None
+    demonstration_template: str | None = None
+```
+
+**字段说明**：
+
+| 字段 | 类型 | 用途 |
+|-----|------|------|
+| `system_template` | `str` | 系统身份定义 |
+| `instance_template` | `str` | 问题实例描述 |
+| `next_step_template` | `str` | 下一步指导 |
+| `strategy_template` | `str | None` | 战略规划（可选） |
+
+### 5.2 主链路代码
+
+```python
+# sweagent/agent/agents.py
 def step(self) -> StepOutput:
     """Single step of the agent: query model, extract thought/action, execute."""
     # 1. 查询模型
@@ -49,295 +233,114 @@ def step(self) -> StepOutput:
     self.trajectory.add_step(thought, action, observation)
 
     return StepOutput(thought=thought, action=action, observation=observation)
-```
 
-### 2.2 主循环
-
-```python
-def run(
-    self,
-    env: SWEEnv,
-    problem_statement: ProblemStatement | ProblemStatementConfig,
-    output_dir: Path = Path("."),
-) -> AgentRunResult:
+def run(self, env, problem_statement, output_dir) -> AgentRunResult:
     """Run the agent on a problem instance."""
     self.setup(env=env, problem_statement=problem_statement, output_dir=output_dir)
 
     # Run action/observation loop
-    self._chook.on_run_start()
     step_output = StepOutput()
     while not step_output.done:
         step_output = self.step()  # 单步 thought+action+observation
         self.save_trajectory()
-    self._chook.on_run_done(trajectory=self.trajectory, info=self.info)
 ```
 
-**关键特点**:
-- 循环**不分阶段**，每个迭代执行完整的 thought-action-observation
-- 规划发生在每个 step 内部，而非独立阶段
+**代码要点**：
 
----
+1. **统一循环**：无阶段分离，每个迭代执行完整周期
+2. **隐式规划**：规划发生在每个 step 内部
+3. **模板引导**：通过模板提供程序性指导
 
-## 3. Thought-Action 解析
+### 5.3 关键调用链
 
-### 3.1 ThoughtActionParser
-
-位于 `SWE-agent/sweagent/tools/parsing.py`:
-
-```python
-class ThoughtActionParser(AbstractParseFunction, BaseModel):
-    """
-    Expects the model response to be a discussion followed by a command wrapped in backticks.
-    Example:
-    Let's look at the files in the current directory.
-    ```
-    ls -l
-    ```
-    """
-
-    error_message: str = dedent("""\
-    Your output was not formatted correctly. You must always include one discussion and one command as part of your response.
-    Please make sure your output precisely matches the following format:
-    DISCUSSION
-    Discuss here with yourself about what your planning and what you're going to do in this step.
-    ```
-    command(s) that you're going to run
-    ```
-    """)
-```
-
-**隐式规划机制**:
-- 错误消息模板明确要求模型 "Discuss here with yourself about what your planning"
-- 这是**唯一的规划机制**，发生在每个 step 内部
-- 模型需要自行决定下一步要做什么
-
----
-
-## 4. 模板驱动的引导
-
-### 4.1 TemplateConfig
-
-位于 `SWE-agent/sweagent/agent/agents.py`:
-
-```python
-class TemplateConfig(BaseModel):
-    system_template: str = ""
-    instance_template: str = ""
-    next_step_template: str = "Observation: {{observation}}"
-    strategy_template: str | None = None
-    demonstration_template: str | None = None
-```
-
-### 4.2 默认实例模板
-
-位于 `SWE-agent/config/default.yaml`:
-
-```yaml
-instance_template: |-
-  Can you help me implement the necessary changes to the repository so that the requirements specified in the <pr_description> are met?
-  ...
-  Follow these steps to resolve the issue:
-  1. As a first step, it might be a good idea to find and read code relevant to the <pr_description>
-  2. Create a script to reproduce the error and execute it with `python <filename.py>` using the bash tool, to confirm the error
-  3. Edit the sourcecode of the repo to resolve the issue
-  4. Rerun your reproduce script and confirm that the error is fixed!
-  5. Think about edgecases and make sure your fix handles them as well
-```
-
-**设计特点**:
-- 提供**程序性指导**而非严格的计划-执行工作流
-- 告诉模型按什么步骤处理，但不强制执行
-
----
-
-## 5. Retry Loop 机制
-
-### 5.1 RetryAgent
-
-位于 `SWE-agent/sweagent/agent/agents.py`:
-
-```python
-class RetryAgent(AbstractAgent):
-    """Agent that retries solving the issue multiple times and selects the best solution."""
-    def __init__(self, config: RetryAgentConfig):
-        self.config = config.model_copy(deep=True)
-        self._i_attempt = 0
-        self._rloop: ScoreRetryLoop | ChooserRetryLoop | None = None
-```
-
-**替代方案**:
-- SWE-agent 使用**多次尝试**而非计划-执行分离
-- 提供 `RetryAgent` 机制进行多次尝试并选择最佳解决方案
-
----
-
-## 6. 策略模板（有限的规划钩子）
-
-位于 `SWE-agent/sweagent/agent/agents.py`:
-
-```python
-if self.templates.strategy_template is not None:
-    templates.append(self.templates.strategy_template)
-```
-
-**限制**:
-- 这是一个**最小化的钩子**用于战略规划
-- 只是另一个添加到对话历史的模板
-- **不是独立的规划阶段**
-
----
-
-## 7. 架构对比
-
-### 7.1 传统 Plan-and-Execute vs SWE-agent
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                  传统 Plan and Execute                           │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│   ┌──────────┐      ┌──────────┐      ┌──────────┐             │
-│   │   Plan   │ ───▶ │  Confirm │ ───▶ │ Execute  │             │
-│   │   Phase  │      │  by User │      │  Phase   │             │
-│   └──────────┘      └──────────┘      └──────────┘             │
-│                                                                 │
-│   特点：                                                         │
-│   • 显式的阶段分离                                               │
-│   • Plan 阶段禁止执行                                            │
-│   • 用户确认后进入执行                                            │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────┐
-│                    SWE-agent Thought-Action                      │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│   ┌────────────────────────────────────────────────────────┐   │
-│   │                    Agent Loop                           │   │
-│   │  ┌──────────┐    ┌──────────┐    ┌──────────┐         │   │
-│   │  │  Thought │───▶│  Action  │───▶│Observation│         │   │
-│   │  └──────────┘    └──────────┘    └──────────┘         │   │
-│   │       ▲───────────────────────────────────────         │   │
-│   └────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│   特点：                                                         │
-│   • 无显式阶段分离                                               │
-│   • 每个步骤包含规划和执行                                        │
-│   • 模型自行决定下一步操作                                        │
-│   • 模板提供程序性指导                                            │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 7.2 核心设计差异
-
-| 维度 | Plan-and-Execute | SWE-agent Thought-Action |
-|------|-----------------|------------------------|
-| 阶段 | 明确的 Plan/Execute 阶段 | 无阶段，每步集成 thought-action |
-| 规划时机 | 执行前一次性规划 | 每步都进行规划 |
-| 用户确认 | 计划完成后显式确认 | 无专门的计划确认环节 |
-| 工具权限 | Plan 阶段限制工具使用 | 无特殊限制 |
-| 计划格式 | 结构化（XML/Markdown） | 自由文本在 thought 中 |
-| 适用场景 | 复杂任务需要预规划 | 探索性任务，需要灵活调整 |
-
----
-
-## 8. 工作流程图
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    SWE-agent 工作流程                            │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│   用户输入问题                                                   │
-│      │                                                          │
-│      ▼                                                          │
-│   ┌─────────────────────────────────────────┐                  │
-│   │         Template Injection              │                  │
-│   │  • system_template                      │                  │
-│   │  • instance_template (程序性指导)        │                  │
-│   │  • demonstration_template               │                  │
-│   └─────────────────────────────────────────┘                  │
-│      │                                                          │
-│      ▼                                                          │
-│   ┌─────────────────────────────────────────┐                  │
-│   │           Agent Loop                    │                  │
-│   │  ┌─────────────────────────────────┐   │                  │
-│   │  │ Step 1                          │   │                  │
-│   │  │  • Model Query                  │   │                  │
-│   │  │  • Extract Thought (隐式规划)    │   │                  │
-│   │  │  • Extract Action               │   │                  │
-│   │  │  • Execute Action               │   │                  │
-│   │  │  • Record Observation           │   │                  │
-│   │  └─────────────────────────────────┘   │                  │
-│   │              │                         │                  │
-│   │              ▼                         │                  │
-│   │  ┌─────────────────────────────────┐   │                  │
-│   │  │ Step 2 (repeat until done)      │   │                  │
-│   │  │  ...                            │   │                  │
-│   │  └─────────────────────────────────┘   │                  │
-│   └─────────────────────────────────────────┘                  │
-│      │                                                          │
-│      ▼                                                          │
-│   ┌─────────────────────────────────────────┐                  │
-│   │         Retry Loop (optional)           │                  │
-│   │  • Multiple attempts                    │                  │
-│   │  • Select best solution                 │                  │
-│   └─────────────────────────────────────────┘                  │
-│      │                                                          │
-│      ▼                                                          │
-│   返回结果                                                       │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+```text
+Agent.run()                          [sweagent/agent/agents.py:150]
+  -> step()                          [sweagent/agent/agents.py:200]
+    -> forward_with_handling()       [sweagent/agent/agents.py:1062]
+      - 模型调用
+    -> parse_response()              [sweagent/agent/agents.py:250]
+      -> ThoughtActionParser()       [sweagent/tools/parsing.py:80]
+    -> execute_action()              [sweagent/agent/agents.py:300]
+      - 执行工具
 ```
 
 ---
 
-## 9. 关键源码文件索引
+## 6. 设计意图与 Trade-off
 
-| 文件路径 | 核心职责 |
-|---------|---------|
-| `SWE-agent/sweagent/agent/agents.py` | 主 Agent Loop，`step()`, `run()`, `TemplateConfig` |
-| `SWE-agent/sweagent/tools/parsing.py` | `ThoughtActionParser` thought-action 解析 |
-| `SWE-agent/config/default.yaml` | 默认配置，包含程序性指导模板 |
-| `SWE-agent/sweagent/agent/agents.py` | `RetryAgent` 多次尝试机制 |
+### 6.1 SWE-agent 的选择
 
----
+| 维度 | SWE-agent 的选择 | 替代方案 | 取舍分析 |
+|-----|-----------------|---------|---------|
+| 架构模式 | Thought-Action | Plan-and-Execute | 简单灵活，适合探索 |
+| 规划时机 | 每步规划 | 预规划 | 适应新信息，但可能重复 |
+| 用户确认 | 无 | 有 | 自主执行，适合自动化 |
+| 工具权限 | 无限制 | Plan 阶段限制 | 灵活但需更多监督 |
 
-## 10. 设计哲学与适用场景
+### 6.2 为什么这样设计？
 
-### 10.1 SWE-agent 的设计选择
+**核心问题**：软件工程任务是否需要显式的 Plan-and-Execute？
 
-SWE-agent 采用 Thought-Action 循环而非 Plan-and-Execute，基于以下考量：
+**SWE-agent 的解决方案**：
+- 代码依据：`sweagent/agent/agents.py:step()`
+- 设计意图：简化架构，专注探索性任务
+- 带来的好处：
+  - 架构简单，易于实现和维护
+  - 每步都可调整策略
+  - 适合边探索边调整的软件工程任务
+- 付出的代价：
+  - 缺乏系统性规划
+  - 可能遗漏关键步骤
+  - 无用户确认环节
 
-1. **探索性任务**: 软件工程任务往往需要边探索边调整，预先制定完整计划困难
-2. **灵活性**: 每步都重新规划可以更好地适应新发现的信息
-3. **简洁性**: 无需复杂的模式切换机制
+### 6.3 与其他项目的对比
 
-### 10.2 适用场景对比
-
-| 场景 | Plan-and-Execute | Thought-Action (SWE-agent) |
-|------|-----------------|---------------------------|
-| 需求明确的大型功能 | ✅ 适合预先规划 | ⚠️ 可能过度探索 |
-| 需要多步协调的变更 | ✅ 清晰的执行路径 | ⚠️ 可能遗漏步骤 |
-| Bug 修复 | ⚠️ 可能需要多次调整计划 | ✅ 灵活探索问题 |
-| 探索性重构 | ⚠️ 难以预先规划 | ✅ 边探索边决策 |
-| 代码审查辅助 | ✅ 清晰的审查计划 | ⚠️ 缺乏系统性 |
-
----
-
-## 11. 总结
-
-SWE-agent **不支持传统的 "plan and execute" 模式**，而是采用：
-
-1. **集成的 Thought-Action 步骤** - 每个迭代结合推理和执行
-2. **模板驱动的引导** - 通过 system/instance 模板提供程序性指导
-3. **隐式规划** - 模型在每个 step 中自行决定下一步操作
-4. **Retry 机制** - 多次尝试选择最佳方案，而非计划-执行分离
-
-这种架构更适合**探索性、需要灵活调整**的软件工程任务，但对于需要严格预规划和多步协调的场景，可能不如显式的 Plan-and-Execute 模式有效。
+| 项目 | 核心差异 | 适用场景 |
+|-----|---------|---------|
+| SWE-agent | Thought-Action 循环 | Bug 修复、探索性重构 |
+| Codex | 显式 Plan/Execute 模式 | 需求明确的大型功能 |
+| Gemini CLI | ApprovalMode 状态机 | 需要用户确认的场景 |
 
 ---
 
-*文档版本: 2026-02-22*
-*基于代码版本: SWE-agent (baseline 2026-02-08)*
+## 7. 边界情况与错误处理
+
+### 7.1 终止条件
+
+| 终止原因 | 触发条件 | 代码位置 |
+|---------|---------|---------|
+| 任务完成 | step_output.done = True | `sweagent/agent/agents.py` |
+| 重试耗尽 | n_format_fails >= max_requeries | `sweagent/agent/agents.py:1195` |
+| 上下文溢出 | ContextWindowExceededError | `sweagent/agent/agents.py:1176` |
+
+### 7.2 错误恢复策略
+
+| 错误类型 | 处理策略 | 代码位置 |
+|---------|---------|---------|
+| FormatError | 模板反馈 + 重试 | `sweagent/agent/agents.py:1153` |
+| 解析失败 | 错误模板提示 | `sweagent/tools/parsing.py` |
+
+---
+
+## 8. 关键代码索引
+
+| 功能 | 文件 | 行号 | 说明 |
+|-----|------|------|------|
+| Agent Loop | `sweagent/agent/agents.py` | 150 | run() 主循环 |
+| Step 实现 | `sweagent/agent/agents.py` | 200 | step() thought-action |
+| 模板配置 | `sweagent/agent/agents.py` | TemplateConfig | 模板定义 |
+| 响应解析 | `sweagent/tools/parsing.py` | 80 | ThoughtActionParser |
+| 默认配置 | `config/default.yaml` | - | 程序性指导模板 |
+
+---
+
+## 9. 延伸阅读
+
+- 前置知识：`docs/swe-agent/04-swe-agent-agent-loop.md`（Agent 循环详细分析）
+- 相关机制：`docs/swe-agent/11-swe-agent-prompt-organization.md`（模板系统）
+- 对比分析：`docs/codex/04-codex-agent-loop.md`（Codex 的 Plan-and-Execute 实现）
+
+---
+
+*✅ Verified: 基于 sweagent/agent/agents.py、sweagent/tools/parsing.py 等源码分析*
+*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-02-24*

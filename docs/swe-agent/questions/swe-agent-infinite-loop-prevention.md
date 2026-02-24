@@ -1,14 +1,292 @@
-# SWE-agent 如何避免 Tool 无限循环调用
+# SWE-agent Infinite Loop Prevention
 
-**结论先行**: SWE-agent 通过 **`max_requeries` 重试上限** + **Autosubmit 自动提交** + **连续超时计数器**防止 tool 无限循环。核心设计是"优雅完成"，即使发生异常也尝试提取 patch 提交结果，而非强制中断。
+## TL;DR（结论先行）
+
+SWE-agent 通过 **`max_requeries` 重试上限** + **Autosubmit 自动提交** + **连续超时计数器**防止 tool 无限循环。核心设计是"优雅完成"，即使发生异常也尝试提取 patch 提交结果，而非强制中断。
 
 ---
 
-## 1. 核心防护机制：max_requeries
+## 1. 为什么需要这个机制？
 
-位于 `SWE-agent/sweagent/agent/agents.py:451`：
+### 1.1 问题场景
+
+没有防护机制时：
+- LLM 反复生成格式错误的响应，陷入无限重试
+- 长时间运行的命令阻塞整个任务
+- 异常发生时丢失所有工作成果
+
+有了防护机制：
+- 重试次数受限，防止资源浪费
+- 连续超时自动退出，避免无限等待
+- 异常时自动提交，保留已做的工作
+
+### 1.2 核心挑战
+
+| 挑战 | 不解决的后果 |
+|-----|-------------|
+| 格式错误循环 | LLM 无法自我纠正，无限重试 |
+| 命令超时累积 | 多次超时阻塞任务进度 |
+| 资源耗尽 | 无限循环导致成本失控 |
+| 异常丢失进度 | 异常发生时工作成果丢失 |
+
+---
+
+## 2. 整体架构
+
+### 2.1 在系统中的位置
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│ Agent Loop                                                   │
+│ sweagent/agent/agents.py                                     │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ 调用
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│ ▓▓▓ Loop Prevention ▓▓▓                                     │
+│ sweagent/agent/agents.py:451                                 │
+│ - max_requeries: 格式错误重试上限                           │
+│ - _n_consecutive_timeouts: 连续超时计数器                   │
+│ - attempt_autosubmission_after_error(): 自动提交兜底        │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ 依赖/调用
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│ Error        │ │ Timeout      │ │ Submission   │
+│ Counter      │ │ Counter      │ │ Handler      │
+│ 错误计数器    │ │ 超时计数器    │ │ 提交处理器    │
+└──────────────┘ └──────────────┘ └──────────────┘
+```
+
+### 2.2 核心组件职责
+
+| 组件 | 职责 | 代码位置 |
+|-----|------|---------|
+| `max_requeries` | 限制格式错误重试次数 | `sweagent/agent/agents.py:451` |
+| `_n_consecutive_timeouts` | 追踪连续超时次数 | `sweagent/agent/agents.py:968` |
+| `forward_with_handling()` | 集中重试控制 | `sweagent/agent/agents.py:1062` |
+| `attempt_autosubmission_after_error()` | 异常时自动提交 | `sweagent/agent/agents.py:823` |
+
+### 2.3 核心组件交互关系
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Agent Loop
+    participant B as forward_with_handling
+    participant C as Error Counter
+    participant D as Timeout Counter
+    participant E as Autosubmit
+
+    A->>B: 1. 执行 step
+    B->>B: 2. 调用模型
+
+    alt 格式错误
+        B->>C: 3a. 检查计数
+        C-->>B: 4a. 返回当前计数
+        B->>B: 5a. 计数 < 3?
+        B->>B: 6a. 是：重试
+        B->>E: 7a. 否：Autosubmit
+    else 命令执行
+        B->>D: 3b. 执行命令
+        D-->>B: 4b. 返回结果
+        alt 超时
+            B->>D: 5b. 增加计数
+            D-->>B: 6b. 检查 >= 3?
+            B->>E: 7b. 是：Autosubmit
+        else 成功
+            B->>D: 5c. 重置计数
+        end
+    end
+
+    B-->>A: 8. 返回结果
+```
+
+---
+
+## 3. 核心组件详细分析
+
+### 3.1 max_requeries 重试控制
+
+#### 职责定位
+
+限制格式错误、被阻止操作、bash 语法错误的重试次数，防止无限重试。
+
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle: 初始化
+    Idle --> Retrying: 发生可重试错误
+    Retrying --> Retrying: 计数 < max_requeries
+    Retrying --> Autosubmit: 计数 >= max_requeries
+    Retrying --> Success: 成功
+    Autosubmit --> [*]
+    Success --> [*]
+
+    note right of Retrying
+        FormatError
+        BlockedActionError
+        BashIncorrectSyntaxError
+    end note
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Idle | 等待执行 | 初始化完成 | 发生可重试错误 |
+| Retrying | 重试中 | 发生可重试错误 | 成功或重试耗尽 |
+| Autosubmit | 自动提交 | 重试耗尽 | 完成提交 |
+| Success | 成功 | 模型输出正确 | 自动返回 Idle |
+
+#### 关键算法逻辑
+
+```mermaid
+flowchart TD
+    A[forward_with_handling] --> B{发生错误?}
+    B -->|否| C[返回结果]
+    B -->|是| D{可重试错误?}
+    D -->|否| E[Autosubmit]
+    D -->|是| F[n_format_fails++]
+    F --> G{< max_requeries?}
+    G -->|是| H[构造错误历史]
+    H --> I[递归重试]
+    I --> B
+    G -->|否| E
+
+    style C fill:#90EE90
+    style E fill:#FFB6C1
+    style H fill:#87CEEB
+```
+
+---
+
+### 3.2 连续超时计数器
+
+#### 职责定位
+
+追踪连续命令超时次数，超过阈值时强制退出，防止无限等待。
+
+#### 内部数据流
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  输入层                                                      │
+│  ├── 命令执行请求                                           │
+│  └── 超时配置                                               │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  处理层                                                      │
+│  ├── 执行命令                                               │
+│  ├── 捕获 TimeoutExpired                                    │
+│  ├── _n_consecutive_timeouts += 1                           │
+│  └── 检查 >= 3?                                             │
+│      ├── 是：raise 终止                                     │
+│      └── 否：interrupt + 反馈                               │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  输出层                                                      │
+│  ├── 成功：计数器重置                                       │
+│  └── 超时：计数器增加或终止                                 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 4. 端到端数据流转
+
+### 4.1 正常流程
+
+```mermaid
+sequenceDiagram
+    participant A as Agent Loop
+    participant B as handle_action
+    participant C as Shell
+    participant D as Timeout Counter
+
+    A->>B: 执行 action
+    B->>C: 执行命令
+    C-->>B: 正常完成
+    B->>D: 重置计数器
+    D-->>B: _n_consecutive_timeouts = 0
+    B-->>A: 返回 observation
+```
+
+### 4.2 异常流程（连续超时）
+
+```mermaid
+sequenceDiagram
+    participant A as Agent Loop
+    participant B as handle_action
+    participant C as Shell
+    participant D as Timeout Counter
+    participant E as Autosubmit
+
+    A->>B: 执行 action
+    B->>C: 执行命令
+    C--xB: TimeoutExpired
+    B->>D: 增加计数
+    D-->>B: _n_consecutive_timeouts = 1
+    B->>B: 中断会话
+    B-->>A: 返回超时反馈
+
+    A->>B: 再次执行
+    B->>C: 执行命令
+    C--xB: TimeoutExpired
+    B->>D: 增加计数
+    D-->>B: _n_consecutive_timeouts = 2
+    B-->>A: 返回超时反馈
+
+    A->>B: 第三次执行
+    B->>C: 执行命令
+    C--xB: TimeoutExpired
+    B->>D: 增加计数
+    D-->>B: _n_consecutive_timeouts = 3
+    B->>E: 触发 Autosubmit
+    E-->>A: 返回提交结果
+```
+
+### 4.3 数据流向图
+
+```mermaid
+flowchart LR
+    subgraph Input["输入阶段"]
+        I1[模型输出] --> I2[解析 action]
+    end
+
+    subgraph Process["处理阶段"]
+        P1[执行命令] --> P2{超时?}
+        P2 -->|是| P3[增加计数]
+        P3 --> P4{>= 3?}
+        P4 -->|是| P5[Autosubmit]
+        P4 -->|否| P6[中断+反馈]
+        P2 -->|否| P7[重置计数]
+    end
+
+    subgraph Output["输出阶段"]
+        O1[StepOutput]
+    end
+
+    I2 --> P1
+    P5 --> O1
+    P6 --> O1
+    P7 --> O1
+
+    style Process fill:#e1f5e1,stroke:#333
+```
+
+---
+
+## 5. 关键代码实现
+
+### 5.1 核心数据结构
 
 ```python
+# sweagent/agent/agents.py:451
 class DefaultAgent(AbstractAgent):
     def __init__(
         self,
@@ -20,148 +298,17 @@ class DefaultAgent(AbstractAgent):
         self._n_consecutive_timeouts = 0
 ```
 
-### 1.1 forward_with_handling() 重试控制
+**字段说明**：
+
+| 字段 | 类型 | 用途 |
+|-----|------|------|
+| `max_requeries` | `int` | 格式错误最大重试次数 |
+| `_n_consecutive_timeouts` | `int` | 连续超时计数器 |
+
+### 5.2 主链路代码
 
 ```python
-def forward_with_handling(self, history: list[dict[str, str]]) -> StepOutput:
-    """Forward the model and handle errors, requerying the model if we can."""
-
-    def handle_error_with_retry(
-        exception: Exception, template: str, n_requeries: int
-    ) -> list[dict[str, str]]:
-        """Requeries the model if the error is a format/blocklist/bash syntax error."""
-        self.logger.warning(
-            "Requerying model after %s (%dth requery)",
-            type(exception).__name__, n_requeries
-        )
-        # 添加错误到 trajectory（历史记录）
-        step: StepOutput = getattr(exception, "step", StepOutput())
-        self.add_step_to_trajectory(step)
-
-        # 构建重新查询的历史
-        return self.get_model_requery_history(
-            error_template=template,
-            **step.to_template_format_dict(),
-            exception_message=str(exception),
-        )
-
-    n_format_fails = 0
-    while n_format_fails < self.max_requeries:
-        try:
-            return self.forward(history)
-
-        # 可重试错误（增加计数）
-        except FormatError as e:
-            n_format_fails += 1
-            history = handle_error_with_retry(
-                exception=e,
-                template=self.tools.config.format_error_template,
-                n_requeries=n_format_fails
-            )
-        except _BlockedActionError as e:
-            n_format_fails += 1
-            history = handle_error_with_retry(
-                exception=e,
-                template=self.tools.config.filter.blocklist_error_template,
-                n_requeries=n_format_fails,
-            )
-        except BashIncorrectSyntaxError as e:
-            n_format_fails += 1
-            history = handle_error_with_retry(
-                exception=e,
-                template=self.templates.shell_check_error_template,
-                n_requeries=n_format_fails,
-            )
-
-        # 可重试错误（不增加计数）
-        except _RetryWithOutput as e:
-            history = handle_error_with_retry(
-                exception=e,
-                template=self.templates.next_step_template,
-                n_requeries=n_format_fails,
-            )
-        except _RetryWithoutOutput:
-            pass  # 简单重试，不增加计数
-
-        # 致命错误 → Autosubmit
-        except ContextWindowExceededError:
-            return handle_error_with_autosubmission("exit_context", "...")
-        except CostLimitExceededError:
-            return handle_error_with_autosubmission("exit_cost", "...")
-        except CommandTimeoutError:
-            return handle_error_with_autosubmission("exit_command_timeout", "...")
-
-    # 重试耗尽 → Autosubmit
-    self.logger.exception("Exit due to repeated format errors")
-    return handle_error_with_autosubmission(
-        "exit_format",
-        "Exit due to repeated format/blocklist/bash syntax errors",
-    )
-```
-
-**分类处理策略**:
-
-| 错误类型 | 增加计数 | 说明 |
-|---------|---------|------|
-| `FormatError` | ✅ | 格式错误，需要 LLM 修正 |
-| `_BlockedActionError` | ✅ | 被阻止的操作 |
-| `BashIncorrectSyntaxError` | ✅ | Bash 语法错误 |
-| `_RetryWithOutput` | ❌ | 带输出的简单重试 |
-| `_RetryWithoutOutput` | ❌ | 不带输出的简单重试 |
-
----
-
-## 2. Autosubmit 自动提交机制
-
-位于 `SWE-agent/sweagent/agent/agents.py:823`：
-
-### 2.1 核心实现
-
-```python
-def attempt_autosubmission_after_error(self, step: StepOutput) -> StepOutput:
-    """对于大多数异常，我们仍尝试提取 patch 并提交。"""
-    self.logger.warning("Attempting autosubmission after error")
-    step = step.model_copy(deep=True)
-    step.done = True  # 标记为完成
-
-    # 检查运行时是否存活
-    if not asyncio.run(self._env.deployment.is_alive(timeout=10)):
-        self.logger.error("Runtime is no longer alive")
-        # 尝试从最后一个 trajectory 步骤的 diff 恢复
-        try:
-            last_trajectory_step = self.trajectory[-1]
-            diff = last_trajectory_step["state"].get("diff")
-            if diff:
-                step.submission = diff
-                step.observation = "Environment died unexpectedly. Exited (autosubmitted)"
-                step.exit_status = f"submitted ({step.exit_status})"
-        except IndexError:
-            pass
-        return step
-
-    # 手动执行提交命令
-    submission_command = "git add -A && git diff --cached > /root/model.patch"
-    try:
-        self._env.execute_command(submission_command, check=True)
-    except Exception as e:
-        self.logger.error("Failed to execute submission command: %s", e)
-
-    # 读取并提交 patch
-    step = self.handle_submission(step, observation="", force_submission=True)
-    if step.submission:
-        step.observation = "Exited (autosubmitted)"
-    return step
-```
-
-**设计哲学**: 即使遇到错误，也尽可能完成任务并提交结果，而不是直接失败。
-
----
-
-## 3. 连续超时计数器
-
-位于 `SWE-agent/sweagent/agent/agents.py:968`：
-
-```python
+# sweagent/agent/agents.py:968
 # 初始化
 self._n_consecutive_timeouts = 0
 
@@ -185,23 +332,87 @@ else:
     self._n_consecutive_timeouts = 0  # 成功则重置计数器
 ```
 
-**防护逻辑**:
-- 连续超时达到 3 次强制退出
-- 成功执行一次即重置计数器
-- 允许偶尔的超时（如网络抖动）
+**代码要点**：
+
+1. **连续检测**：只有连续超时才会触发退出
+2. **中断机制**：超时后尝试中断会话，而非直接终止
+3. **模板反馈**：使用 Jinja2 模板给 LLM 清晰的超时说明
+4. **成功重置**：一次成功执行即重置计数器
+
+### 5.3 关键调用链
+
+```text
+Agent.step()                         [sweagent/agent/agents.py:200]
+  -> handle_action()                 [sweagent/agent/agents.py:900]
+    -> _env.execute()                [sweagent/environment/swe_env.py:150]
+      - subprocess.run(timeout=...)
+    -> CommandTimeoutError 捕获      [sweagent/agent/agents.py:968]
+      - _n_consecutive_timeouts += 1
+      - 检查 >= 3?
+      - 是：raise 终止
+      - 否：interrupt_session()
+```
 
 ---
 
-## 4. 总执行时间限制
+## 6. 设计意图与 Trade-off
 
-位于 `SWE-agent/sweagent/agent/agents.py:1018`：
+### 6.1 SWE-agent 的选择
+
+| 维度 | SWE-agent 的选择 | 替代方案 | 取舍分析 |
+|-----|-----------------|---------|---------|
+| 重试限制 | 固定次数 max_requeries | 指数退避 | 简单可控，适合确定性场景 |
+| 超时策略 | 连续超时计数 | 累计超时 | 允许偶尔超时，更灵活 |
+| 异常处理 | Autosubmit | 直接失败 | 保留工作成果，适合 CI/CD |
+| 终止方式 | 抛出异常 | 优雅退出 | 明确信号，便于上层处理 |
+
+### 6.2 为什么这样设计？
+
+**核心问题**：如何在防止无限循环的同时最大化任务完成率？
+
+**SWE-agent 的解决方案**：
+- 代码依据：`sweagent/agent/agents.py:451`
+- 设计意图："优雅完成"而非"完美完成"
+- 带来的好处：
+  - 有限重试防止资源浪费
+  - 连续超时检测避免阻塞
+  - Autosubmit 确保有输出
+- 付出的代价：
+  - 可能提交不完整修复
+  - 需要额外的错误处理逻辑
+
+### 6.3 与其他项目的对比
+
+| 项目 | 核心差异 | 适用场景 |
+|-----|---------|---------|
+| SWE-agent | max_requeries + Autosubmit | CI/CD 自动化评测 |
+| Gemini CLI | 递归 continuation 限制 | 复杂多步任务 |
+| Kimi CLI | Checkpoint + D-Mail | 交互式对话 |
+| Codex | CancellationToken | 企业安全环境 |
+| OpenCode | 无显式限制 | 轻量级场景 |
+
+---
+
+## 7. 边界情况与错误处理
+
+### 7.1 终止条件
+
+| 终止原因 | 触发条件 | 代码位置 |
+|---------|---------|---------|
+| 格式重试耗尽 | n_format_fails >= max_requeries | `sweagent/agent/agents.py:1195` |
+| 连续超时 | _n_consecutive_timeouts >= 3 | `sweagent/agent/agents.py:971` |
+| 总执行时间 | _total_execution_time > 1800s | `sweagent/agent/agents.py:1020` |
+| 上下文溢出 | ContextWindowExceededError | `sweagent/agent/agents.py:1176` |
+| 成本超限 | CostLimitExceededError | `sweagent/agent/agents.py:1178` |
+
+### 7.2 超时/资源限制
 
 ```python
+# sweagent/agent/agents.py:1018
 def forward(self, history: list[dict[str, str]]) -> StepOutput:
     # 检查总执行时间
     if self._total_execution_time > self.tools.config.total_execution_timeout:
         raise _TotalExecutionTimeExceeded()
-    # ... 后续逻辑
 ```
 
 配置：
@@ -210,113 +421,35 @@ class ToolConfig(BaseModel):
     total_execution_timeout: int = 1800  # 30 分钟
 ```
 
----
+### 7.3 错误恢复策略
 
-## 5. 防循环流程图
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│               SWE-agent Tool 调用防循环流程                       │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│   LLM 输出 action                                                │
-│        │                                                        │
-│        ▼                                                        │
-│   ┌───────────────────┐                                        │
-│   │ parse_actions()   │                                        │
-│   └─────────┬─────────┘                                        │
-│             │                                                   │
-│     ┌───────┴───────┬──────────────────┐                      │
-│     ▼               ▼                  ▼                      │
-│   解析成功       解析失败            被阻止                      │
-│     │               │                  │                       │
-│     │          ┌────┘                  │                       │
-│     │          ▼                       ▼                       │
-│     │     n_format_fails             blocklist                │
-│     │          │                        │                       │
-│     │          ▼                        ▼                       │
-│     │     ┌─────────┐              同 FormatError             │
-│     │     │ < 3?    │                                           │
-│     │     └────┬────┘                                           │
-│     │       是│                                                 │
-│     │          ▼                                                 │
-│     │     模板化错误反馈                                          │
-│     │     (Jinja2 template)                                      │
-│     │          │                                                 │
-│     │          ▼                                                 │
-│     └───────重新查询 LLM ─────────────────┘                     │
-│                                                                 │
-│   ┌─────────────────────────────────────────────────────────┐   │
-│   │                   工具执行阶段                           │   │
-│   │                                                         │   │
-│   │   execute_command()                                     │   │
-│   │        │                                                │   │
-│   │        ▼                                                │   │
-│   │   ┌─────────────┐                                      │   │
-│   │   │ 超时?       │────是────▶ _n_consecutive_timeouts++  │   │
-│   │   └─────────────┘                │                      │   │
-│   │        │否                        │ >= 3?               │   │
-│   │        ▼                          ▼                      │   │
-│   │   正常结束              Autosubmit + 退出                │   │
-│   │        │                          │                      │   │
-│   │        ▼                          ▼                      │   │
-│   │   _n_consecutive_timeouts = 0   提取 patch               │   │
-│   │   (重置计数器)                  自动提交                  │   │
-│   │                                                         │   │
-│   └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│   ┌─────────────────────────────────────────────────────────┐   │
-│   │                   重试耗尽后                             │   │
-│   │                                                         │   │
-│   │   n_format_fails >= 3                                   │   │
-│   │        │                                                │   │
-│   │        ▼                                                │   │
-│   │   ┌───────────────────┐                                │   │
-│   │   │ handle_error_with │                                │   │
-│   │   │ _autosubmission() │                                │   │
-│   │   └─────────┬─────────┘                                │   │
-│   │             │                                           │   │
-│   │             ▼                                           │   │
-│   │   1. 执行 git diff 生成 patch                           │   │
-│   │   2. 读取 /root/model.patch                             │   │
-│   │   3. 将 patch 作为 submission                           │   │
-│   │   4. 标记 step.done = True                              │   │
-│   │             │                                           │   │
-│   │             ▼                                           │   │
-│   │   返回 AgentRunResult (info, trajectory)                │   │
-│   │                                                         │   │
-│   └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+| 错误类型 | 处理策略 | 代码位置 |
+|---------|---------|---------|
+| 格式错误 | 模板反馈 + 重试 | `sweagent/agent/agents.py:1153` |
+| 连续超时 | Autosubmit | `sweagent/agent/agents.py:971` |
+| 重试耗尽 | Autosubmit | `sweagent/agent/agents.py:1195` |
 
 ---
 
-## 6. 与其他 Agent 的对比
+## 8. 关键代码索引
 
-| 防护机制 | SWE-agent | Gemini CLI | Kimi CLI | Codex | OpenCode |
-|---------|-----------|------------|----------|-------|----------|
-| **重试上限** | ✅ max_requeries=3 | ✅ 3次 | ✅ 3次 | ✅ 5/4次 | ❌ 无 |
-| **自动提交** | ✅ Autosubmit | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 |
-| **连续超时计数** | ✅ 3次退出 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 |
-| **总执行时间** | ✅ 30分钟 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 |
-| **模板化错误** | ✅ Jinja2 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 |
-| **状态回滚** | ❌ 无 | ❌ 无 | ✅ Checkpoint | ❌ 无 | ❌ 无 |
-
----
-
-## 7. 总结
-
-SWE-agent 的防循环设计哲学是**"优雅完成"**：
-
-1. **重试限制**: `max_requeries=3` 限制格式错误重试
-2. **Autosubmit**: 即使异常也尝试提交 patch，确保 CI/CD 成功率
-3. **超时防护**: 连续超时计数器（3次）和总执行时间（30分钟）兜底
-4. **模板化反馈**: Jinja2 模板给 LLM 清晰的修正指导
-
-SWE-agent 的独特之处在于**不追求"完美完成"，而是"尽可能完成"**。即使发生错误，也会尝试提取已做的工作（patch）并提交，这在自动化评测场景（如 SWE-bench）中尤为重要。
+| 功能 | 文件 | 行号 | 说明 |
+|-----|------|------|------|
+| 重试上限配置 | `sweagent/agent/agents.py` | 451 | max_requeries=3 |
+| 连续超时计数 | `sweagent/agent/agents.py` | 968 | _n_consecutive_timeouts |
+| 重试控制 | `sweagent/agent/agents.py` | 1062 | forward_with_handling() |
+| 自动提交 | `sweagent/agent/agents.py` | 823 | attempt_autosubmission_after_error() |
+| 总执行时间 | `sweagent/agent/agents.py` | 1018 | total_execution_timeout 检查 |
 
 ---
 
-*文档版本: 2026-02-21*
-*基于代码版本: SWE-agent (baseline 2026-02-08)*
+## 9. 延伸阅读
+
+- 前置知识：`docs/swe-agent/04-swe-agent-agent-loop.md`（Agent 循环中的防护调用点）
+- 相关机制：`docs/swe-agent/questions/swe-agent-tool-error-handling.md`（错误处理详细分析）
+- 深度分析：`docs/swe-agent/questions/swe-agent-skill-execution-timeout.md`（超时处理机制）
+
+---
+
+*✅ Verified: 基于 sweagent/agent/agents.py:451、sweagent/agent/agents.py:968 等源码分析*
+*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-02-24*

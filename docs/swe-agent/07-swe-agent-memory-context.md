@@ -1,102 +1,166 @@
-# Memory Context 管理（swe-agent）
+# Memory Context 管理（SWE-agent）
 
-本文基于 `./swe-agent` 源码，解释 SWE-agent 如何实现 History 管理、Trajectory 持久化和 Replay 功能。
+## TL;DR（结论先行）
+
+SWE-agent 的 Memory Context 采用"可配置的 Processor 链 + Trajectory 持久化"设计：通过链式 History Processors 对对话历史进行转换和压缩（如 LastNObservations 保留最近 N 条 observation），以 Trajectory 格式持久化到 `.traj` 文件，并支持完整的 Replay 功能用于复现和分析。
+
+SWE-agent 的核心取舍：**Processor 链压缩 + 双轨存储**（对比 Kimi CLI 的 Checkpoint 回滚、Gemini CLI 的分层内存）
 
 ---
 
-## 1. 先看全局（流程图）
+## 1. 为什么需要这个机制？（解决什么问题）
 
-### 1.1 History → Trajectory → State 架构
+### 1.1 问题场景
+
+Code Agent 在处理复杂任务时面临内存管理挑战：
+- 上下文长度限制（模型 token 上限）
+- 历史记录膨胀（多轮对话后历史过长）
+- 执行过程追溯（需要分析 Agent 行为）
+- 任务复现（从断点恢复或重放执行）
+
+没有 Memory Context 管理：
+- Token 超限导致模型调用失败
+- 无法追溯 Agent 的决策过程
+- 崩溃后丢失所有进度
+- 无法分析失败原因
+
+### 1.2 核心挑战
+
+| 挑战 | 不解决的后果 |
+|-----|-------------|
+| 上下文长度限制 | Token 超限，模型调用失败 |
+| 历史记录膨胀 | 有效信息被淹没 |
+| 执行过程追溯 | 无法分析 Agent 行为 |
+| 任务复现 | 无法从断点恢复 |
+| 跨会话记忆 | 无法利用历史经验 |
+
+---
+
+## 2. 整体架构（ASCII 图）
+
+### 2.1 在系统中的位置
 
 ```text
-┌─────────────────────────────────────────────────────────────────┐
-│  Agent Loop 执行                                                  │
-│  ┌────────────────────────────────────────┐                     │
-│  │ Agent.run()                            │                     │
-│  │  ├── step()                            │                     │
-│  │  │   ├── model.query()                │                     │
-│  │  │   ├── parse_action()               │                     │
-│  │  │   ├── env.step()                   │                     │
-│  │  │   └── create_history_item()        │                     │
-│  │  └── append to history[]               │                     │
-│  └────────┬───────────────────────────────┘                     │
-└───────────┼─────────────────────────────────────────────────────┘
-            │
-            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  History Processors 链                                            │
-│  ┌────────────────────────────────────────┐                     │
-│  │ for processor in history_processors:   │                     │
-│  │   history = processor(history)         │                     │
-│  │                                        │                     │
-│  │ 支持的处理器:                          │                     │
-│  │ - LastNObservations                    │                     │
-│  │ - CacheControlHistoryProcessor         │                     │
-│  │ - ClosedWindowHistoryProcessor         │                     │
-│  │ - RemoveRegex                          │                     │
-│  └────────┬───────────────────────────────┘                     │
-└───────────┼─────────────────────────────────────────────────────┘
-            │
-            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Trajectory 持久化                                                │
-│  ┌────────────────────────────────────────┐                     │
-│  │ {session_name}.traj                    │                     │
-│  │  └── JSON 格式                         │                     │
-│  │      {                                 │                     │
-│  │        "trajectory": [...],            │                     │
-│  │        "info": {...},                  │                     │
-│  │        "config": {...}                 │                     │
-│  │      }                                 │                     │
-│  └────────────────────────────────────────┘                     │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│ Agent Loop                                                  │
+│ sweagent/agent/agents.py                                    │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ 调用
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│ ▓▓▓ Memory Context ▓▓▓                                      │
+│                                                             │
+│ ┌─────────────────┐  ┌─────────────────┐  ┌─────────────┐  │
+│ │ History         │  │ History         │  │ Trajectory  │  │
+│ │ (原始历史)      │──│ Processors      │  │ (执行轨迹)  │  │
+│ │                 │  │ (压缩/变换)     │  │             │  │
+│ └─────────────────┘  └─────────────────┘  └─────────────┘  │
+│         │                     │                   │        │
+│         │                     ▼                   ▼        │
+│         │            ┌─────────────────┐  ┌─────────────┐  │
+│         │            │ Processed       │  │ .traj File  │  │
+│         │            │ History         │  │ (持久化)    │  │
+│         │            │ (模型输入)      │  │             │  │
+│         │            └─────────────────┘  └─────────────┘  │
+│         │                          │                        │
+│         └──────────────────────────┘                        │
+│                                    │                        │
+│                                    ▼                        │
+│                           ┌─────────────────┐              │
+│                           │ Model Query     │              │
+│                           │ (LLM 调用)      │              │
+│                           └─────────────────┘              │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 1.2 History 结构
+### 2.2 核心组件职责
+
+| 组件 | 职责 | 代码位置 |
+|-----|------|---------|
+| `history` | 原始对话历史 | `sweagent/agent/agents.py:481` |
+| `History Processors` | 历史记录变换链 | `sweagent/agent/history_processors.py` |
+| `trajectory` | 执行轨迹 | `sweagent/agent/agents.py:482` |
+| `save_trajectory()` | 持久化到文件 | `sweagent/agent/agents.py` |
+| `RunReplay` | 轨迹重放 | `sweagent/run/run_replay.py` |
+
+### 2.3 核心组件交互关系
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Agent
+    participant H as History
+    participant P as Processors
+    participant M as Model
+    participant T as Trajectory
+    participant F as .traj File
+
+    loop Agent Loop
+        A->>H: 1. 获取 raw history
+        H->>P: 2. 应用 processor 链
+        P->>P: 3. LastNObservations
+        P->>P: 4. CacheControl
+        P-->>A: 5. processed messages
+
+        A->>M: 6. query(messages)
+        M-->>A: 7. model_response
+
+        A->>A: 8. 执行 step
+        A->>H: 9. add_step_to_history()
+        A->>T: 10. add_step_to_trajectory()
+        A->>F: 11. save_trajectory()
+    end
+```
+
+**关键交互说明**：
+
+| 步骤 | 交互内容 | 设计意图 |
+|-----|---------|---------|
+| 1-5 | History Processor 链 | 灵活压缩上下文 |
+| 6-7 | 模型调用 | 使用处理后的 history |
+| 8-11 | 更新和持久化 | 双轨记录，支持回放 |
+
+---
+
+## 3. 核心组件详细分析
+
+### 3.1 History 数据结构
+
+#### 职责定位
+
+History 存储完整的对话历史，用于构建模型输入和持久化分析。
+
+#### 数据结构
 
 ```text
+┌────────────────────────────────────────────────────────────────────┐
+│ History - 对话历史（用于模型输入）                                   │
+└────────────────────────────────────────────────────────────────────┘
+
 History = list[HistoryItem]
 
 HistoryItem {
-  role: "user" | "assistant" | "system" | "tool"
+  role: "system" | "user" | "assistant" | "tool"
   content: str | list[dict]           # 消息内容
   message_type: "thought" | "action" | "observation"
 
   # 可选字段
   agent: str                          # 代理名称
   is_demo: bool                       # 是否为演示数据
-  thought: str                       # 思考过程
-  action: str | None                 # 执行的动作
+  thought: str                       # 推理内容
+  action: str | None                 # 执行动作
   tool_calls: list[dict] | None     # 工具调用
   tool_call_ids: list[str] | None   # 工具调用 ID
   tags: list[str]                    # 处理器标签
-  cache_control: dict | None         # 缓存控制（Claude）
+  cache_control: dict | None         # Anthropic 缓存控制
+  thinking_blocks: list[dict] | None # 思考块
 }
 ```
 
----
-
-## 2. 阅读路径（30 秒 / 3 分钟 / 10 分钟）
-
-- **30 秒版**：只看 `1.1` + `1.2`（知道 History 结构和 Processor 链）。
-- **3 分钟版**：看 `1.1` + `1.2` + `3` + `4`（知道 Processors、Trajectory 和 Replay）。
-- **10 分钟版**：通读全文（能配置和扩展 History Processors）。
-
-### 2.1 一句话定义
-
-SWE-agent 的 Memory Context 采用"**可配置的 Processor 链 + Trajectory 持久化**"的设计：通过链式 History Processors 对对话历史进行转换和压缩，以 Trajectory 格式持久化到 `.traj` 文件，并支持完整的 Replay 功能。
-
----
-
-## 3. 核心组件详解
-
-### 3.1 History 类型定义
-
-**文件**: `sweagent/types.py:44-77`
+#### 核心实现
 
 ```python
-from typing import TypedDict, Literal
-
+# sweagent/types.py:44-77
 class _HistoryItem(TypedDict):
     """必需字段"""
     role: str                          # user | assistant | system | tool
@@ -116,53 +180,48 @@ class HistoryItem(_HistoryItem, total=False):
     thinking_blocks: list[dict[str, Any]] | None
 
 History = list[HistoryItem]
-
-class TrajectoryStep(TypedDict):
-    """Trajectory 中的单步记录"""
-    action: str
-    observation: str
-    response: str
-    state: dict[str, str]
-    thought: str
-    execution_time: float
-    query: list[dict[str, Any]]
-    extra_info: dict[str, Any]
-
-Trajectory = list[TrajectoryStep]
 ```
 
-### 3.2 History Processors
+---
 
-**文件**: `sweagent/agent/history_processors.py`
+### 3.2 History Processor 链
 
-#### DefaultHistoryProcessor
+#### 职责定位
 
-```python
-class DefaultHistoryProcessor(BaseModel):
-    """默认处理器，不做任何修改"""
-    type: Literal["default"] = "default"
+通过可配置的 Processor 链对 history 进行变换，实现上下文压缩和优化。
 
-    def __call__(self, history: History) -> History:
-        return history
+#### Processor 架构
+
+```text
+Raw History          Processors              Model Input
+    │                    │                        │
+    ▼                    ▼                        ▼
+┌─────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│ 完整历史    │───▶│ LastNObservations│───▶│ 处理后历史      │
+│ (所有消息)  │    │ (保留最近N条)    │    │ (用于模型输入)  │
+└─────────────┘    ├─────────────────┤    └─────────────────┘
+                   │ CacheControl    │
+                   │ (添加缓存标记)  │
+                   ├─────────────────┤
+                   │ RemoveRegex     │
+                   │ (移除特定内容)  │
+                   ├─────────────────┤
+                   │ ClosedWindow    │
+                   │ (替换文件窗口)  │
+                   ├─────────────────┤
+                   │ TagToolCallObs  │
+                   │ (标签工具调用)  │
+                   └─────────────────┘
 ```
 
-#### LastNObservations
+#### 核心 Processor 实现
 
 ```python
+# sweagent/agent/history_processors.py:86-120
 class LastNObservations(BaseModel):
     """
     只保留最近的 N 个 observations，其余用摘要替代。
-
-    这是 SWE-agent 论文中使用的经典处理器，
-    默认保留最近 5 个 observations。
-
-    配置示例:
-    ```yaml
-    agent:
-      history_processors:
-        - type: last_n_observations
-          n: 5
-    ```
+    这是 SWE-agent 论文中使用的经典处理器，默认保留最近 5 个 observations。
     """
     n: int                           # 保留的 observation 数量
     polling: int = 1                # 更新间隔（用于缓存优化）
@@ -191,72 +250,56 @@ class LastNObservations(BaseModel):
         return new_history
 ```
 
-#### CacheControlHistoryProcessor
+#### Processor 列表
 
-```python
-class CacheControlHistoryProcessor(BaseModel):
-    """
-    为 Anthropic Claude 添加手动缓存控制标记。
-
-    配置示例:
-    ```yaml
-    agent:
-      history_processors:
-        - type: cache_control
-          last_n_messages: 2
-    ```
-    """
-    last_n_messages: int = 2
-    last_n_messages_offset: int = 0
-    tagged_roles: list[str] = ["user", "tool"]
-    type: Literal["cache_control"] = "cache_control"
-
-    def __call__(self, history: History) -> History:
-        new_history = []
-        n_tagged = 0
-
-        for i_entry, entry in enumerate(reversed(history)):
-            # 清除之前的缓存标记
-            _clear_cache_control(entry)
-
-            # 为最近 N 条消息添加缓存标记
-            if (n_tagged < self.last_n_messages and
-                entry["role"] in self.tagged_roles and
-                i_entry >= self.last_n_messages_offset):
-                _set_cache_control(entry)
-                n_tagged += 1
-
-            new_history.append(entry)
-
-        return list(reversed(new_history))
-```
-
-### 3.3 其他 Processors
-
-| Processor | 功能 | 配置 |
-|-----------|------|------|
-| `TagToolCallObservations` | 为特定工具调用的 observations 添加标签 | `function_names: set[str]` |
-| `ClosedWindowHistoryProcessor` | 替换已关闭的文件窗口内容 | - |
-| `RemoveRegex` | 使用正则表达式移除内容 | `remove: list[str]` |
-| `ImageParsingHistoryProcessor` | 解析内嵌的 base64 图片 | `allowed_mime_types: set[str]` |
+| Processor | 功能 | 配置示例 |
+|-----------|------|---------|
+| `LastNObservations` | 保留最近 N 个 observations | `n: 5` |
+| `CacheControlHistoryProcessor` | 添加 Anthropic 缓存标记 | `last_n_messages: 2` |
+| `ClosedWindowHistoryProcessor` | 替换已关闭的文件窗口 | - |
+| `RemoveRegex` | 使用正则移除内容 | `remove: ["<diff>.*</diff>"]` |
+| `TagToolCallObservations` | 为工具调用 observations 添加标签 | `function_names: ["read_file"]` |
+| `ImageParsingHistoryProcessor` | 解析 base64 图片 | `allowed_mime_types: ["image/png"]` |
 
 ---
 
-## 4. Trajectory 持久化
+### 3.3 Trajectory 持久化
 
-### 4.1 Trajectory 文件格式
+#### 职责定位
 
-**文件**: `sweagent/run/run_replay.py`
+Trajectory 记录完整的执行轨迹，用于持久化、分析和回放。
 
-```python
-# {session_name}.traj
+#### 数据结构
+
+```text
+┌────────────────────────────────────────────────────────────────────┐
+│ Trajectory - 执行轨迹（用于持久化）                                  │
+└────────────────────────────────────────────────────────────────────┘
+
+Trajectory = list[TrajectoryStep]
+
+TrajectoryStep {
+  action: str                        # 执行的动作
+  observation: str                   # 观察结果
+  response: str                      # 模型响应
+  state: dict[str, str]             # 环境状态快照
+  thought: str                       # 推理过程
+  execution_time: float              # 执行时间
+  query: list[dict[str, Any]]       # 查询内容
+  extra_info: dict[str, Any]         # 额外信息
+}
+```
+
+#### 文件格式
+
+```json
 {
   "trajectory": [
     {
       "action": "edit 12:12\n<<<<<<< SEARCH...",
       "observation": "[File: /path/to/file.py (10 lines total)]\n1|def foo():\n2|    pass",
       "response": "I'll edit the file...",
-      "state": {"open_file": "/path/to/file.py"},
+      "state": {"open_file": "/path/to/file.py", "working_dir": "/repo"},
       "thought": "I need to add a new function...",
       "execution_time": 1.23,
       "query": [{"role": "user", "content": "..."}],
@@ -275,151 +318,295 @@ class CacheControlHistoryProcessor(BaseModel):
 }
 ```
 
-### 4.2 保存 Trajectory
+#### 持久化实现
 
 ```python
-from sweagent.agent.agents import Agent
+# sweagent/agent/agents.py
+def get_trajectory_data(self) -> dict[str, Any]:
+    """打包所有 session 数据"""
+    return {
+        "trajectory": self.trajectory,
+        "history": self.history,
+        "info": self.info,
+        "replay_config": self.replay_config.model_dump_json() if self.replay_config else None,
+        "environment": self._env.name,
+    }
 
-class Agent:
-    def save_trajectory(self, trajectory_path: Path) -> None:
-        """保存 trajectory 到文件"""
-        data = {
-            "trajectory": self.trajectory,
-            "info": self.info,
-            "config": self.config.model_dump(),
-        }
-        with open(trajectory_path, "w") as f:
-            json.dump(data, f, indent=2)
+def save_trajectory(self) -> None:
+    """持久化到磁盘"""
+    data = self.get_trajectory_data()
+    self.traj_path.write_text(json.dumps(data, indent=2))
 ```
 
 ---
 
-## 5. Replay 功能
+### 3.4 Replay 功能
 
-### 5.1 从 Trajectory 重放
+#### 职责定位
 
-**文件**: `sweagent/run/run_replay.py`
+支持从 trajectory 文件重放执行过程，用于复现 bug、验证修复和生成演示。
 
-```python
-async def run_replay(
-    trajectory_path: Path,
-    env: Environment,
-    agent: Agent,
-) -> None:
-    """
-    从 trajectory 文件重放执行过程
+#### 重放流程
 
-    用途:
-    1. 复现 bug
-    2. 验证修复
-    3. 生成演示
-    """
-    # 1. 加载 trajectory
-    with open(trajectory_path) as f:
-        data = json.load(f)
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant R as RunReplay
+    participant T as Trajectory
+    participant E as Environment
 
-    trajectory = data["trajectory"]
+    U->>R: sweagent run-replay --trajectory_path traj.json
+    R->>R: 加载 trajectory 文件
+    R->>E: 初始化环境
 
-    # 2. 逐步重放
-    for step in trajectory:
-        # 设置环境状态
-        env.set_state(step["state"])
+    loop 遍历 trajectory
+        R->>T: 读取 step
+        R->>E: set_state(step.state)
+        R->>E: execute(step.action)
+        E-->>R: observation
+        R->>R: 验证 observation == step.observation
+    end
 
-        # 执行动作
-        observation = await env.step(step["action"])
-
-        # 验证 observation 是否匹配
-        if observation != step["observation"]:
-            logger.warning(f"Observation mismatch at step {step}")
-
-    logger.info("Replay completed successfully")
+    R-->>U: Replay completed
 ```
 
-### 5.2 Trajectory 转 Demo
+#### 实现代码
 
 ```python
-# sweagent/run/run_traj_to_demo.py
+# sweagent/run/run_replay.py
+class RunReplay:
+    def _create_actions_file(self) -> None:
+        """从 trajectory 提取动作用于回放"""
+        actions = []
+        for item in self._traj_data["history"]:
+            if item["role"] == "assistant":
+                action = {"message": item["content"]}
+                if self._use_function_calling:
+                    action["tool_calls"] = item["tool_calls"]
+                actions.append(action)
 
-def convert_trajectory_to_demo(trajectory_path: Path) -> Demo:
-    """
-    将 trajectory 转换为可演示的格式
-
-    过滤掉:
-    - 失败的步骤
-    - 重复的动作
-    - 系统消息
-    """
-    with open(trajectory_path) as f:
-        data = json.load(f)
-
-    demo_steps = []
-    for step in data["trajectory"]:
-        if step.get("exit_status") == "success":
-            demo_steps.append({
-                "action": step["action"],
-                "observation": step["observation"],
-            })
-
-    return Demo(steps=demo_steps)
+    def main(self):
+        """在全新环境中回放 trajectory"""
+        self._create_actions_file()
+        run_single = self._get_run_single()
+        run_single.run()  # 执行回放
 ```
 
 ---
 
-## 6. 与 Agent Loop 的集成
+## 4. 端到端数据流转
+
+### 4.1 正常流程（详细版）
+
+```mermaid
+sequenceDiagram
+    participant A as Agent
+    participant H as History
+    participant P as Processors
+    participant M as Model
+    participant T as Trajectory
+    participant F as .traj File
+
+    A->>H: 获取 raw history
+    H->>P: for processor in history_processors
+
+    P->>P: LastNObservations (keep last 5)
+    P->>P: CacheControl (for Claude)
+    P->>P: RemoveRegex (过滤内容)
+
+    P-->>A: processed messages
+    A->>M: query(processed messages)
+    M-->>A: model_response
+
+    A->>A: parse and execute
+    A->>H: add_step_to_history()
+    A->>T: add_step_to_trajectory()
+    A->>F: save_trajectory()
+```
+
+### 4.2 数据变换详情
+
+| 阶段 | 输入 | 处理 | 输出 | 代码位置 |
+|-----|------|------|------|---------|
+| 原始 History | 对话记录 | 构建 HistoryItem | history[] | `sweagent/agent/agents.py:572` |
+| History 处理 | raw history | Processors 链 | processed messages | `sweagent/agent/agents.py:540` |
+| 模型输入 | processed messages | query() | model_response | `sweagent/agent/models.py` |
+| History 更新 | StepOutput | add_step_to_history() | 更新后 history | `sweagent/agent/agents.py:556` |
+| Trajectory 更新 | StepOutput | add_step_to_trajectory() | 更新后 trajectory | `sweagent/agent/agents.py:300` |
+| 持久化 | trajectory + history + info | JSON 序列化 | .traj 文件 | `sweagent/agent/agents.py:save_trajectory` |
+
+---
+
+## 5. 关键代码实现
+
+### 5.1 核心数据结构
+
+```python
+# sweagent/types.py:44-77
+class HistoryItem(TypedDict):
+    """对话历史项"""
+    role: str                          # system/user/assistant/tool
+    content: str | list[dict]
+    message_type: Literal["thought", "action", "observation"]
+    agent: str                         # 代理名称
+    is_demo: bool                      # 是否为演示数据
+    thought: str                       # 推理内容
+    action: str | None                 # 执行动作
+    tool_calls: list[dict] | None     # 工具调用
+    tags: list[str]                    # 处理器标签
+    cache_control: dict | None         # Anthropic 缓存控制
+
+class TrajectoryStep(TypedDict):
+    """轨迹步骤"""
+    action: str                        # 执行的动作
+    observation: str                   # 观察结果
+    response: str                      # 模型响应
+    state: dict[str, str]             # 环境状态
+    thought: str                       # 推理过程
+    execution_time: float              # 执行时间
+    query: list[dict[str, Any]]       # 查询内容
+    extra_info: dict[str, Any]         # 额外信息
+```
+
+### 5.2 主链路代码
+
+```python
+# sweagent/agent/agents.py:540-551
+@property
+def messages(self) -> list[dict[str, Any]]:
+    """返回经 history_processors 处理的消息"""
+    # 按 agent 名称过滤
+    filtered_history = [entry for entry in self.history if entry["agent"] == self.name]
+
+    # 应用 processor 链
+    messages = filtered_history
+    for processor in self.history_processors:
+        messages = processor(messages)
+
+    return messages
+```
+
+**代码要点**：
+1. **延迟处理**：每次调用时动态应用 processors
+2. **过滤机制**：按 agent 名称过滤历史
+3. **链式处理**：支持多个 processors 组合
+4. **无副作用**：返回新列表，不修改原始 history
+
+### 5.3 关键调用链
 
 ```text
-┌──────────────────────────────────────────────────────────────────────┐
-│                        Agent Loop                                     │
-│  ┌─────────────┐  ┌─────────────────────┐  ┌─────────────────────┐  │
-│  │ Step 1      │──▶│ model.query()       │──▶│ Parse Action        │  │
-│  │             │  │ (with history)      │  │                     │  │
-│  └─────────────┘  └─────────────────────┘  └─────────────────────┘  │
-│         │                                              │            │
-│         │                                              ▼            │
-│         │                                   ┌─────────────────────┐  │
-│         │                                   │ Environment.step()  │  │
-│         │                                   └─────────────────────┘  │
-│         │                                              │            │
-│         ▼                                              ▼            │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │ create_history_item()                                          │  │
-│  │   └── Add to history[]                                         │  │
-│  └───────────────────────────────────────────────────────────────┘  │
-│                              │                                      │
-│                              ▼                                      │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │ History Processors                                             │  │
-│  │   - LastNObservations (keep last 5)                            │  │
-│  │   - CacheControl (for Claude)                                  │  │
-│  │   - TagToolCallObservations                                    │  │
-│  └───────────────────────────────────────────────────────────────┘  │
-│                              │                                      │
-│                              ▼                                      │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │ Processed history -> Next model query                          │  │
-│  └───────────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────────┘
+Agent.step()                       [sweagent/agent/agents.py:800]
+  -> self.messages (property)       [sweagent/agent/agents.py:540]
+    -> filter by agent name
+    -> for processor in history_processors:
+      -> LastNObservations()        [sweagent/agent/history_processors.py:86]
+      -> CacheControlHistoryProcessor() [sweagent/agent/history_processors.py:200]
+      -> RemoveRegex()              [sweagent/agent/history_processors.py]
+  -> model.query(messages)         [sweagent/agent/models.py]
+  -> add_step_to_history()         [sweagent/agent/agents.py:556]
+  -> add_step_to_trajectory()      [sweagent/agent/agents.py:300]
+  -> save_trajectory()             [sweagent/agent/agents.py]
 ```
 
 ---
 
-## 7. 排障速查
+## 6. 设计意图与 Trade-off
 
-| 问题 | 检查点 | 文件 |
-|------|-------|------|
-| History 过长 | 调整 `last_n_observations.n` | `agent/history_processors.py:86` |
-| 缓存未命中 | 检查 `cache_control` 标记 | `agent/history_processors.py:261` |
-| Replay 失败 | 验证环境状态和 observation 匹配 | `run/run_replay.py` |
-| Trajectory 损坏 | 检查 JSON 格式和必需字段 | `types.py:44` |
-| Processor 未生效 | 验证配置文件中的 `type` 字段 | `agent/history_processors.py:390` |
+### 6.1 SWE-agent 的选择
+
+| 维度 | SWE-agent 的选择 | 替代方案 | 取舍分析 |
+|-----|-----------------|---------|---------|
+| 上下文压缩 | Processor 链 | 固定截断 | 灵活可配置，但配置复杂 |
+| 存储方式 | 双轨（history + trajectory） | 单一结构 | 兼顾模型输入和持久化 |
+| 持久化频率 | 每步保存 | 结束时保存 | 支持断点续传，但 I/O 开销 |
+| 回放机制 | Trajectory 重放 | Checkpoint 回滚 | 可人工检查，但无法自动恢复 |
+| 缓存控制 | CacheControl Processor | 自动缓存 | 精确控制，但需配置 |
+
+### 6.2 为什么这样设计？
+
+**核心问题**：如何在长运行的 Code Agent 任务中管理上下文长度、支持分析和回放？
+
+**SWE-agent 的解决方案**：
+- 代码依据：`sweagent/agent/agents.py:540-551`
+- 设计意图：通过 Processor 链灵活压缩上下文，通过双轨存储分离模型输入和持久化需求
+- 带来的好处：
+  - 灵活的上下文管理策略
+  - 完整的执行记录便于分析
+  - 支持断点续传和回放
+- 付出的代价：
+  - 配置复杂度
+  - I/O 开销
+  - 状态无法自动回滚
+
+### 6.3 与其他项目的对比
+
+| 项目 | 核心差异 | 适用场景 |
+|-----|---------|---------|
+| SWE-agent | Processor 链 + Trajectory 持久化 | 学术研究、可复现实验 |
+| Kimi CLI | Checkpoint 文件回滚 | 对话回滚、状态恢复 |
+| Gemini CLI | 分层内存管理 | 长上下文任务 |
+| Codex | 无状态 Actor | 高并发、无状态服务 |
 
 ---
 
-## 8. 架构特点总结
+## 7. 边界情况与错误处理
 
-- **链式 Processors**: 可配置、可组合的 History 转换链
-- **可插拔设计**: 通过配置添加/移除 Processors
-- **多目标优化**: 支持 Token 压缩、缓存优化、内容过滤
-- **完整持久化**: Trajectory 包含完整执行信息
-- **可重放性**: 支持从任意 trajectory 重放
-- **Demo 生成**: 可从成功执行生成演示数据
+### 7.1 终止条件
+
+| 终止原因 | 触发条件 | 代码位置 |
+|---------|---------|---------|
+| History 过长 | 超过模型上下文限制 | `sweagent/agent/agents.py:forward_with_handling` |
+| Trajectory 损坏 | JSON 解析失败 | `sweagent/run/run_replay.py` |
+| Processor 错误 | 配置错误 | `sweagent/agent/history_processors.py` |
+| 磁盘空间不足 | 无法保存 trajectory | `sweagent/agent/agents.py:save_trajectory` |
+
+### 7.2 错误恢复策略
+
+| 错误类型 | 处理策略 | 代码位置 |
+|---------|---------|---------|
+| ContextWindowExceededError | attempt_autosubmit | `sweagent/agent/agents.py:forward_with_handling` |
+| Trajectory 解析失败 | 跳过或报错 | `sweagent/run/run_replay.py` |
+| Processor 未生效 | 验证配置 type 字段 | `sweagent/agent/history_processors.py:390` |
+
+### 7.3 资源限制
+
+```python
+# 上下文长度控制
+class LastNObservations:
+    n: int = 5  # 默认保留最近 5 个 observations
+
+# Trajectory 文件大小
+# 每步 trajectory 约 1-10KB
+# 100 步任务约 100KB-1MB
+```
+
+---
+
+## 8. 关键代码索引
+
+| 功能 | 文件 | 行号 | 说明 |
+|-----|------|------|------|
+| History 定义 | `sweagent/types.py` | 44 | HistoryItem |
+| Trajectory 定义 | `sweagent/types.py` | 120 | TrajectoryStep |
+| History Processors | `sweagent/agent/history_processors.py` | - | 处理器链 |
+| LastNObservations | `sweagent/agent/history_processors.py` | 86 | 上下文压缩 |
+| CacheControl | `sweagent/agent/history_processors.py` | 200 | 缓存控制 |
+| messages property | `sweagent/agent/agents.py` | 540 | 获取处理后 history |
+| 添加 History | `sweagent/agent/agents.py` | 556 | add_step_to_history() |
+| 添加 Trajectory | `sweagent/agent/agents.py` | 300 | add_step_to_trajectory() |
+| 持久化 | `sweagent/agent/agents.py` | - | save_trajectory() |
+| Replay | `sweagent/run/run_replay.py` | - | RunReplay |
+| Trajectory 转 Demo | `sweagent/run/run_traj_to_demo.py` | - | convert_trajectory_to_demo() |
+
+---
+
+## 9. 延伸阅读
+
+- 前置知识：`docs/swe-agent/01-swe-agent-overview.md`、`docs/swe-agent/02-swe-agent-session-management.md`
+- 相关机制：`docs/swe-agent/04-swe-agent-agent-loop.md`
+- 深度分析：`docs/swe-agent/questions/swe-agent-history-compression.md`
+
+---
+
+*✅ Verified: 基于 sweagent/agent/history_processors.py、sweagent/types.py 等源码分析*
+*基于版本：2026-02-08 | 最后更新：2026-02-24*

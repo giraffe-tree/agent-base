@@ -1,89 +1,240 @@
 # Agent Loop（SWE-agent）
 
-本文基于 `./SWE-agent`（重点 `sweagent/agent/agents.py` 与 `sweagent/run/run_single.py`）源码，解释 SWE-agent 如何把「问题输入 -> 模型决策 -> 环境执行 -> 结果回注 -> 直到提交」组织成可控的 Agent Loop。  
-为适配“先看全貌再看细节”的阅读习惯，先给流程图和阅读路径，再展开实现细节。
+## TL;DR（结论先行）
+
+SWE-agent 的 Agent Loop 采用"双层循环架构"：内层是 step 级的动作-观察循环（模型输出动作 -> 环境执行 -> 观察回注），外层是 attempt 级的重试循环（失败后重置环境重新尝试）。核心特点是 `forward_with_handling()` 实现的错误恢复机制和 `RetryAgent` 的多尝试选优策略。
+
+SWE-agent 的核心取舍：**双层循环 + 错误重采样 + attempt 级重试**（对比 Kimi CLI 的单层 while 循环、Gemini CLI 的递归 continuation、Codex 的 Actor 消息驱动）
 
 ---
 
-## 1. 先看全局（流程图）
+## 1. 为什么需要这个机制？（解决什么问题）
 
-### 1.1 主路径流程图（DefaultAgent）
+### 1.1 问题场景
+
+Code Agent 需要处理复杂的软件工程任务，面临以下挑战：
+- 模型输出格式错误（无法解析为有效动作）
+- 工具执行失败（命令语法错误、被拦截）
+- 单次尝试无法完成任务（需要多次尝试）
+- 环境状态污染（失败后需要重置）
+
+没有完善的 Loop 机制：
+- 一次格式错误导致整个任务失败
+- 无法从错误中恢复
+- 失败后无法重试
+- 无法选择最优结果
+
+### 1.2 核心挑战
+
+| 挑战 | 不解决的后果 |
+|-----|-------------|
+| 模型输出格式错误 | 任务中断，无法继续 |
+| 工具执行失败 | 无法完成操作 |
+| 单次尝试失败 | 整体任务失败 |
+| 环境状态污染 | 后续步骤基于错误状态 |
+| 结果质量不确定 | 无法保证最优输出 |
+
+---
+
+## 2. 整体架构（ASCII 图）
+
+### 2.1 在系统中的位置
 
 ```text
-┌─────────────────────────────────────────────────────────────────────┐
-│  运行器层: RunSingle                                                │
-│  ┌─────────────────────────────────────────┐                        │
-│  │ RunSingle.run(problem_statement)        │ ◄── 入口               │
-│  │  ├── env.start()                        │ ──► 启动环境           │
-│  │  └── agent.run(env, output_dir)         │ ──► 委托给 Agent       │
-│  └─────────────┬───────────────────────────┘                        │
-└────────────────┼────────────────────────────────────────────────────┘
-                 │
-                 ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  Agent 层: DefaultAgent                                             │
-│  ┌─────────────────────────────────────────┐                        │
-│  │ DefaultAgent.run()                      │                        │
-│  │  ├── setup(...)                         │ ──► 初始化历史/工具    │
-│  │  ├── on_run_start() hook                │                        │
-│  │  │                                      │                        │
-│  │  └── ┌───────────────────────────────┐  │ ◄── 主循环            │
-│  │      │   while not done:  ◄──────────┼──┘                        │
-│  │      │                            │   │                         │
-│  │      │   step() ──────────────────┘   │                         │
-│  │      │       │                        │                         │
-│  │      │       ▼                        │                         │
-│  │      │   ┌─────────────────────────┐  │                         │
-│  │      │   │ step(): 单步编排        │  │                         │
-│  │      │   │ ├── forward_with_handling│ │                         │
-│  │      │   │ ├── add_step_to_history │  │                         │
-│  │      │   │ ├── add_step_to_trajectory│ │                        │
-│  │      │   │ └── save_trajectory()   │  │                         │
-│  │      │   └───────────┬─────────────┘  │                         │
-│  │      │               │                │                         │
-│  │      │   done = true?├────Yes────────►│ on_run_done + return    │
-│  │      │               │                │ AgentRunResult          │
-│  │      │              No                │                         │
-│  │      │               └───────────────►│ continue loop           │
-│  │      └───────────────────────────────┘                          │
-│  └─────────────────────────────────────────┘                        │
-└─────────────────────────────────────────────────────────────────────┘
-
-  ┌─────────────────────────────────────────────────────────────────────┐
-  │  step() 内部展开: forward_with_handling → handle_action            │
-  ├─────────────────────────────────────────────────────────────────────┤
-  │                                                                     │
-  │   ┌─────────────────┐     ┌─────────────────┐     ┌─────────────┐  │
-  │   │  forward()      │────►│ parse thought/  │────►│ handle_     │  │
-  │   │  (query model)  │     │ action          │     │ action()    │  │
-  │   └─────────────────┘     └─────────────────┘     └──────┬──────┘  │
-  │                                                          │         │
-  │                              ┌───────────────────────────┘         │
-  │                              ▼                                      │
-  │                    ┌─────────────────┐                              │
-  │                    │  env.execute()  │ ◄── 在 SWEEnv 中执行         │
-  │                    │  返回 observation│                              │
-  │                    └─────────────────┘                              │
-  │                                                                     │
-  │   errors: ───────────────► requery (max_requeries 次)               │
-  │   ┌─────────────┐                                                   │
-  │   │ FormatError │◄── 格式错误                                       │
-  │   │ BlockedAction│◄── 被拦截动作                                    │
-  │   │ BashSyntax  │◄── 语法错误                                       │
-  │   └─────────────┘                                                   │
-  │                                                                     │
-  └─────────────────────────────────────────────────────────────────────┘
-
-图例: ┌─┐ 函数/模块  ├──► 正向流程  ◄──┐ 循环  ───► 触发/展开
+┌─────────────────────────────────────────────────────────────┐
+│ RunSingle / RunBatch                                        │
+│ sweagent/run/run_single.py                                  │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ 调用
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│ ▓▓▓ Agent Loop (双层) ▓▓▓                                   │
+│ sweagent/agent/agents.py                                    │
+│                                                             │
+│ ┌─────────────────────────────────────────────────────────┐ │
+│ │ 外层: RetryAgent.run()                                  │ │
+│ │ - attempt 级重试循环                                    │ │
+│ │ - review/choose 最优结果                                │ │
+│ └───────────────────────┬─────────────────────────────────┘ │
+│                         │ 调用                              │
+│                         ▼                                   │
+│ ┌─────────────────────────────────────────────────────────┐ │
+│ │ 内层: DefaultAgent.run()                                │ │
+│ │ - step 级执行循环                                       │ │
+│ │ - 模型调用 + 工具执行                                   │ │
+│ └───────────────────────┬─────────────────────────────────┘ │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ 依赖
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│ Model        │ │ Tools        │ │ Environment  │
+│ 模型调用     │ │ 工具执行     │ │ 沙箱环境     │
+└──────────────┘ └──────────────┘ └──────────────┘
 ```
 
-### 1.2 关键分支流程图（重试、提交、异常）
+### 2.2 核心组件职责
+
+| 组件 | 职责 | 代码位置 |
+|-----|------|---------|
+| `RetryAgent` | 外层重试循环，管理多次 attempt | `sweagent/agent/agents.py:257` |
+| `DefaultAgent` | 内层执行循环，单 attempt 管理 | `sweagent/agent/agents.py:443` |
+| `step()` | 单步编排：模型调用+工具执行 | `sweagent/agent/agents.py:800` |
+| `forward_with_handling()` | 模型调用+错误重采样 | `sweagent/agent/agents.py:700` |
+| `handle_action()` | 动作执行+提交检测 | `sweagent/agent/agents.py:750` |
+
+### 2.3 核心组件交互关系
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant R as RunSingle
+    participant RA as RetryAgent
+    participant DA as DefaultAgent
+    participant F as forward_with_handling
+    participant H as handle_action
+    participant T as Tools
+    participant E as Environment
+
+    R->>RA: 1. run(env, problem)
+    activate RA
+
+    RA->>RA: 2. 初始化 retry loop
+
+    loop attempt 级循环
+        RA->>DA: 3. agent.run()
+        activate DA
+
+        DA->>DA: 4. setup()
+
+        loop step 级循环 (while not done)
+            DA->>F: 5. forward_with_handling()
+            activate F
+            F->>F: 6. query model
+            F->>T: 7. parse_actions()
+            T-->>F: 8. (thought, action)
+            F-->>DA: 9. StepOutput
+            deactivate F
+
+            DA->>H: 10. handle_action()
+            activate H
+            H->>T: 11. should_block_action()
+            H->>E: 12. execute(action)
+            E-->>H: 13. observation
+            H->>H: 14. check submission
+            H-->>DA: 15. updated StepOutput
+            deactivate H
+
+            DA->>DA: 16. save_trajectory()
+        end
+
+        DA-->>RA: 17. AgentRunResult
+        deactivate DA
+
+        RA->>RA: 18. on_submit()
+        RA->>RA: 19. retry() ?
+        opt retry = true
+            RA->>E: 20. hard_reset()
+        end
+    end
+
+    RA->>RA: 21. choose best attempt
+    RA-->>R: 22. final result
+    deactivate RA
+```
+
+**关键交互说明**：
+
+| 步骤 | 交互内容 | 设计意图 |
+|-----|---------|---------|
+| 1-3 | 外层循环启动内层 Agent | 分离重试逻辑和执行逻辑 |
+| 5-9 | 模型调用与错误重采样 | 自动恢复格式错误 |
+| 10-15 | 动作执行与提交检测 | 统一执行入口，检测任务完成 |
+| 16 | 每步持久化 | 支持断点续传 |
+| 18-21 | 重试决策和选优 | 支持多次尝试，选择最优结果 |
+
+---
+
+## 3. 核心组件详细分析
+
+### 3.1 内层循环：DefaultAgent
+
+#### 职责定位
+
+DefaultAgent 负责单个 attempt 的执行，管理 step 级的模型调用和工具执行。
+
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Setup: run() 开始
+    Setup --> Running: setup() 完成
+
+    Running --> Running: step() 完成，未结束
+    Running --> Submitted: 检测到 submit
+    Running --> Exited: 执行 exit
+    Running --> Error: 致命错误
+    Running --> Timeout: 超时/成本超限
+
+    Submitted --> [*]: 返回结果
+    Exited --> [*]: 返回结果
+    Error --> [*]: attempt_autosubmit
+    Timeout --> [*]: 强制结束
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Setup | 初始化 | run() 被调用 | 工具安装完成，history 初始化完成 |
+| Running | 执行中 | 初始化完成 | step_output.done = true |
+| Submitted | 已提交 | 检测到 submit 命令 | 自动退出 |
+| Exited | 已退出 | 执行 exit 命令 | 自动退出 |
+| Error | 错误状态 | 发生致命错误 | autosubmit 后退出 |
+| Timeout | 超时状态 | 达到时间/成本限制 | 强制退出 |
+
+#### 内部数据流
 
 ```text
-┌──────────────────────────────────────────────────────────────────────┐
-│ [A] 单步重采样分支 —— 错误恢复策略                                    │
-└──────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  输入层                                                      │
+│  ├── messages: 经 processors 处理后的 history                │
+│  └── state: 环境状态快照                                     │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  处理层                                                      │
+│  ├── forward_with_handling()                                │
+│  │   ├── query model                                        │
+│  │   ├── parse_actions() ──► (thought, action)             │
+│  │   └── 错误处理 + 重采样                                  │
+│  ├── handle_action()                                        │
+│  │   ├── should_block_action() ──► 检查拦截                │
+│  │   ├── env.execute() ──► observation                     │
+│  │   └── check submission                                   │
+│  └── 构建 StepOutput                                        │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  输出层                                                      │
+│  ├── 更新 history                                           │
+│  ├── 更新 trajectory                                        │
+│  ├── save_trajectory()                                      │
+│  └── 返回 StepOutput                                        │
+└─────────────────────────────────────────────────────────────┘
+```
 
+---
+
+### 3.2 错误重采样：forward_with_handling
+
+#### 职责定位
+
+`forward_with_handling()` 是 SWE-agent Loop 的"韧性核心"，在 `max_requeries` 范围内自动恢复可重采样错误。
+
+#### 错误分类处理
+
+```text
                        ┌─────────────────┐
                        │    forward()    │ ◄── 调用模型
                        └────────┬────────┘
@@ -102,271 +253,342 @@
              ▼                  ▼                    ▼
     ┌─────────────────┐ ┌───────────────┐ ┌─────────────────────┐
     │ 组装错误模板    │ │ 携带/不携带   │ │ attempt_autosub()   │
-    │                 │ │ 上一步输出    │ │                     │
-    │ requery 模型    │ │               │ │ • 尝试提取 patch    │
-    │     ↓           │ │ 继续重采样    │ │ • done = true       │
-    │ 最多 max_       │ │     ↓         │ │ • exit_status 标记  │
-    │   requeries 次  │ │               │ │                     │
-    │     ↓           │ │               │ │                     │
-    │ 成功? ──Yes──►  │ │               │ │                     │
-    │  正常继续       │ │               │ │                     │
-    │  仍失败?        │ │               │ │                     │
+    │ requery 模型    │ │ 上一步输出    │ │                     │
+    │ (max_requeries) │ │               │ │ • 尝试提取 patch    │
+    │                 │ │ 继续重采样    │ │ • done = true       │
+    │ 仍失败?         │ │               │ │ • exit_status 标记  │
     │ exit_format +   │ │               │ │                     │
     │ autosubmit      │ │               │ │                     │
     └─────────────────┘ └───────────────┘ └─────────────────────┘
+```
 
+#### 关键算法逻辑
 
-┌──────────────────────────────────────────────────────────────────────┐
-│ [B] 提交分支 —— 如何结束一次 attempt                                  │
-└──────────────────────────────────────────────────────────────────────┘
+```python
+# sweagent/agent/agents.py:700-750 (简化)
+def forward_with_handling(self, messages: list[dict]) -> StepOutput:
+    """模型调用 + 错误重采样"""
+    for attempt in range(self.config.max_requeries):
+        try:
+            # 1. 调用模型
+            model_response = self.model.query(messages)
 
-                    ┌─────────────────┐
-                    │ observation 或  │
-                    │ force_submission│
-                    └────────┬────────┘
-                             │
-                             ▼
-            ┌────────────────────────────────┐
-            │      命中 submit 信号?         │
-            └───────────────┬────────────────┘
-                            │
-           ┌────────────────┴────────────────┐
-           ▼                                 ▼
-      ┌─────────┐                      ┌──────────────┐
-      │   YES   │                      │      NO      │
-      └────┬────┘                      └──────┬───────┘
-           │                                  │
-           ▼                                  ▼
-   ┌───────────────┐              ┌──────────────────────────┐
-   │ 读取 patch    │              │ 正常继续下一步           │
-   │ /root/model   │              │                          │
-   │   .patch      │              │                          │
-   ├───────────────┤              └──────────────────────────┘
-   │ step.submission│
-   │   = patch     │
-   ├───────────────┤
-   │ step.done =   │
-   │    true       │
-   ├───────────────┤
-   │ exit_status = │
-   │  submitted()  │
-   └───────────────┘
+            # 2. 解析动作
+            thought, action = self.tools.parse_actions(model_response)
 
+            # 3. 执行动作
+            return self.handle_action(thought, action, model_response)
 
-┌──────────────────────────────────────────────────────────────────────┐
-│ [C] RetryAgent 外层循环 —— Attempt 级重试                            │
-└──────────────────────────────────────────────────────────────────────┘
+        except FormatError as e:
+            # 4. 格式错误：组装错误模板，requery
+            messages = self._add_error_template(messages, e)
+            continue
 
-    ┌─────────────────────────────────────────────────────────────┐
-    │                      RetryAgent.run()                       │
-    │                                                             │
-    │  ┌─────────────┐   ┌─────────────────────────────────────┐  │
-    │  │ setup       │   │  while not done:  ◄─────────────────┼──┤
-    │  │ 第 0 次     │   │       │                             │  │
-    │  │ attempt     │   │       ▼                             │  │
-    │  └──────┬──────┘   │   ┌─────────────────────┐            │  │
-    │         │          │   │ step()              │            │  │
-    │         └──────────┼──►│ save_trajectory()   │            │  │
-    │                    │   │                     │            │  │
-    │                    │   │ if done:            │            │  │
-    │                    │   │   ├─► rloop.        │            │  │
-    │                    │   │   │   on_submit()   │            │  │
-    │                    │   │   │        │        │            │  │
-    │                    │   │   │        ▼        │            │  │
-    │                    │   │   │   ┌─────────────┴───────┐    │  │
-    │                    │   │   │   │ rloop.retry() ?     │    │  │
-    │                    │   │   │   └───────────┬─────────┘    │  │
-    │                    │   │   │               │              │  │
-    │                    │   │   │      ┌────────┴────────┐     │  │
-    │                    │   │   │      ▼                 ▼     │  │
-    │                    │   │   │  ┌───────┐          ┌──────┐ │  │
-    │                    │   │   │  │  YES  │          │  NO  │ │  │
-    │                    │   │   │  └───┬───┘          └──┬───┘ │  │
-    │                    │   │   │      │                 │     │  │
-    │                    │   │   │      ▼                 ▼     │  │
-    │                    │   │   │ ┌──────────────────────────┐ │  │
-    │                    │   │   │ │ env.hard_reset()         │ │  │
-    │                    │   │   │ │ next attempt             │ │  │
-    │                    │   │   │ │ done = false             │─┘  │
-    │                    │   │   │ └──────────────────────────┘    │
-    │                    │   │   │                                 │
-    │                    └───┼───┘                                 │
-    │                        │   ┌───────────────────────────────┐  │
-    │                        └──►│ choose best attempt           │  │
-    │                            │ return global result            │  │
-    │                            └───────────────────────────────┘  │
-    └─────────────────────────────────────────────────────────────┘
+        except BlockedActionError as e:
+            # 5. 被拦截动作：requery
+            messages = self._add_blocked_template(messages, e)
+            continue
 
+        except ContextWindowExceededError:
+            # 6. 上下文超限：致命错误
+            return self.attempt_autosubmit_after_error()
 
-图例: ┌─┐ 函数/处理块  ├──► 正常流程  ──► 触发动作  ◄── 循环/条件
+    # 7. 重采样耗尽：exit_format + autosubmit
+    return self._exit_format_and_autosubmit()
+```
+
+**算法要点**：
+1. **分层错误处理**：可重采样错误、重试类异常、致命错误
+2. **错误模板注入**：将错误信息反馈给模型，请求修正
+3. **上限控制**：`max_requeries` 防止无限循环
+4. **兜底策略**：重采样耗尽后尝试 autosubmit
+
+---
+
+### 3.3 外层循环：RetryAgent
+
+#### 职责定位
+
+RetryAgent 在 DefaultAgent 外再套一层 attempt loop，支持失败后重置环境重新尝试，并选择最优结果。
+
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Init: RetryAgent.run()
+    Init --> Attempt1: 第 1 次 attempt
+
+    Attempt1 --> Submitted1: 完成
+    Attempt1 --> Failed1: 失败
+
+    Submitted1 --> Attempt2: retry() = true
+    Submitted1 --> [*]: retry() = false
+    Failed1 --> Attempt2: retry() = true
+    Failed1 --> [*]: retry() = false
+
+    Attempt2 --> Submitted2: 完成
+    Attempt2 --> Failed2: 失败
+
+    Submitted2 --> Choose: 达到最大尝试次数
+    Failed2 --> Choose: 达到最大尝试次数
+
+    Choose --> [*]: 返回最优结果
 ```
 
 ---
 
-## 2. 阅读路径（30 秒 / 3 分钟 / 10 分钟）
+## 4. 端到端数据流转
 
-- **30 秒版**：只看 `1.1` + `2.1`（知道 loop 在哪一层、何时结束）。
-- **3 分钟版**：看 `1.1` + `1.2` + `4~6`（知道重采样、执行、提交、异常）。
-- **10 分钟版**：通读 `3~9`（能定位大多数“为什么停/为什么没提交”问题）。
+### 4.1 正常流程（详细版）
 
-### 2.1 一句话定义
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant R as RunSingle
+    participant RA as RetryAgent
+    participant DA as DefaultAgent
+    participant F as forward_with_handling
+    participant M as Model
+    participant T as Tools
+    participant E as Environment
 
-SWE-agent 的 Agent Loop 是“**step 级动作-观察循环 +（可选）attempt 级重试循环**”：  
-每个 step 都是“模型输出动作 -> 环境执行 -> 观察回注”；当出现 submission 或退出信号时结束当前 attempt；若启用 `RetryAgent`，再由 reviewer/chooser 决定是否开新 attempt。
+    U->>R: 启动任务
+    R->>E: env.start()
+    R->>RA: retry_agent.run()
 
----
+    loop attempt 循环
+        RA->>DA: default_agent.run()
+        DA->>DA: setup()
 
-## 3. 入口与分层
+        loop step 循环
+            DA->>DA: messages = self.messages
+            DA->>F: forward_with_handling(messages)
 
-核心分层如下：
+            F->>M: query(messages)
+            M-->>F: model_response
+            F->>T: parse_actions(model_response)
+            T-->>F: (thought, action)
+            F->>T: should_block_action(action)
+            T-->>F: allowed/blocked
+            F->>E: execute(action)
+            E-->>F: observation
+            F-->>DA: StepOutput
 
-- **`RunSingle.run()`**（`sweagent/run/run_single.py`）：运行器入口，负责环境生命周期与 hooks。
-- **`DefaultAgent.run()`**（`sweagent/agent/agents.py`）：单 attempt 主循环（`while not done`）。
-- **`DefaultAgent.step()`**：单步编排，负责调用模型、执行动作、落历史和轨迹。
-- **`forward_with_handling()` / `forward()`**：模型采样、动作解析、错误重采样。
-- **`handle_action()`**：把 action 送进 `SWEEnv` 执行，拿 observation 并检查 submission。
-- **`RetryAgent.run()`**：attempt 外层循环（多次尝试 + review/choose 最优）。
+            DA->>DA: add_step_to_history()
+            DA->>DA: add_step_to_trajectory()
+            DA->>DA: save_trajectory()
+        end
 
-### 3.1 从 run 到 loop
+        DA-->>RA: AgentRunResult
+        RA->>RA: on_submit()
+        RA->>RA: retry() ?
+        opt retry = true
+            RA->>E: hard_reset()
+        end
+    end
 
-默认单实例路径是：
+    RA->>RA: choose best attempt
+    RA-->>R: final result
+    R->>E: env.close()
+```
 
-1. `RunSingle.run()` 启动环境 `env.start()`；
-2. 调 `agent.run(problem_statement, env, output_dir)`；
-3. `DefaultAgent.setup()` 初始化 system/demo/instance 消息；
-4. 进入 `while not step_output.done` 的 step 循环；
-5. 每步后持久化 `.traj`，最终返回 `AgentRunResult`。
+### 4.2 数据变换详情
 
----
-
-## 4. `DefaultAgent.run()`：step 级主循环
-
-`DefaultAgent.run()` 本身很薄，主职责是把生命周期围起来：
-
-1. `setup(...)`：安装工具、写 system/demo/instance 初始历史；
-2. `on_run_start` hook；
-3. `while not done` 重复 `step()`；
-4. 每步调用 `save_trajectory()`；
-5. `on_run_done` hook，返回最终 `info + trajectory`。
-
-`done=true` 的典型来源：
-
-- action 为 `exit`；
-- 观测中检测到 submission（或强制 submission）；
-- 致命错误后走 autosubmission；
-- 达到某些退出条件（如总执行时长、连续超时等）并转换为退出。
-
----
-
-## 5. 单步循环：`step()` -> `forward_with_handling()` -> `handle_action()`
-
-### 5.1 `step()`（编排层）
-
-`step()` 负责“串起来并落账”：
-
-- 调 `forward_with_handling(self.messages)` 得到 `StepOutput`；
-- 把 thought/action/observation 追加到 history；
-- 更新 `info`（`submission`、`exit_status`、`model_stats`、edited files）；
-- 追加 trajectory step。
-
-也就是说，`step()` 是每轮 loop 的状态提交点。
-
-### 5.2 `forward()`（采样与动作解析）
-
-`forward()` 做单次“纯前向”：
-
-1. query 模型（或 action sampler）；
-2. `tools.parse_actions(output)` 解析出 `thought + action`；
-3. 调 `handle_action(step)` 在环境中执行；
-4. 成功返回完整 `StepOutput`，失败把当前 `step` 挂到异常上抛。
-
-### 5.3 `handle_action()`（执行与观测）
-
-执行阶段关键点：
-
-- blocklist 命中直接抛 `_BlockedActionError`；
-- `action == "exit"` 直接置 `done=true`；
-- 否则 `env.communicate(...)` 执行命令，处理 timeout/interrupt；
-- 拉取最新 `state` 并检测特殊 token（重试/forfeit）；
-- 最后调用 `handle_submission()` 判定是否提交并结束。
+| 阶段 | 输入 | 处理 | 输出 | 代码位置 |
+|-----|------|------|------|---------|
+| 外层启动 | problem, env | RetryAgent 初始化 | RetryAgent 实例 | `sweagent/agent/agents.py:257` |
+| 内层启动 | env, problem | DefaultAgent.setup() | 初始化完成 | `sweagent/agent/agents.py:561` |
+| 模型调用 | messages | model.query() | model_response | `sweagent/agent/models.py` |
+| 动作解析 | model_response | parse_actions() | (thought, action) | `sweagent/tools/parsing.py` |
+| 错误处理 | 异常 | forward_with_handling() | StepOutput/重试 | `sweagent/agent/agents.py:700` |
+| 动作执行 | action | handle_action() | observation | `sweagent/agent/agents.py:750` |
+| 提交检测 | observation | check submission | done=true? | `sweagent/agent/agents.py` |
+| 重试决策 | AgentRunResult | retry() | 是否重试 | `sweagent/agent/agents.py` |
+| 选优 | 多次结果 | choose() | 最优结果 | `sweagent/agent/agents.py` |
 
 ---
 
-## 6. 错误处理与重采样：`forward_with_handling()`
+## 5. 关键代码实现
 
-这层是 SWE-agent loop 的“韧性核心”。它在 `max_requeries` 范围内做恢复：
+### 5.1 核心数据结构
 
-- **可重采样错误**：`FormatError`、`_BlockedActionError`、`BashIncorrectSyntaxError`、`ContentPolicyViolationError` 等；
-- **重采样方式**：用错误模板构造临时 history，再次 query；
-- **退出类错误**：context/cost/retry/runtime/environment 等，直接走 `attempt_autosubmission_after_error()`；
-- **最终兜底**：连续重采样失败后，以 `exit_format` 退出并尝试 autosubmit。
+```python
+# sweagent/types.py
+class StepOutput(BaseModel):
+    """单步输出"""
+    thought: str
+    action: str
+    observation: str
+    output: str
+    done: bool
+    exit_status: int | str | None
+    submission: str | None
+    state: dict[str, str]
 
-关键语义：  
-SWE-agent 不会因为“单次格式错”立刻中断，而是优先自修复；但命中硬性上限或致命错误时，会尽量提取 patch 后再结束。
+class AgentInfo(BaseModel):
+    """Agent 元信息"""
+    exit_status: str | None = None
+    submission: str | None = None
+    model_stats: InstanceStats
+```
+
+### 5.2 主链路代码
+
+```python
+# sweagent/agent/agents.py:400-434 (简化)
+def run(self, env: SWEEnv, problem_statement: ProblemStatement, output_dir: Path) -> AgentRunResult:
+    """主循环入口"""
+    self.setup(env, problem_statement, output_dir)
+    self._chook.on_run_start()
+
+    step_output = None
+    while not step_output or not step_output.done:
+        step_output = self.step()
+        self.save_trajectory()
+
+    self._chook.on_run_done(trajectory=self.trajectory, info=self.info)
+    return AgentRunResult(info=self.info, trajectory=self.trajectory)
+```
+
+**代码要点**：
+1. **简洁的主循环**：setup -> while not done -> step -> save
+2. **Hook 系统**：在关键节点触发回调
+3. **即时持久化**：每步保存 trajectory
+4. **结果封装**：返回完整的 AgentRunResult
+
+### 5.3 关键调用链
+
+```text
+RunSingle.run()                    [sweagent/run/run_single.py]
+  -> RetryAgent.run()              [sweagent/agent/agents.py:257]
+    -> retry loop
+      -> DefaultAgent.run()        [sweagent/agent/agents.py:400]
+        -> setup()                 [sweagent/agent/agents.py:561]
+        -> while not done:
+          -> step()                [sweagent/agent/agents.py:800]
+            -> forward_with_handling() [sweagent/agent/agents.py:700]
+              -> model.query()     [sweagent/agent/models.py]
+              -> parse_actions()   [sweagent/tools/parsing.py]
+              -> handle_action()   [sweagent/agent/agents.py:750]
+                -> tools.execute() [sweagent/tools/tools.py]
+                  -> env.communicate() [sweagent/environment/swe_env.py]
+            -> add_step_to_history()   [sweagent/agent/agents.py:556]
+            -> add_step_to_trajectory() [sweagent/agent/agents.py:300]
+            -> save_trajectory()   [sweagent/agent/agents.py]
+      -> on_submit()
+      -> retry() ?
+        -> hard_reset()            [sweagent/environment/swe_env.py]
+    -> choose best attempt
+```
 
 ---
 
-## 7. 提交与收敛：`handle_submission()` / autosubmission
+## 6. 设计意图与 Trade-off
 
-SWE-agent 的“结束”通常围绕 patch 提交：
+### 6.1 SWE-agent 的选择
 
-1. 先检测是否出现 submit 信号（或强制提交）；
-2. 从 `/root/model.patch` 读取补丁内容；
-3. 写入 `step.submission`，并置 `done=true`；
-4. 更新 `exit_status`（如 `submitted` / `submitted (exit_*)`）。
+| 维度 | SWE-agent 的选择 | 替代方案 | 取舍分析 |
+|-----|-----------------|---------|---------|
+| 循环结构 | 双层循环（step + attempt） | 单层循环（Kimi CLI） | 支持失败后重试，但复杂度增加 |
+| 错误恢复 | 重采样（requery） | 直接失败（Codex） | 自动恢复格式错误，但增加调用次数 |
+| 重试策略 | attempt 级重试 + 选优 | 无重试 | 提高成功率，但成本增加 |
+| 环境重置 | hard_reset() | 无重置 | 状态干净，但启动慢 |
+| 提交机制 | submit 命令检测 | 自动检测 | 显式控制，但需要模型配合 |
 
-若运行时异常导致无法正常提交流程，`attempt_autosubmission_after_error()` 会尝试：
+### 6.2 为什么这样设计？
 
-- 环境仍存活：执行 `git add -A && git diff --cached > /root/model.patch` 后再走提交；
-- 环境已死：尝试从上一条 trajectory 的 `state["diff"]` 抢救 patch。
+**核心问题**：如何在软件工程任务中实现可靠、可恢复的自动化执行？
 
----
+**SWE-agent 的解决方案**：
+- 代码依据：`sweagent/agent/agents.py:700-750`
+- 设计意图：通过双层循环分离"单次尝试推进"和"多次尝试选优"，通过 `forward_with_handling` 实现自动错误恢复
+- 带来的好处：
+  - 自动恢复常见错误（格式错误、被拦截动作）
+  - 支持失败后重试，提高成功率
+  - 选择最优结果，提高输出质量
+- 付出的代价：
+  - 架构复杂度增加
+  - 模型调用次数增加
+  - Docker 重置开销
 
-## 8. 外层重试循环：`RetryAgent.run()`
+### 6.3 与其他项目的对比
 
-`RetryAgent` 在 DefaultAgent 外再套一层 attempt loop：
-
-1. 初始化 retry loop（`ScoreRetryLoop` 或 `ChooserRetryLoop`）；
-2. 跑一次 sub-agent（本质是 `DefaultAgent`）直到 done；
-3. `on_submit(...)` 把本次 submission 交给 reviewer/chooser；
-4. 若 `rloop.retry()` 为真：`env.hard_reset()` 后开下一次 attempt；
-5. 最后 `choose=True` 汇总最佳 attempt 作为全局结果。
-
-这让 SWE-agent 同时具备：
-
-- **局部自修复**（step 内重采样）；
-- **全局重试优化**（attempt 间比较与选优）。
-
----
-
-## 9. 中断、上限与保护机制
-
-Loop 运行过程中主要保护阈值：
-
-- **重采样上限**：`max_requeries`，避免无限“格式修复循环”；
-- **命令执行超时**：单命令 timeout + 连续超时上限；
-- **总执行时长上限**：`total_execution_timeout`；
-- **预算上限**：模型单次/总成本限制（触发 `exit_cost` 或 total cost 异常）；
-- **Retry budget 与次数**：`max_attempts`、`cost_limit`、`min_budget_for_new_attempt`。
-
-这些条件最终都会落到 `StepOutput.done` 或 retry loop 的 `retry()` 决策上，实现可预测收敛。
+| 项目 | 核心差异 | 适用场景 |
+|-----|---------|---------|
+| SWE-agent | 双层循环 + 错误重采样 + attempt 重试 | 软件工程任务、需要高可靠性 |
+| Kimi CLI | 单层 while + Checkpoint 回滚 | 对话式交互、状态恢复 |
+| Codex | Actor 消息驱动 + 无状态 | 高并发、企业级部署 |
+| Gemini CLI | 递归 continuation + 分层内存 | 复杂任务、长上下文 |
+| OpenCode | resetTimeoutOnProgress | 长运行任务、超时控制 |
 
 ---
 
-## 10. 排障速查
+## 7. 边界情况与错误处理
 
-- **为什么没继续下一步**：看 `step_output.done` 是谁置为 `true`（exit/submission/错误退出）。
-- **为什么模型一直重试**：看 `forward_with_handling()` 是否持续命中可重采样错误。
-- **为什么没拿到 patch**：看 `/root/model.patch` 是否生成，及 autosubmission 分支是否触发。
-- **为什么 attempt 没继续**：看 `rloop.retry()` 的预算/次数/accept 阈值判定。
-- **为什么结果不是最后一次**：`RetryAgent` 会在结束时选择“最佳 attempt”返回。
+### 7.1 终止条件
+
+| 终止原因 | 触发条件 | 代码位置 |
+|---------|---------|---------|
+| 正常提交 | 执行 submit 命令 | `sweagent/agent/agents.py:handle_submission` |
+| 退出命令 | 执行 exit 命令 | `sweagent/agent/agents.py:handle_action` |
+| 最大步数 | 达到 max_iterations | `sweagent/agent/agents.py:step` |
+| 重采样耗尽 | 超过 max_requeries | `sweagent/agent/agents.py:forward_with_handling` |
+| 成本超限 | 达到 cost_limit | `sweagent/agent/models.py` |
+| 上下文超限 | 超过 token 限制 | `sweagent/agent/agents.py:forward_with_handling` |
+| 超时 | 达到 total_execution_timeout | `sweagent/agent/agents.py` |
+| 环境错误 | runtime 崩溃 | `sweagent/environment/swe_env.py` |
+
+### 7.2 错误恢复策略
+
+| 错误类型 | 处理策略 | 代码位置 |
+|---------|---------|---------|
+| FormatError | requery（最多 max_requeries 次） | `sweagent/agent/agents.py:forward_with_handling` |
+| BlockedActionError | requery + 错误提示 | `sweagent/agent/agents.py:forward_with_handling` |
+| BashIncorrectSyntaxError | requery + 语法检查 | `sweagent/agent/agents.py:forward_with_handling` |
+| ContentPolicyViolationError | requery | `sweagent/agent/agents.py:forward_with_handling` |
+| ContextWindowExceededError | attempt_autosubmit | `sweagent/agent/agents.py:forward_with_handling` |
+| CostLimitExceededError | 退出 | `sweagent/agent/models.py` |
+| Timeout | 标记并继续或退出 | `sweagent/tools/tools.py` |
+| 环境崩溃 | attempt_autosubmit | `sweagent/agent/agents.py` |
+
+### 7.3 资源限制
+
+```python
+# 关键配置参数
+class AgentConfig:
+    max_iterations: int = 100  # 单 attempt 最大步数
+    max_requeries: int = 3     # 最大重采样次数
+    total_execution_timeout: int = 3600  # 总执行超时（秒）
+
+class ModelConfig:
+    per_instance_cost_limit: float = 3.0  # 单次成本限制（美元）
+```
 
 ---
 
-## 11. 架构特点总结
+## 8. 关键代码索引
 
-- **双层循环**：内层 step loop 解决“当前尝试如何推进”，外层 retry loop 解决“多次尝试如何选优”。
-- **执行中心化**：所有 action 最终走 `handle_action -> SWEEnv`，行为可统一管控。
-- **错误韧性强**：先重采样修复，再 autosubmit 兜底，尽量减少“空跑退出”。
-- **轨迹可复盘**：每步落 `history + trajectory + info`，并持续写 `.traj`。
-- **工程化收敛**：通过 timeout/cost/requery/retry 多维阈值避免无界循环。
+| 功能 | 文件 | 行号 | 说明 |
+|-----|------|------|------|
+| RetryAgent | `sweagent/agent/agents.py` | 257 | 外层重试循环 |
+| DefaultAgent | `sweagent/agent/agents.py` | 443 | 内层执行循环 |
+| Agent Loop | `sweagent/agent/agents.py` | 400-434 | run() 主循环 |
+| Step | `sweagent/agent/agents.py` | 800 | 单步执行 |
+| forward_with_handling | `sweagent/agent/agents.py` | 700 | 模型调用+错误处理 |
+| handle_action | `sweagent/agent/agents.py` | 750 | 动作执行 |
+| StepOutput | `sweagent/types.py` | - | 单步输出类型 |
+| AgentInfo | `sweagent/types.py` | - | Agent 元信息 |
+| ParseError | `sweagent/agent/agents.py` | - | 解析错误处理 |
+
+---
+
+## 9. 延伸阅读
+
+- 前置知识：`docs/swe-agent/01-swe-agent-overview.md`、`docs/swe-agent/02-swe-agent-cli-entry.md`
+- 相关机制：`docs/swe-agent/05-swe-agent-tools-system.md`、`docs/swe-agent/02-swe-agent-session-management.md`
+- 深度分析：`docs/swe-agent/questions/swe-agent-error-handling.md`
+
+---
+
+*✅ Verified: 基于 sweagent/agent/agents.py 源码分析*
+*基于版本：2026-02-08 | 最后更新：2026-02-24*

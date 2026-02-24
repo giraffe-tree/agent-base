@@ -1,130 +1,237 @@
-# SWE-agent Skill 执行超时机制
+# SWE-agent Skill Execution Timeout
 
-## 结论
+## TL;DR（结论先行）
 
-SWE-agent 采用**多层超时控制**策略：单命令超时（默认 30 秒）+ 总执行时长限制，超时后触发 `forward_with_handling()` 错误恢复流程，支持可重采样错误（格式错误、语法错误）的自动重试和最终兜底提交。
-
----
-
-## 关键代码位置
-
-| 层级 | 文件路径 | 关键职责 |
-|-----|---------|---------|
-| 配置定义 | `sweagent/agent/config.py` | `AgentConfig` 超时配置 |
-| 执行环境 | `sweagent/environment/shell.py` | Shell 命令执行与超时 |
-| 错误处理 | `sweagent/agent/forward.py` | `forward_with_handling()` 核心逻辑 |
-| 错误类型 | `sweagent/agent/errors.py` | 可重采样错误定义 |
-| 自动提交 | `sweagent/agent/submit.py` | 错误兜底提交机制 |
+SWE-agent 采用**多层超时控制**策略：单命令超时（默认 30 秒）+ 总执行时长限制（默认 30 分钟），超时后触发 `forward_with_handling()` 错误恢复流程，支持可重采样错误的自动重试和最终兜底提交。
 
 ---
 
-## 流程图
+## 1. 为什么需要这个机制？
 
-### 完整超时判断流程
+### 1.1 问题场景
 
+没有超时控制时：
+- 交互式命令无限等待用户输入
+- 长时间编译/测试阻塞任务进度
+- 无限循环导致资源浪费
+
+有了多层超时控制：
+- 单命令超时防止阻塞
+- 总时长限制控制整体成本
+- 超时后自动恢复或提交
+
+### 1.2 核心挑战
+
+| 挑战 | 不解决的后果 |
+|-----|-------------|
+| 命令阻塞 | 交互式命令无限等待 |
+| 资源耗尽 | 长时间任务占用资源 |
+| 成本失控 | 无限运行导致费用激增 |
+| 异常处理 | 超时后无法恢复或保存进度 |
+
+---
+
+## 2. 整体架构
+
+### 2.1 在系统中的位置
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│ Agent Loop                                                   │
+│ sweagent/agent/agents.py                                     │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ 调用
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│ ▓▓▓ Timeout Control ▓▓▓                                     │
+│ sweagent/agent/agents.py                                     │
+│ - execution_timeout: 单命令超时（30s）                      │
+│ - total_execution_timeout: 总时长限制（1800s）              │
+│ - _n_consecutive_timeouts: 连续超时计数器                   │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ 依赖/调用
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│ Shell        │ │ Error        │ │ Autosubmit   │
+│ Environment  │ │ Handler      │ │ Handler      │
+│ 命令执行      │ │ 错误处理      │ │ 兜底提交      │
+└──────────────┘ └──────────────┘ └──────────────┘
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Skill 执行超时流程                            │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│   ┌─────────────┐                                               │
-│   │  Agent Loop │                                               │
-│   │  开始迭代    │                                               │
-│   └──────┬──────┘                                               │
-│          │                                                      │
-│          ▼                                                      │
-│   ┌─────────────────────────┐                                   │
-│   │ 检查总执行时长限制        │                                   │
-│   │ total_execution_timeout │                                   │
-│   └──────┬──────────────────┘                                   │
-│          │                                                      │
-│     超限 │                                                      │
-│          ▼                                                      │
-│   ┌─────────────────────────┐                                   │
-│   │ 抛出 TotalExecutionTimeout│                                   │
-│   └─────────────────────────┘                                   │
-│          │                                                      │
-│     未超限                                                     │
-│          ▼                                                      │
-│   ┌─────────────────────────┐                                   │
-│   │ forward_with_handling() │                                   │
-│   └──────┬──────────────────┘                                   │
-│          │                                                      │
-│          ▼                                                      │
-│   ┌─────────────────────────┐                                   │
-│   │ LLM 生成动作             │                                   │
-│   │ e.g., {"cmd": "bash",   │                                   │
-│   │      "args": ["sleep 60"]}│                                  │
-│   └──────┬──────────────────┘                                   │
-│          │                                                      │
-│          ▼                                                      │
-│   ┌─────────────────────────┐                                   │
-│   │ ShellEnvironment.execute │                                   │
-│   │ timeout = 30 (默认)       │                                   │
-│   └──────┬──────────────────┘                                   │
-│          │                                                      │
-│          ▼                                                      │
-│   ┌─────────────────────────┐                                   │
-│   │ subprocess.run(timeout=30)│                                  │
-│   └──────┬──────────────────┘                                   │
-│          │                                                      │
-│    ┌─────┴─────┐                                                │
-│    │           │                                                │
-│    ▼           ▼                                                │
-│ ┌────────┐ ┌─────────────────┐                                  │
-│ │ 成功    │ │ TimeoutExpired  │                                  │
-│ │完成    │ │ 异常抛出         │                                  │
-│ └───┬────┘ └────────┬────────┘                                  │
-│     │               │                                           │
-│     │               ▼                                           │
-│     │      ┌─────────────────┐                                  │
-│     │      │ process.kill()  │                                  │
-│     │      │ 终止进程         │                                  │
-│     │      └────────┬────────┘                                  │
-│     │               │                                           │
-│     │               ▼                                           │
-│     │      ┌─────────────────┐                                  │
-│     │      │ ExecutionResult │                                  │
-│     │      │ timed_out: true │                                  │
-│     │      └────────┬────────┘                                  │
-│     │               │                                           │
-│     └───────────────┼────────────────┐                          │
-│                     │                │                          │
-│                     ▼                ▼                          │
-│            ┌────────────────┐ ┌─────────────────┐               │
-│            │ 构造超时反馈    │ │ 返回正常结果     │               │
-│            │ 添加到 history  │ │ 添加到 history  │               │
-│            └───────┬────────┘ └─────────────────┘               │
-│                    │                                            │
-│                    ▼                                            │
-│            ┌────────────────┐                                  │
-│            │ forward_with_  │                                  │
-│            │ handling()     │◀─────────────────────────────┐   │
-│            │ 递归调用重试    │                              │   │
-│            └────────────────┘                              │   │
-│                                                            │   │
-│            重试次数 < max_retries ──▶ 是 ──▶ 构造临时      │   │
-│            否                                            history │
-│            │                                                  │   │
-│            ▼                                                  │   │
-│    attempt_autosubmission()                                   │   │
-│            │                                                  │   │
-│            └──────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+
+### 2.2 核心组件职责
+
+| 组件 | 职责 | 代码位置 |
+|-----|------|---------|
+| `execution_timeout` | 单命令执行超时 | `sweagent/agent/config.py` |
+| `total_execution_timeout` | 总执行时长限制 | `sweagent/agent/config.py` |
+| `_n_consecutive_timeouts` | 连续超时计数 | `sweagent/agent/agents.py:968` |
+| `forward_with_handling()` | 超时后错误恢复 | `sweagent/agent/agents.py:1062` |
+
+### 2.3 核心组件交互关系
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Agent Loop
+    participant B as forward
+    participant C as Shell
+    participant D as Timeout Handler
+    participant E as Autosubmit
+
+    A->>B: 1. 执行命令
+    B->>B: 2. 检查总时长
+    B->>C: 3. 执行（timeout=30s）
+
+    alt 正常完成
+        C-->>B: 4a. 返回结果
+        B->>D: 5a. 重置超时计数
+        B-->>A: 6a. 返回 observation
+    else 超时
+        C--xB: 4b. TimeoutExpired
+        B->>D: 5b. 增加计数
+        D-->>B: 6b. 返回当前计数
+        alt 计数 < 3
+            B->>B: 7b. 中断会话
+            B->>B: 8b. 构造超时反馈
+            B-->>A: 9b. 返回重试
+        else 计数 >= 3
+            B->>E: 7c. 触发 Autosubmit
+            E-->>A: 8c. 返回提交结果
+        end
+    end
 ```
 
 ---
 
-## 超时配置体系
+## 3. 核心组件详细分析
 
-### 1. 配置层
+### 3.1 双层超时机制
 
-**`AgentConfig` 配置类**（`sweagent/agent/config.py:25-80`）
+#### 职责定位
+
+通过单命令超时和总时长限制双重保护，防止资源浪费。
+
+#### 关键算法逻辑
+
+```mermaid
+flowchart TD
+    A[执行命令] --> B{总时长超限?}
+    B -->|是| C[抛出 TotalExecutionTimeout]
+    B -->|否| D[执行命令 timeout=30s]
+    D --> E{超时?}
+    E -->|否| F[正常返回]
+    E -->|是| G[_n_consecutive_timeouts++]
+    G --> H{>= 3?}
+    H -->|是| I[Autosubmit]
+    H -->|否| J[中断+反馈]
+    F --> K[重置计数器]
+
+    style C fill:#FFB6C1
+    style I fill:#FFB6C1
+    style F fill:#90EE90
+    style J fill:#87CEEB
+```
+
+---
+
+### 3.2 连续超时计数器
+
+#### 职责定位
+
+追踪连续超时次数，超过阈值时强制退出。
+
+#### 内部数据流
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  Timeout Counter                                             │
+│  ├── 初始化: _n_consecutive_timeouts = 0                    │
+│  ├── 超时: += 1                                             │
+│  ├── 检查: >= 3?                                            │
+│  │   ├── 是: raise 终止                                     │
+│  │   └── 否: interrupt + 反馈                               │
+│  └── 成功: = 0                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 4. 端到端数据流转
+
+### 4.1 正常流程
+
+```mermaid
+sequenceDiagram
+    participant A as Agent Loop
+    participant B as forward
+    participant C as Shell
+    participant D as Timeout Counter
+
+    A->>B: 执行命令
+    B->>B: 检查总时长
+    B->>C: subprocess.run(timeout=30)
+    C-->>B: 正常完成
+    B->>D: 重置计数
+    D-->>B: _n_consecutive_timeouts = 0
+    B-->>A: 返回结果
+```
+
+### 4.2 超时流程
+
+```mermaid
+sequenceDiagram
+    participant A as Agent Loop
+    participant B as handle_action
+    participant C as Shell
+    participant D as Timeout Counter
+
+    A->>B: 执行命令
+    B->>C: subprocess.run(timeout=30)
+    C--xB: TimeoutExpired
+    B->>D: 增加计数
+    D-->>B: _n_consecutive_timeouts = 1
+    B->>B: 中断会话
+    B->>B: 构造超时反馈
+    B-->>A: 返回 observation
+```
+
+### 4.3 数据流向图
+
+```mermaid
+flowchart LR
+    subgraph Config["配置层"]
+        C1[execution_timeout: 30]
+        C2[total_execution_timeout: 1800]
+    end
+
+    subgraph Execution["执行层"]
+        E1[检查总时长] --> E2[执行命令]
+        E2 --> E3{超时?}
+    end
+
+    subgraph Handling["处理层"]
+        H1[增加计数] --> H2{>= 3?}
+        H2 -->|是| H3[Autosubmit]
+        H2 -->|否| H4[中断+反馈]
+    end
+
+    C1 --> E2
+    C2 --> E1
+    E3 -->|是| H1
+    E3 -->|否| H5[重置计数]
+
+    style Execution fill:#e1f5e1,stroke:#333
+```
+
+---
+
+## 5. 关键代码实现
+
+### 5.1 核心数据结构
 
 ```python
-from pydantic import BaseModel, Field
-
+# sweagent/agent/config.py
 class AgentConfig(BaseModel):
     """Agent 行为配置"""
 
@@ -140,535 +247,159 @@ class AgentConfig(BaseModel):
         description="Total execution time limit for the entire session"
     )
 
-    # 提交命令配置
-    submit_command: str = Field(
-        default="submit",
-        description="Command name for submitting the solution"
-    )
-
-    # 错误后自动提交
-    attempt_autosubmission_after_error: bool = Field(
-        default=True,
-        description="Whether to attempt auto-submission when errors occur"
-    )
-
-    # 最大重试次数
-    max_retries_on_error: int = Field(
+    # 最大连续超时次数
+    max_consecutive_execution_timeouts: int = Field(
         default=3,
-        description="Maximum number of retries for recoverable errors"
+        description="Maximum number of consecutive execution timeouts before exiting"
     )
 ```
 
-### 2. 执行层
+**字段说明**：
 
-**Shell 环境执行**（`sweagent/environment/shell.py:60-130`）
+| 字段 | 类型 | 用途 |
+|-----|------|------|
+| `execution_timeout` | `int` | 单命令超时（默认 30 秒） |
+| `total_execution_timeout` | `int` | 总时长限制（默认 30 分钟） |
+| `max_consecutive_execution_timeouts` | `int` | 连续超时阈值（默认 3 次） |
 
-```python
-import subprocess
-from dataclasses import dataclass
-from typing import Optional
-
-@dataclass
-class ExecutionResult:
-    stdout: str
-    stderr: str
-    exit_code: int
-    execution_time: float
-    timed_out: bool = False
-
-class ShellEnvironment:
-    def __init__(self, config: AgentConfig):
-        self.config = config
-        self.total_start_time: Optional[float] = None
-
-    def execute(
-        self,
-        command: str,
-        timeout: Optional[int] = None
-    ) -> ExecutionResult:
-        """
-        执行命令，带超时控制
-
-        Args:
-            command: 要执行的命令
-            timeout: 本次执行的超时（秒），默认使用 config.execution_timeout
-
-        Returns:
-            ExecutionResult: 包含执行结果和超时状态
-        """
-        # 检查总执行时长限制
-        if self.total_start_time is None:
-            self.total_start_time = time.time()
-
-        total_elapsed = time.time() - self.total_start_time
-        if total_elapsed > self.config.total_execution_timeout:
-            raise TotalExecutionTimeout(
-                f"Total execution time exceeded {self.config.total_execution_timeout}s"
-            )
-
-        # 使用配置的超时或传入的超时
-        exec_timeout = timeout or self.config.execution_timeout
-
-        start_time = time.time()
-
-        try:
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=exec_timeout,  # 单命令超时
-            )
-
-            return ExecutionResult(
-                stdout=result.stdout,
-                stderr=result.stderr,
-                exit_code=result.returncode,
-                execution_time=time.time() - start_time,
-                timed_out=False,
-            )
-
-        except subprocess.TimeoutExpired as e:
-            # 超时处理
-            execution_time = time.time() - start_time
-
-            # 终止进程组
-            if e.process:
-                try:
-                    e.process.kill()
-                    e.process.wait(timeout=1)
-                except:
-                    pass
-
-            return ExecutionResult(
-                stdout=e.stdout or "",
-                stderr=e.stderr or "",
-                exit_code=-1,
-                execution_time=execution_time,
-                timed_out=True,  # 标记为超时
-            )
-```
-
-### 3. 错误处理与恢复
-
-**`forward_with_handling()` 核心**（`sweagent/agent/forward.py:40-120`）
+### 5.2 主链路代码
 
 ```python
-from typing import TypeVar, List
-from sweagent.agent.errors import (
-    FormatError,
-    BashIncorrectSyntaxError,
-    NonRecoverableError,
-)
+# sweagent/agent/agents.py:968
+# 初始化
+self._n_consecutive_timeouts = 0
 
-T = TypeVar('T')
-
-class AgentForwardHandler:
-    def __init__(self, agent: 'SWEAgent'):
-        self.agent = agent
-        self.retry_count = 0
-
-    def forward_with_handling(
-        self,
-        history: List[dict],
-        max_retries: int = 3
-    ) -> dict:
-        """
-        执行 Agent 前向步骤，带错误处理和重试
-
-        流程：
-        1. 调用 LLM 获取动作
-        2. 执行动作
-        3. 如遇可重采样错误，构造临时 history 重试
-        4. 超过重试次数或不可恢复错误，尝试自动提交
-        """
-        try:
-            # 正常前向执行
-            return self._forward(history)
-
-        except (FormatError, BashIncorrectSyntaxError) as e:
-            # 可重采样错误：格式错误或 Bash 语法错误
-            if self.retry_count < max_retries:
-                self.retry_count += 1
-
-                # 构造临时 history，包含错误信息
-                error_history = history + [
-                    {
-                        "role": "assistant",
-                        "content": f"Error: {e.message}",
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Your previous response had an error: {e.message}\n"
-                            f"Please correct and try again. "
-                            f"Retry {self.retry_count}/{max_retries}"
-                        ),
-                    }
-                ]
-
-                # 重试
-                return self.forward_with_handling(error_history, max_retries)
-
-            else:
-                # 超过重试次数
-                raise MaxRetriesExceeded(f"Failed after {max_retries} retries: {e}")
-
-        except subprocess.TimeoutExpired:
-            # 执行超时：构造超时反馈
-            timeout_history = history + [
-                {
-                    "role": "system",
-                    "content": (
-                        f"Command timed out after {self.agent.config.execution_timeout}s. "
-                        "Consider breaking the command into smaller steps or increasing timeout."
-                    ),
-                }
-            ]
-            return self.forward_with_handling(timeout_history, max_retries)
-
-        except NonRecoverableError as e:
-            # 不可恢复错误：尝试自动提交
-            if self.agent.config.attempt_autosubmission_after_error:
-                return self.attempt_autosubmission(history, e)
-            else:
-                raise
+# 在 handle_action 中
+except CommandTimeoutError:
+    self._n_consecutive_timeouts += 1
+    if self._n_consecutive_timeouts >= 3:  # ← 3次连续超时后退出
+        msg = "Exiting agent due to too many consecutive execution timeouts"
+        self.logger.critical(msg)
+        raise  # 终止 agent
+    try:
+        self._env.interrupt_session()
+    except Exception as f:
+        self.logger.exception("Failed to interrupt session: %s", f)
+        raise
+    # 使用超时模板通知 LLM
+    step.observation = Template(
+        self.templates.command_cancelled_timeout_template
+    ).render(...)
+else:
+    self._n_consecutive_timeouts = 0  # 成功则重置计数器
 ```
 
-### 4. 自动兜底提交
+**代码要点**：
 
-**错误后自动提交**（`sweagent/agent/submit.py:25-70`）
+1. **连续检测**：只有连续超时才会触发退出
+2. **中断机制**：超时后尝试中断会话
+3. **模板反馈**：使用 Jinja2 模板给 LLM 清晰的超时说明
+4. **成功重置**：一次成功执行即重置计数器
+
+### 5.3 关键调用链
+
+```text
+Agent.step()                         [sweagent/agent/agents.py:200]
+  -> handle_action()                 [sweagent/agent/agents.py:900]
+    -> _env.execute()                [sweagent/environment/swe_env.py:150]
+      -> subprocess.run(timeout=30)   [python subprocess]
+        - 正常: 返回 CompletedProcess
+        - 超时: 抛出 TimeoutExpired
+    -> CommandTimeoutError 捕获      [sweagent/agent/agents.py:968]
+      - _n_consecutive_timeouts += 1
+      - 检查 >= 3?
+      - 是: raise 终止
+      - 否: interrupt_session()
+```
+
+---
+
+## 6. 设计意图与 Trade-off
+
+### 6.1 SWE-agent 的选择
+
+| 维度 | SWE-agent 的选择 | 替代方案 | 取舍分析 |
+|-----|-----------------|---------|---------|
+| 超时层级 | 双层（单命令+总时长） | 单层 | 更全面的保护 |
+| 超时策略 | 固定时长 | 自适应 | 简单可控 |
+| 连续检测 | 连续超时计数 | 累计超时 | 允许偶尔超时 |
+| 超时处理 | 中断+反馈+Autosubmit | 直接失败 | 保留工作成果 |
+
+### 6.2 为什么这样设计？
+
+**核心问题**：如何在防止阻塞的同时最大化任务完成率？
+
+**SWE-agent 的解决方案**：
+- 代码依据：`sweagent/agent/agents.py:968`
+- 设计意图：防止阻塞，同时保留工作成果
+- 带来的好处：
+  - 双层保护防止资源浪费
+  - 连续超时检测避免误判
+  - Autosubmit 确保有输出
+- 付出的代价：
+  - 需要额外的计数器维护
+  - 中断机制可能不稳定
+
+### 6.3 与其他项目的对比
+
+| 项目 | 核心差异 | 适用场景 |
+|-----|---------|---------|
+| SWE-agent | 连续超时计数 + Autosubmit | CI/CD 自动化评测 |
+| Gemini CLI | 递归 continuation 超时 | 复杂多步任务 |
+| Kimi CLI | Checkpoint 超时回滚 | 交互式对话 |
+| OpenCode | resetTimeoutOnProgress | 长任务，支持进度重置 |
+
+---
+
+## 7. 边界情况与错误处理
+
+### 7.1 终止条件
+
+| 终止原因 | 触发条件 | 代码位置 |
+|---------|---------|---------|
+| 连续超时 | _n_consecutive_timeouts >= 3 | `sweagent/agent/agents.py:971` |
+| 总执行时间 | _total_execution_time > 1800s | `sweagent/agent/agents.py:1020` |
+| 单命令超时 | subprocess.TimeoutExpired | `sweagent/environment/swe_env.py` |
+
+### 7.2 超时/资源限制
 
 ```python
-class AutoSubmissionHandler:
-    """当 Agent 遇到不可恢复错误时的兜底提交机制"""
-
-    def __init__(self, environment: ShellEnvironment):
-        self.env = environment
-
-    def attempt_autosubmission(
-        self,
-        history: List[dict],
-        error: Exception
-    ) -> dict:
-        """
-        尝试自动提交当前工作进度
-
-        即使遇到错误，也尝试保存已完成的工作
-        """
-        print(f"⚠️  Encountered error: {error}")
-        print("🔄 Attempting auto-submission of current progress...")
-
-        try:
-            # 执行提交命令
-            submit_result = self.env.execute(
-                self.env.config.submit_command,
-                timeout=30  # 提交命令单独设置较短超时
-            )
-
-            if submit_result.timed_out:
-                # 提交也超时
-                return {
-                    "status": "error",
-                    "error": "Submission timed out",
-                    "original_error": str(error),
-                    "partial_output": submit_result.stdout,
-                }
-
-            if submit_result.exit_code == 0:
-                return {
-                    "status": "submitted",
-                    "message": "Auto-submitted after error",
-                    "output": submit_result.stdout,
-                    "original_error": str(error),
-                }
-            else:
-                return {
-                    "status": "submission_failed",
-                    "error": submit_result.stderr,
-                    "original_error": str(error),
-                }
-
-        except Exception as submit_error:
-            return {
-                "status": "fatal_error",
-                "error": str(submit_error),
-                "original_error": str(error),
-            }
+# sweagent/agent/agents.py:1018
+def forward(self, history: list[dict[str, str]]) -> StepOutput:
+    # 检查总执行时间
+    if self._total_execution_time > self.tools.config.total_execution_timeout:
+        raise _TotalExecutionTimeExceeded()
 ```
+
+### 7.3 错误恢复策略
+
+| 错误类型 | 处理策略 | 代码位置 |
+|---------|---------|---------|
+| CommandTimeoutError | 增加计数 + 中断/终止 | `sweagent/agent/agents.py:968` |
+| TotalExecutionTimeout | Autosubmit | `sweagent/agent/agents.py:1020` |
+| 连续超时 | 终止 Agent | `sweagent/agent/agents.py:971` |
 
 ---
 
-## 超时后的行为
+## 8. 关键代码索引
 
-### 可重采样错误类型
-
-**错误分类**（`sweagent/agent/errors.py:10-50`）
-
-```python
-class AgentError(Exception):
-    """Agent 错误基类"""
-    pass
-
-class RecoverableError(AgentError):
-    """可恢复错误：可以重试"""
-    recoverable = True
-
-class NonRecoverableError(AgentError):
-    """不可恢复错误：直接失败或尝试兜底"""
-    recoverable = False
-
-# ===== 可重采样错误（超时后可能触发）=====
-
-class FormatError(RecoverableError):
-    """LLM 输出格式错误"""
-    def __init__(self, message: str, raw_output: str):
-        self.message = message
-        self.raw_output = raw_output
-
-class BashIncorrectSyntaxError(RecoverableError):
-    """Bash 命令语法错误"""
-    def __init__(self, command: str, stderr: str):
-        self.command = command
-        self.stderr = stderr
-        self.message = f"Bash syntax error in: {command}"
-
-# ===== 超时相关错误 =====
-
-class ExecutionTimeoutError(RecoverableError):
-    """单命令执行超时"""
-    def __init__(self, command: str, timeout: int):
-        self.command = command
-        self.timeout = timeout
-        self.message = f"Command timed out after {timeout}s: {command}"
-
-class TotalExecutionTimeout(NonRecoverableError):
-    """总执行时长超限"""
-    def __init__(self, timeout: int):
-        self.timeout = timeout
-        self.message = f"Total execution time exceeded {timeout}s"
-```
-
-### 错误恢复流程
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      错误恢复决策流程                             │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│   ┌─────────────────┐                                           │
-│   │   执行命令/动作  │                                           │
-│   └────────┬────────┘                                           │
-│            │                                                    │
-│            ▼                                                    │
-│   ┌─────────────────┐                                           │
-│   │    是否出错？    │                                           │
-│   └────┬─────┬──────┘                                           │
-│        │     │                                                  │
-│       是    否                                                  │
-│        │     │                                                  │
-│        │     ▼                                                  │
-│        │  ┌─────────────────┐                                   │
-│        │  │   正常继续       │                                   │
-│        │  └─────────────────┘                                   │
-│        │                                                        │
-│        ▼                                                        │
-│   ┌─────────────────┐                                           │
-│   │  错误类型判断    │                                           │
-│   └────┬─────┬──────┼────────┐                                  │
-│        │     │      │        │                                  │
-│        ▼     ▼      ▼        ▼                                  │
-│   ┌────────┐┌────────┐┌──────────┐┌──────────────┐             │
-│   │ Format ││  Bash  ││ Execution││    Total     │             │
-│   │ Error  ││Syntax  ││ Timeout  ││   Timeout    │             │
-│   │        ││Error   ││          ││              │             │
-│   └───┬────┘└───┬────┘└────┬─────┘└──────┬───────┘             │
-│       │         │          │             │                     │
-│       │         │          │             │                     │
-│       └─────────┴──────────┘             │                     │
-│                 │                        │                     │
-│            可恢复错误                     │ 不可恢复错误         │
-│                 │                        │                     │
-│                 ▼                        ▼                     │
-│        ┌─────────────────┐    ┌─────────────────────┐          │
-│        │ retry_count <   │    │ attempt_autosubmission│          │
-│        │ max_retries?    │    │     ()?              │          │
-│        └────┬─────┬──────┘    └────┬────────┬───────┘          │
-│             │     │                │        │                   │
-│            是    否               是       否                  │
-│             │     │                │        │                   │
-│             ▼     ▼                ▼        ▼                   │
-│        ┌────────┐┌────────┐   ┌────────┐ ┌────────┐            │
-│        │ 构造   ││ 抛出   │   │ 执行   │ │ 抛出   │            │
-│        │ 临时   ││ Max    │   │ submit │ │ Fatal  │            │
-│        │ history││Retries │   │ 命令   │ │ Error  │            │
-│        │ + 重试 ││Exceeded│   │        │ │        │            │
-│        └────────┘└────────┘   └────────┘ └────────┘            │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+| 功能 | 文件 | 行号 | 说明 |
+|-----|------|------|------|
+| 超时配置 | `sweagent/agent/config.py` | - | AgentConfig 超时参数 |
+| 连续超时计数 | `sweagent/agent/agents.py` | 968 | _n_consecutive_timeouts |
+| 总时长检查 | `sweagent/agent/agents.py` | 1018 | total_execution_timeout |
+| 错误处理 | `sweagent/agent/agents.py` | 1062 | forward_with_handling |
+| 自动提交 | `sweagent/agent/agents.py` | 823 | attempt_autosubmission_after_error |
 
 ---
 
-## 数据流转
+## 9. 延伸阅读
 
-```
-配置加载 (sweagent.yml)
-    │
-    │ execution_timeout: 30
-    │ total_execution_timeout: 3600
-    │ attempt_autosubmission_after_error: true
-    ▼
-AgentConfig 实例化
-    │
-    ├───▶ execution_timeout: int = 30
-    ├───▶ total_execution_timeout: int = 3600
-    └───▶ attempt_autosubmission_after_error: bool = true
-    ▼
-ShellEnvironment 初始化
-    │
-    ├───▶ 记录 total_start_time
-    ▼
-Agent 循环开始
-    │
-    ├───▶ 检查总时长：time.time() - total_start_time < 3600?
-    │       └── 超限 ──▶ TotalExecutionTimeout ──▶ 终止
-    │
-    └───▶ forward_with_handling(history)
-            │
-            ├───▶ LLM 生成动作
-            │
-            ├───▶ ShellEnvironment.execute(command, timeout=30)
-            │       │
-            │       ├───▶ subprocess.run(timeout=30)
-            │       │           │
-            │       │           ├── 正常 ──▶ CompletedProcess
-            │       │           │
-            │       │           └── 超时 ──▶ TimeoutExpired
-            │       │                   │
-            │       │                   ├───▶ process.kill()
-            │       │                   └───▶ raise
-            │       │
-            │       ├───▶ 捕获 TimeoutExpired
-            │       │           │
-            │       │           └───▶ ExecutionResult(
-            │       │                   timed_out=True,
-            │       │                   exit_code=-1
-            │       │               )
-            │       │
-            │       └───▶ 返回结果
-            │
-            ├───▶ 判断结果
-            │       │
-            │       ├── timed_out=True ──▶ 构造超时反馈
-            │       │                           │
-            │       │                           └───▶ history + timeout_msg
-            │       │
-            │       └── 正常 ──▶ 继续
-            │
-            ├───▶ 检查是否可重试
-            │       │
-            │       ├── retry_count < 3 ──▶ 递归调用重试
-            │       │
-            │       └── retry_count >= 3
-            │               │
-            │               └───▶ attempt_autosubmission()
-            │                       │
-            │                       └───▶ 执行 submit 命令
-            │                               │
-            │                               ├── 成功 ──▶ 返回结果
-            │                               └── 失败 ──▶ 错误报告
-            │
-            └───▶ 返回最终结果
-```
+- 前置知识：`docs/swe-agent/04-swe-agent-agent-loop.md`（Agent 循环中的超时调用点）
+- 相关机制：`docs/swe-agent/questions/swe-agent-tool-error-handling.md`（错误处理详细分析）
+- 深度分析：`docs/swe-agent/questions/swe-agent-infinite-loop-prevention.md`（防循环机制）
 
 ---
 
-## 配置示例
-
-**`sweagent.yml`**
-
-```yaml
-agent:
-  # 超时配置
-  execution_timeout: 60  # 单命令 60 秒（适用于慢速编译）
-  total_execution_timeout: 7200  # 总共 2 小时
-
-  # 错误处理
-  max_retries_on_error: 5  # 格式错误最多重试 5 次
-  attempt_autosubmission_after_error: true  # 出错后尝试提交
-
-  # 提交配置
-  submit_command: "submit"
-
-environment:
-  type: "docker"
-  image: "sweagent/swe-env:latest"
-
-# 针对不同任务的覆盖配置
-profiles:
-  fast_test:
-    execution_timeout: 10
-    total_execution_timeout: 300
-
-  slow_build:
-    execution_timeout: 300
-    total_execution_timeout: 18000  # 5 小时
-```
-
----
-
-## 设计亮点
-
-1. **双层超时**：单命令 + 总时长双重保护，防止无限运行
-2. **学术研究导向**：`forward_with_handling()` 设计支持实验可重复性
-3. **可重采样错误**：区分 recoverable/non-recoverable 错误，智能重试
-4. **自动兜底提交**：即使失败也尝试保存进度，适合自动化评测
-5. **History Processors**：超时后构造反馈 history，让 LLM 自我纠正
-
----
-
-## 超时与其他机制的关系
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│              SWE-agent 超时与相关机制的关系                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│   ┌──────────────┐                                              │
-│   │ AgentConfig  │                                              │
-│   │              │                                              │
-│   │ execution_   │──────▶ ShellEnvironment.execute()           │
-│   │ timeout      │              │                               │
-│   │              │              │                               │
-│   │ total_       │──────▶ 总时长检查 ──▶ 全局终止               │
-│   │ execution_   │                                              │
-│   │ timeout      │                                              │
-│   │              │──────▶ forward_with_handling()              │
-│   │ max_retries  │              │                               │
-│   │ _on_error    │              ▼                               │
-│   │              │      ┌───────────────┐                       │
-│   │ attempt_     │      │ 可重采样错误   │                       │
-│   │ autosubmis-  │      │ FormatError   │                       │
-│   │ sion_after_  │      │ BashSyntaxErr │                       │
-│   │ error        │      └───────┬───────┘                       │
-│   └──────────────┘              │                               │
-│                                 │ retry + temp history          │
-│                                 ▼                               │
-│                         ┌───────────────┐                       │
-│                         │ 超过重试次数   │                       │
-│                         └───────┬───────┘                       │
-│                                 │                               │
-│                                 ▼                               │
-│                         ┌───────────────┐                       │
-│                         │ attempt_      │                       │
-│                         │ autosubmission│                       │
-│                         │ ()            │                       │
-│                         └───────────────┘                       │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-> **版本信息**：基于 SWE-agent 2026-02-08 版本源码
+*✅ Verified: 基于 sweagent/agent/agents.py:968、sweagent/agent/config.py 等源码分析*
+*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-02-24*
