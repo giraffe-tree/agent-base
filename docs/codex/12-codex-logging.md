@@ -1,130 +1,161 @@
-# Codex 日志记录机制
+# Logging（codex）
 
-## 引子：当你需要同时调试 10 个并发 tool 调用时...
+## TL;DR（结论先行）
 
-想象一下这个场景：你的 Agent 正在并行执行 10 个 tool 调用，突然其中一个失败了。你查看日志，却发现所有输出混在一起，根本无法分辨哪个日志属于哪个调用。
+一句话定义：Codex 的 Logging 是**基于 Rust tracing 框架的多层 subscriber 架构**，同时支持文件日志、SQLite 持久化存储和 OpenTelemetry 分布式追踪，实现企业级可观测性。
 
-这就是**并发日志**的挑战。传统的 `println!` 在这样的场景下完全失效：
-
-```rust
-// 问题：10 个并发调用，日志混在一起
-[2024-01-20 10:00:01] 开始调用 tool: read_file
-[2024-01-20 10:00:01] 开始调用 tool: write_file  // 哪个是哪个？
-[2024-01-20 10:00:02] 调用完成                   // 又是哪个的完成？
-```
-
-Codex 的解决方案是**Span 追踪**：为每个并发操作创建一个上下文，所有相关日志都附着在这个上下文中。
-
-```rust
-// Span 追踪让并发日志清晰可辨
-[2024-01-20 10:00:01] [span=read_file] 开始调用
-[2024-01-20 10:00:01] [span=write_file] 开始调用
-[2024-01-20 10:00:02] [span=read_file] 调用完成  // 清晰归属
-```
-
-本章深入解析 Codex 如何使用 Rust 的 `tracing` 框架实现企业级日志系统。
+Codex 的核心取舍：**结构化存储 + 分布式追踪原生支持**（对比传统文本日志、简单打印输出）
 
 ---
 
-## 结论先行
+## 1. 为什么需要这个机制？（解决什么问题）
 
-Codex 采用 Rust 生态的 `tracing` 框架构建多层 subscriber 架构，同时支持文件日志、SQLite 持久化存储和 OpenTelemetry 分布式追踪，实现企业级可观测性。
+### 1.1 问题场景
 
----
-
-## 技术类比：理解 tracing 生态
-
-如果你熟悉 Linux 系统编程，可以把 `tracing` 比作以下组合：
-
-| tracing 概念 | Linux 类比 | 核心思想 |
-|-------------|-----------|---------|
-| **Subscriber** | `ftrace` 的 tracer | 接收和处理事件的中心 |
-| **Layer** | `ftrace` 的 filter + 多个输出管道 | 可组合的多目标输出 |
-| **Span** | 函数图（function_graph）+ 时间戳 | 追踪调用链和耗时 |
-| **OpenTelemetry** | `eBPF` + `perf` | 跨系统、跨进程的可观测性 |
-| **LogDbLayer** | `systemd-journald` | 结构化存储，支持查询 |
-
-### 为什么选择 SQLite 而不是纯文本？
-
-| 特性 | 纯文本日志 | SQLite 日志 |
-|------|-----------|-------------|
-| 查询能力 | `grep`（基于正则） | `SELECT`（结构化查询） |
-| 并发写入 | 需要锁机制 | 原生支持 |
-| 存储效率 | 重复字段冗余 | 类型压缩 |
-| 保留策略 | `logrotate` 外部配置 | SQL `DELETE` 语句 |
-| 可观测性集成 | 需要解析 | 直接读取 |
-
-Codex 的日志架构像 Linux 的追踪基础设施：
-- `tracing` = `ftrace`（零开销的静态探针）
-- `LogDbLayer` = `journald`（结构化存储，可查询）
-- `OpenTelemetry` = `eBPF`（跨系统的可观测性）
-
----
-
-## 架构图
-
+没有 Logging：
 ```
+并发工具调用 → 日志混在一起 → 无法追踪
+生产环境问题 → 无日志可查 → 难以调试
+性能问题 → 无耗时数据 → 无法优化
+跨服务调用 → 无链路追踪 → 无法定位
+```
+
+有 Logging：
+```
+Span 追踪 → 并发日志清晰归属 → 易于调试
+SQLite 存储 → 结构化查询 → 高效检索
+OpenTelemetry → 分布式链路 → 全栈可观测
+批处理写入 → 异步非阻塞 → 不影响性能
+```
+
+### 1.2 核心挑战
+
+| 挑战 | 不解决的后果 |
+|-----|-------------|
+| 并发日志归属 | 无法区分不同工具调用的日志 |
+| 性能影响 | 日志阻塞主流程，影响响应 |
+| 存储效率 | 日志文件过大，检索困难 |
+| 可观测性 | 无法集成到企业监控体系 |
+| 安全合规 | 敏感信息泄露，权限不当 |
+
+---
+
+## 2. 整体架构（ASCII 图）
+
+### 2.1 在系统中的位置
+
+```text
 ┌─────────────────────────────────────────────────────────────┐
-│                    Application Code                         │
-│         tracing::info! / tracing::debug!                    │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
+│ Application Code                                             │
+│ tracing::info! / tracing::debug!                             │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ 日志事件
+                        ▼
 ┌─────────────────────────────────────────────────────────────┐
-│              tracing_subscriber::Registry                   │
-│                  (中央事件分发器)                            │
-└─────────────────────────────────────────────────────────────┘
-                              │
-        ┌─────────────────────┼─────────────────────┐
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐   ┌─────────────────┐   ┌─────────────────┐
-│  File Layer   │   │   LogDbLayer    │   │ OpenTelemetry   │
-│   文件日志     │   │   SQLite 存储   │   │   链路追踪       │
-├───────────────┤   ├─────────────────┤   ├─────────────────┤
-│ • non_blocking│   │ • 批处理插入     │   │ • traces        │
-│ • with_target │   │ • 90天自动清理   │   │ • metrics       │
-│ • FmtSpan     │   │ • thread_id 追踪 │   │ • logs          │
-│ • chmod 600   │   │ • process_uuid  │   │                 │
-└───────────────┘   └─────────────────┘   └─────────────────┘
+│ ▓▓▓ Logging System ▓▓▓                                      │
+│ codex-rs/                                                   │
+│ - tui/src/lib.rs       : Subscriber 初始化                   │
+│ - state/src/log_db.rs  : SQLite 日志存储                     │
+│ - core/src/otel_init.rs: OpenTelemetry 集成                  │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ 输出
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│ File Layer   │ │ LogDbLayer   │ │ OpenTelemetry│
+│ 文件日志     │ │ SQLite 存储  │ │ 链路追踪     │
+└──────────────┘ └──────────────┘ └──────────────┘
 ```
 
+### 2.2 核心组件职责
+
+| 组件 | 职责 | 代码位置 |
+|-----|------|---------|
+| `Registry` | 中央事件分发器 | `tracing_subscriber::Registry` |
+| `File Layer` | 非阻塞文件日志 | `tui/src/lib.rs:325` |
+| `LogDbLayer` | SQLite 结构化存储 | `state/src/log_db.rs` |
+| `OpenTelemetry` | 分布式链路追踪 | `core/src/otel_init.rs` |
+| `Feedback Layer` | 用户反馈收集 | `codex_feedback` crate |
+
+### 2.3 核心组件交互关系
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Application
+    participant R as Registry
+    participant F as File Layer
+    participant S as LogDbLayer
+    participant O as OpenTelemetry
+
+    A->>R: tracing::info!()
+    R->>R: 事件分发
+
+    par 多路输出
+        R->>F: 写入文件
+        F->>F: non_blocking 写入
+
+        R->>S: 写入 SQLite
+        S->>S: 批处理缓冲
+
+        R->>O: 发送链路数据
+        O->>O: OTLP 导出
+    end
+```
+
+**关键交互说明**：
+
+| 步骤 | 交互内容 | 设计意图 |
+|-----|---------|---------|
+| 1 | 应用代码产生日志事件 | 标准 tracing API |
+| 2 | Registry 分发事件 | 中心化事件路由 |
+| 3-4 | 文件层非阻塞写入 | 避免 IO 阻塞 |
+| 5-6 | SQLite 批处理 | 提高写入效率 |
+| 7-8 | OpenTelemetry 导出 | 分布式追踪集成 |
+
 ---
 
-## 核心概念：tracing 框架
+## 3. 核心组件详细分析
 
-### tracing vs log crate：编译期 vs 运行期
+### 3.1 Subscriber 初始化内部结构
 
-Rust 生态有两个主要的日志解决方案：
+#### 职责定位
 
-| 特性 | `log` crate | `tracing` |
-|------|-------------|-----------|
-| 过滤时机 | 运行时（日志产生后过滤） | 编译期（通过 feature flag） |
-| 结构化 | 简单 key-value | 强大的 span 和 field |
-| 异步友好 | 一般 | 原生支持 |
-| 性能开销 | 中等 | 接近零（静态检查） |
-| 学习曲线 | 平缓 | 较陡 |
+在 TUI 启动时初始化多层 subscriber，配置各种输出层。
 
-Codex 选择 `tracing` 是因为 Agent 场景的特殊需求：
-1. **异步并发**：大量 async/await 代码
-2. **上下文追踪**：需要 span 来关联相关日志
-3. **性能敏感**：不能容忍日志带来的额外开销
+#### 内部数据流
 
-### Subscriber、Layer、Span 三要素
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  准备阶段                                                    │
+│  ├── 创建日志目录 (~/.codex/logs/)                          │
+│  ├── 设置文件权限 (Unix 600)                                │
+│  └── 打开日志文件                                           │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Layer 构建                                                  │
+│  ├── File Layer (non_blocking + FmtSpan)                   │
+│  ├── Feedback Layer (用户反馈)                              │
+│  ├── OpenTelemetry Layer (可选)                            │
+│  └── LogDbLayer (SQLite 存储)                              │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  注册阶段                                                    │
+│  └── Registry::with(file_layer)                            │
+│      .with(feedback_layer)                                 │
+│      .with(log_db_layer)                                   │
+│      .with(otel_layer)                                     │
+│      .try_init()                                           │
+└─────────────────────────────────────────────────────────────┘
+```
 
-| 概念 | 说明 | 作用 |
-|------|------|------|
-| **Subscriber** | 日志订阅者 | 接收并处理所有 tracing 事件 |
-| **Layer** | 分层装饰器 | 可组合的多目标输出（文件/SQLite/OTel） |
-| **Span** | 上下文追踪 | 支持分布式链路追踪 |
-
----
-
-## 初始化流程
-
-**✅ Verified**: `codex/codex-rs/tui/src/lib.rs` 325-420行
+#### 关键算法逻辑
 
 ```rust
+// tui/src/lib.rs:325-420
+
 // 1. 创建日志目录并设置文件权限
 let log_dir = codex_core::config::log_dir(&config)?;
 std::fs::create_dir_all(&log_dir)?;
@@ -154,56 +185,39 @@ let env_filter = || {
 // 4. 文件日志 Layer
 let file_layer = tracing_subscriber::fmt::layer()
     .with_writer(non_blocking)
-    .with_target(true)      // 保留模块路径便于过滤
-    .with_ansi(false)       // 文件日志禁用 ANSI 颜色
-    .with_span_events(
-        tracing_subscriber::fmt::format::FmtSpan::NEW
-            | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
-    )
+    .with_target(true)
+    .with_ansi(false)
+    .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
     .with_filter(env_filter());
 
-// 5. Feedback Layer（用户反馈收集）
-let feedback = codex_feedback::CodexFeedback::new();
-let feedback_layer = feedback.logger_layer();
-let feedback_metadata_layer = feedback.metadata_layer();
-
-// 6. OpenTelemetry Layer
-let otel = codex_core::otel_init::build_provider(&config, ...);
-let otel_logger_layer = otel.as_ref().and_then(|o| o.logger_layer());
-let otel_tracing_layer = otel.as_ref().and_then(|o| o.tracing_layer());
-
-// 7. SQLite LogDbLayer
-let log_db_layer = codex_core::state_db::get_state_db(&config, None)
-    .await
-    .map(|db| log_db::start(db).with_filter(env_filter()));
-
-// 8. 注册所有 Layer 到 Registry
-tracing_subscriber::registry()
-    .with(file_layer)
-    .with(feedback_layer)
-    .with(feedback_metadata_layer)
-    .with(log_db_layer)
-    .with(otel_logger_layer)
-    .with(otel_tracing_layer)
-    .try_init();
+// 5-8. 其他 Layer 和注册
 ```
 
----
+**算法要点**：
 
-## LogDbLayer：SQLite 存储实现
+1. **权限安全**：Unix 系统设置 600 权限，防止敏感信息泄露
+2. **非阻塞写入**：使用 `tracing_appender::non_blocking` 避免 IO 阻塞
+3. **环境过滤**：支持 `RUST_LOG` 环境变量动态控制日志级别
+4. **Span 事件**：记录 Span 创建和关闭，支持调用链追踪
 
-**✅ Verified**: `codex/codex-rs/state/src/log_db.rs`
+### 3.2 LogDbLayer SQLite 存储内部结构
 
-### 核心参数
+#### 职责定位
+
+提供结构化日志存储，支持 SQL 查询和自动清理。
+
+#### 关键参数
 
 ```rust
+// state/src/log_db.rs
+
 const LOG_QUEUE_CAPACITY: usize = 512;      // 内存队列容量
 const LOG_BATCH_SIZE: usize = 64;           // 批处理大小
 const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(250);  // 刷新间隔
 const LOG_RETENTION_DAYS: i64 = 90;         // 保留天数
 ```
 
-### 存储结构
+#### 存储结构
 
 ```rust
 struct LogEntry {
@@ -220,7 +234,7 @@ struct LogEntry {
 }
 ```
 
-### 批处理与清理机制
+#### 批处理与清理机制
 
 ```rust
 async fn run_inserter(
@@ -261,24 +275,30 @@ async fn run_retention_cleanup(state_db: Arc<StateRuntime>) {
 }
 ```
 
----
+**算法要点**：
 
-## Span 追踪在 Agent Loop 中的应用
+1. **批处理优化**：64条批量插入 + 250ms 定时刷新
+2. **内存缓冲**：512条队列容量，平衡内存和性能
+3. **自动清理**：90天保留策略，防止存储无限增长
+4. **结构化存储**：支持按级别、模块、时间等多维度查询
 
-### Span 创建与传播
+### 3.3 Span 追踪内部结构
+
+#### 职责定位
+
+使用 tracing 的 Span 机制追踪并发操作的上下文。
+
+#### 关键算法逻辑
 
 ```rust
-// 在 Agent Loop 中创建 Span
+// Span 创建与传播
 let span = tracing::info_span!("agent_turn", thread_id = ?thread_id);
 let _enter = span.enter();
 
 // 子 Span 自动继承上下文
 tracing::info!(parent: &span, "processing user request");
-```
 
-### Span 字段提取
-
-```rust
+// Span 字段提取
 impl<S> Layer<S> for LogDbLayer {
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
         let mut visitor = SpanFieldVisitor::default();
@@ -293,152 +313,401 @@ impl<S> Layer<S> for LogDbLayer {
 }
 ```
 
----
+### 3.4 组件间协作时序
 
-## 配置方式
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant R as Registry
+    participant F as File Layer
+    participant S as LogDbLayer
+    participant O as OpenTelemetry
 
-### 环境变量
+    App->>R: tracing::info!()
+    activate R
 
-```bash
-# 默认级别：info
-export RUST_LOG="codex_core=debug,codex_tui=debug"
+    R->>R: 匹配过滤规则
 
-# 查看所有模块
-codex --help 2>&1 | head -20
+    par 并发输出
+        R->>F: 格式化写入
+        activate F
+        F->>F: non_blocking 写入文件
+        deactivate F
+
+        R->>S: 入队处理
+        activate S
+        S->>S: 缓冲队列
+        alt 达到批处理大小
+            S->>S: SQLite 批量插入
+        end
+        deactivate S
+
+        R->>O: 链路数据
+        activate O
+        O->>O: OTLP 协议导出
+        deactivate O
+    end
+
+    deactivate R
 ```
 
-### 代码配置
+### 3.5 关键数据路径
+
+#### 主路径（正常日志记录）
+
+```mermaid
+flowchart LR
+    subgraph Input["输入阶段"]
+        I1[tracing::info!] --> I2[Registry 分发]
+    end
+
+    subgraph Process["处理阶段"]
+        P1[File Layer] --> P2[非阻塞写入]
+        P3[LogDbLayer] --> P4[批处理缓冲]
+        P5[OpenTelemetry] --> P6[OTLP 导出]
+    end
+
+    subgraph Output["输出阶段"]
+        O1[日志文件] --> O2[SQLite DB]
+        O3[追踪后端]
+    end
+
+    I2 --> P1
+    I2 --> P3
+    I2 --> P5
+    P2 --> O1
+    P4 --> O2
+    P6 --> O3
+
+    style Process fill:#e1f5e1,stroke:#333
+```
+
+#### 批处理路径（SQLite 写入）
+
+```mermaid
+flowchart TD
+    Start[日志事件] --> Queue[进入队列]
+    Queue --> Check{检查条件}
+
+    Check -->|达到64条| Batch[批量插入]
+    Check -->|250ms超时| Batch
+    Check -->|队列未满| Wait[继续等待]
+    Wait --> Queue
+
+    Batch --> DB[SQLite 写入]
+    DB --> Clean[90天清理检查]
+
+    style Batch fill:#90EE90
+```
+
+---
+
+## 4. 端到端数据流转
+
+### 4.1 正常流程（详细版）
+
+```mermaid
+sequenceDiagram
+    participant User as 用户
+    participant App as Codex App
+    participant R as Registry
+    participant F as File Layer
+    participant S as LogDbLayer
+
+    User->>App: 启动 Codex
+    App->>App: 初始化 Logging
+
+    App->>App: 创建日志目录
+    App->>App: 设置文件权限 600
+
+    App->>R: 构建 Registry
+    R->>F: 添加 File Layer
+    R->>S: 添加 LogDbLayer
+    R->>R: 注册完成
+
+    loop 应用运行
+        App->>R: tracing::info!()
+        R->>R: 过滤检查
+
+        alt 通过过滤
+            R->>F: 写入文件
+            F->>F: 格式化 + 非阻塞写入
+
+            R->>S: 入队
+            S->>S: 批处理缓冲
+            alt 触发条件
+                S->>S: SQLite 插入
+            end
+        end
+    end
+
+    App->>User: 应用关闭
+```
+
+**数据变换详情**：
+
+| 阶段 | 输入 | 处理 | 输出 | 代码位置 |
+|-----|------|------|------|---------|
+| 初始化 | Config | 目录创建 + 权限设置 | 日志环境就绪 | `tui/src/lib.rs:325` |
+| 事件产生 | 代码调用 | 格式化 | Log 事件 | Application |
+| 过滤 | Log 事件 | EnvFilter 匹配 | 通过/丢弃 | Registry |
+| 文件写入 | 日志内容 | 格式化 + 非阻塞 IO | 日志文件 | `fmt::layer()` |
+| SQLite | 日志内容 | 批处理 + SQL 插入 | state.db | `log_db.rs` |
+
+### 4.2 数据流向图
+
+```mermaid
+flowchart LR
+    subgraph Source["日志源"]
+        S1[Agent Loop]
+        S2[Tool System]
+        S3[MCP Handler]
+    end
+
+    subgraph Core["核心层"]
+        C1[tracing::info!]
+        C2[Registry]
+    end
+
+    subgraph Layer["输出层"]
+        L1[File Layer]
+        L2[LogDbLayer]
+        L3[OpenTelemetry]
+        L4[Feedback Layer]
+    end
+
+    subgraph Storage["存储"]
+        St1[codex-tui.log]
+        St2[state.db]
+        St3[OTel Collector]
+    end
+
+    S1 --> C1
+    S2 --> C1
+    S3 --> C1
+    C1 --> C2
+    C2 --> L1
+    C2 --> L2
+    C2 --> L3
+    C2 --> L4
+    L1 --> St1
+    L2 --> St2
+    L3 --> St3
+```
+
+---
+
+## 5. 关键代码实现
+
+### 5.1 核心数据结构
 
 ```rust
-// 动态调整过滤级别
-let env_filter = EnvFilter::try_from_default_env()
-    .unwrap_or_else(|_| EnvFilter::new("info"));
+// state/src/log_db.rs
+
+struct LogEntry {
+    ts: i64,
+    ts_nanos: i64,
+    level: String,
+    target: String,
+    message: String,
+    thread_id: Option<String>,
+    process_uuid: Option<String>,
+    module_path: Option<String>,
+    file: Option<String>,
+    line: Option<i64>,
+}
+
+// 核心参数
+const LOG_QUEUE_CAPACITY: usize = 512;
+const LOG_BATCH_SIZE: usize = 64;
+const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+const LOG_RETENTION_DAYS: i64 = 90;
+```
+
+**字段说明**：
+
+| 字段 | 类型 | 用途 |
+|-----|------|------|
+| `ts` | `i64` | 秒级时间戳 |
+| `level` | `String` | 日志级别 |
+| `target` | `String` | 目标模块 |
+| `thread_id` | `Option<String>` | 线程标识 |
+| `process_uuid` | `Option<String>` | 进程标识 |
+
+### 5.2 主链路代码
+
+```rust
+// tui/src/lib.rs:325-420
+
+// 1. 创建日志目录并设置文件权限
+let log_dir = codex_core::config::log_dir(&config)?;
+std::fs::create_dir_all(&log_dir)?;
+
+let mut log_file_opts = OpenOptions::new();
+log_file_opts.create(true).append(true);
+
+#[cfg(unix)]
+{
+    use std::os::unix::fs::OpenOptionsExt;
+    log_file_opts.mode(0o600);
+}
+
+let log_file = log_file_opts.open(log_dir.join("codex-tui.log"))?;
+
+// 2. 非阻塞文件写入器
+let (non_blocking, _guard) = non_blocking(log_file);
+
+// 3. 环境变量过滤
+let env_filter = || {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("codex_core=info,codex_tui=info")
+    })
+};
+
+// 4. 文件日志 Layer
+let file_layer = tracing_subscriber::fmt::layer()
+    .with_writer(non_blocking)
+    .with_target(true)
+    .with_ansi(false)
+    .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+    .with_filter(env_filter());
+
+// 5. 注册所有 Layer
+tracing_subscriber::registry()
+    .with(file_layer)
+    .with(log_db_layer)
+    .with(otel_layer)
+    .try_init();
+```
+
+**代码要点**：
+
+1. **安全权限**：Unix 600 权限，仅所有者可读写
+2. **非阻塞 IO**：避免日志写入阻塞主流程
+3. **灵活过滤**：支持 RUST_LOG 环境变量
+4. **Span 追踪**：记录 Span 生命周期
+
+### 5.3 关键调用链
+
+```text
+Application::run()
+  -> init_logging()               [tui/src/lib.rs:325]
+    -> create log dir
+    -> set file permissions 600
+    -> non_blocking file writer
+    -> build File Layer
+    -> build LogDbLayer           [state/src/log_db.rs]
+      - start inserter task
+      - batch processing
+    -> build OpenTelemetry Layer  [core/src/otel_init.rs]
+    -> Registry::with().try_init()
+
+Runtime logging
+  -> tracing::info!()
+    -> Registry dispatch
+      -> File Layer write
+      -> LogDbLayer queue
+        - batch insert to SQLite
+      -> OpenTelemetry export
 ```
 
 ---
 
-## 快速上手：5分钟掌握 Codex 日志
+## 6. 设计意图与 Trade-off
 
-### 1. 基础环境变量配置
+### 6.1 Codex 的选择
 
-```bash
-# 基础级别控制
-export RUST_LOG="info"
-codex
+| 维度 | Codex 的选择 | 替代方案 | 取舍分析 |
+|-----|-------------|---------|---------|
+| 日志框架 | Rust tracing | log crate / 自定义 | 结构化 + 异步原生支持，但学习曲线陡峭 |
+| 存储方式 | SQLite 结构化 | 纯文本 | 可查询 + 高效，但依赖 SQLite |
+| 输出模式 | 多层 subscriber | 单一输出 | 灵活组合，但初始化复杂 |
+| 并发处理 | non_blocking + 批处理 | 同步写入 | 高性能，但有延迟 |
+| 可观测性 | OpenTelemetry 原生 | 自定义协议 | 生态丰富，但配置复杂 |
 
-# 调试特定模块
-export RUST_LOG="codex_core::agent=debug,codex_tui=info,codex_rmcp_client=trace"
-codex
+### 6.2 为什么这样设计？
 
-# 查看所有可用模块（从 help 输出推断）
-codex --help 2>&1 | grep -E "^\s+\w+"
-```
+**核心问题**：如何在不影响性能的前提下，实现企业级可观测性？
 
-### 2. 实时查看日志文件
+**Codex 的解决方案**：
+- 代码依据：`tui/src/lib.rs:325-420` 的多层 subscriber 初始化
+- 设计意图：单一事件源，多路输出，各层独立优化
+- 带来的好处：
+  - 文件日志用于本地调试
+  - SQLite 支持结构化查询
+  - OpenTelemetry 集成企业监控
+  - 批处理 + 非阻塞确保性能
+- 付出的代价：
+  - 初始化代码复杂
+  - 需要理解 tracing 生态
+  - 多路输出增加资源消耗
 
-```bash
-# 找到日志目录
-ls ~/.codex/logs/
+### 6.3 与其他项目的对比
 
-# 实时跟踪
-tail -f ~/.codex/logs/codex-tui.log
-
-# 过滤特定级别
-grep "ERROR" ~/.codex/logs/codex-tui.log
-```
-
-### 3. 查询 SQLite 日志数据库
-
-```bash
-# 找到数据库文件
-ls ~/.codex/*.db
-
-# 使用 sqlite3 查询（如果已安装）
-sqlite3 ~/.codex/state.db <<EOF
-SELECT
-    datetime(ts, 'unixepoch') as time,
-    level,
-    target,
-    message
-FROM logs
-WHERE level = 'ERROR'
-ORDER BY ts DESC
-LIMIT 10;
-EOF
-```
-
-### 4. 与 OpenTelemetry Collector 集成
-
-```bash
-# 配置环境变量
-export OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4317"
-export OTEL_SERVICE_NAME="codex-agent"
-
-# 运行 Codex（自动启用 OTel 导出）
-codex
-```
-
-### 5. 常见问题排查
-
-**Q: 日志文件在哪里？**
-```bash
-# 默认位置
-~/.codex/logs/codex-tui.log
-# 或者
-~/.local/share/codex/logs/
-```
-
-**Q: 如何只查看 Agent 相关的详细日志？**
-```bash
-export RUST_LOG="codex_core::agent=trace,info"
-# trace 级别只给 agent 模块，其他保持 info
-```
-
-**Q: 日志文件权限问题？**
-```bash
-# Codex 自动设置 600 权限（仅所有者可读写）
-ls -l ~/.codex/logs/
-# -rw------- 1 user group ... codex-tui.log
-```
-
-**Q: 如何导出特定时间段的日志？**
-```bash
-# 使用 SQLite 查询特定时间范围
-sqlite3 ~/.codex/state.db "
-SELECT * FROM logs
-WHERE ts > strftime('%s', '2024-01-20')
-  AND ts < strftime('%s', '2024-01-21')
-ORDER BY ts;
-"
-```
+| 项目 | 核心差异 | 适用场景 |
+|-----|---------|---------|
+| Codex | tracing + SQLite + OTel | 企业级可观测性 |
+| Gemini CLI | 结构化日志文件 | 简单本地调试 |
+| Kimi CLI | Python logging | 快速开发迭代 |
+| OpenCode | 可配置日志级别 | 灵活控制 |
 
 ---
 
-## 证据索引
+## 7. 边界情况与错误处理
 
-| 组件 | 文件路径 | 行号 | 关键职责 |
-|------|----------|------|----------|
-| 初始化 | `codex/codex-rs/tui/src/lib.rs` | 325-420 | 多层 subscriber 初始化 |
-| LogDbLayer | `codex/codex-rs/state/src/log_db.rs` | 1-307 | SQLite 日志存储实现 |
-| 状态数据库 | `codex/codex-rs/state/src/` | - | StateRuntime/LogEntry 定义 |
-| OpenTelemetry | `codex/codex-rs/core/src/otel_init.rs` | - | OTel 初始化 |
-| 配置 | `codex/codex-rs/core/src/config/` | - | 日志目录配置 |
+### 7.1 终止条件
+
+| 终止原因 | 触发条件 | 代码位置 |
+|---------|---------|---------|
+| 日志目录创建失败 | 权限不足 | `tui/src/lib.rs:329` |
+| 文件打开失败 | 磁盘满/权限 | `tui/src/lib.rs:342` |
+| SQLite 初始化失败 | 数据库损坏 | `log_db.rs` |
+| 队列满 | 写入速度过慢 | `log_db.rs` |
+| OTel 导出失败 | 网络不可用 | `otel_init.rs` |
+
+### 7.2 资源限制
+
+```rust
+// log_db.rs
+const LOG_QUEUE_CAPACITY: usize = 512;      // 内存队列上限
+const LOG_BATCH_SIZE: usize = 64;           // 批处理大小
+const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+const LOG_RETENTION_DAYS: i64 = 90;         // 保留天数
+```
+
+### 7.3 错误恢复策略
+
+| 错误类型 | 处理策略 | 代码位置 |
+|---------|---------|---------|
+| 文件写入失败 | 忽略错误，继续运行 | File Layer |
+| SQLite 失败 | 降级为仅文件日志 | LogDbLayer |
+| OTel 失败 | 静默失败，不影响主流程 | OTel Layer |
+| 队列满 | 丢弃旧日志，记录警告 | LogDbLayer |
 
 ---
 
-## 边界与不确定性
+## 8. 关键代码索引
 
-- **⚠️ Inferred**: OpenTelemetry 的具体导出端点配置依赖于 `config` 中的遥测设置
-- **⚠️ Inferred**: Feedback Layer 的具体实现位于 `codex_feedback` crate，本分析未深入
-- **❓ Pending**: SQLite 表结构的具体 DDL 语句需查看 `state_db` 初始化代码
-- **✅ Verified**: 文件权限设置为 600 的代码已确认（Unix 系统）
+| 功能 | 文件 | 行号 | 说明 |
+|-----|------|------|------|
+| 初始化 | `tui/src/lib.rs` | 325-420 | Subscriber 初始化 |
+| 文件权限 | `tui/src/lib.rs` | 336-340 | Unix 600 权限设置 |
+| 非阻塞写入 | `tui/src/lib.rs` | 345 | non_blocking |
+| LogDbLayer | `state/src/log_db.rs` | 1-307 | SQLite 日志实现 |
+| 批处理 | `state/src/log_db.rs` | 200-253 | 批量插入逻辑 |
+| 自动清理 | `state/src/log_db.rs` | 256-261 | 90天清理 |
+| OpenTelemetry | `core/src/otel_init.rs` | - | OTel 初始化 |
+| 环境过滤 | `tui/src/lib.rs` | 348-352 | RUST_LOG 支持 |
 
 ---
 
-## 设计亮点
+## 9. 延伸阅读
 
-1. **多层架构**: 单一事件源分发到多个消费端（文件/SQLite/OTel）
-2. **非阻塞 I/O**: `tracing_appender::non_blocking` 避免日志阻塞主流程
-3. **批处理优化**: SQLite 写入采用 64条批量 + 250ms 定时刷新策略
-4. **安全设计**: 日志文件默认 600 权限，防止敏感信息泄露
-5. **可观测性**: 原生支持分布式链路追踪（OpenTelemetry）
+- 前置知识：`02-codex-cli-entry.md`、`03-codex-session-runtime.md`
+- 相关机制：`04-codex-agent-loop.md`、`05-codex-tools-system.md`
+- 技术文档：[tracing 文档](https://docs.rs/tracing/)、[OpenTelemetry Rust](https://opentelemetry.io/docs/instrumentation/rust/)
+
+---
+
+*✅ Verified: 基于 codex/codex-rs/{tui/src/lib.rs,state/src/log_db.rs,core/src/otel_init.rs} 源码分析*
+*基于版本：2026-02-08 | 最后更新：2026-02-24*

@@ -1,371 +1,274 @@
-# Session Runtime（codex）
+# Session Runtime（Codex）
 
-本文基于 `codex/codex-rs/core/src` 源码，解释 Codex 的 Session Runtime——会话生命周期管理、状态存储和 Turn 调度的核心机制。
+## TL;DR（结论先行）
+
+一句话定义：Codex Session Runtime 采用「**单 Session 下单活跃 Turn + 可中断任务**」模型，用 `active_turn` 管理运行任务，并通过 Rollout 事件持久化支持恢复。
+
+核心取舍：
+- 用显式取消换状态一致性（新任务启动会替换旧任务）
+- 用事件流持久化换可恢复与可审计
 
 ---
 
-## 1. 先看全局（架构图）
+## 1. 为什么需要这个机制？
+
+### 1.1 问题场景
 
 ```text
-┌─────────────────────────────────────────────────────────────────┐
-│  Session：会话生命周期管理                                        │
-│  ┌────────────────────────────────────────┐                     │
-│  │ codex/codex-rs/core/src/codex.rs       │                     │
-│  │  ├── struct Session                    │                     │
-│  │  ├── fn new() -> Session               │                     │
-│  │  ├── fn spawn_task()                   │                     │
-│  │  └── fn abort_all_tasks()              │                     │
-│  └────────┬───────────────────────────────┘                     │
-└───────────┼─────────────────────────────────────────────────────┘
-            │
-            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  SessionState：持久化状态                                         │
-│  ┌────────────────────────────────────────┐                     │
-│  │ codex/codex-rs/core/src/state/session.rs│                    │
-│  │  ├── history: ContextManager           │                     │
-│  │  ├── session_configuration             │                     │
-│  │  ├── mcp_connection_manager            │                     │
-│  │  └── latest_rate_limits                │                     │
-│  └────────┬───────────────────────────────┘                     │
-└───────────┼─────────────────────────────────────────────────────┘
-            │
-            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  TurnContext：单次回合上下文                                      │
-│  ┌────────────────────────────────────────┐                     │
-│  │ codex/codex-rs/core/src/codex.rs       │                     │
-│  │  ├── model_info                        │                     │
-│  │  ├── sandbox_policy                    │                     │
-│  │  ├── approval_policy                   │                     │
-│  │  └── tool_call_gate                    │                     │
-│  └────────────────────────────────────────┘                     │
-└─────────────────────────────────────────────────────────────────┘
+场景：用户持续多轮交互，并在中途插入新请求
+
+如果允许多个 turn 并行写状态：
+  - 历史记录竞态
+  - 工具调用顺序紊乱
+  - 恢复点不确定
+
+Codex 的做法：
+  - 会话层只保留单活跃 turn
+  - 新任务先 abort 旧任务再启动
 ```
+
+### 1.2 核心挑战
+
+| 挑战 | 不解决的后果 |
+|-----|-------------|
+| 并发控制 | 多任务争用同一会话状态 |
+| 状态隔离 | Turn 间上下文污染 |
+| 可恢复性 | 崩溃后无法回放并恢复 |
+| 取消语义 | 用户中断后资源无法优雅回收 |
 
 ---
 
-## 2. 核心概念
+## 2. 整体架构
 
-### 2.1 一句话定义
+### 2.1 在系统中的位置
 
-Codex 的 Session Runtime 采用「**单 Session 多 Turn，单 Turn 顺序执行**」的并发模型：一个会话可同时存在多个 Turn，但只有一个 Turn 处于活跃状态；每个 Turn 内部是顺序执行的 Agent Loop。
-
-### 2.2 三层结构
-
-| 层级 | 职责 | 生命周期 |
-|------|------|----------|
-| **Session** | 管理会话生命周期、状态持久化、任务调度 | 从启动到退出 |
-| **Turn** | 单次用户交互的完整执行单元 | 从用户输入到完成 |
-| **Task** | Turn 的后台执行载体（tokio::task） | 与 Turn 相同 |
-
----
-
-## 3. Session 结构详解
-
-### 3.1 Session 主结构
-
-```rust
-// codex/codex-rs/core/src/codex.rs
-pub struct Session {
-    /// 会话唯一标识
-    conversation_id: ThreadId,
-    
-    /// 共享状态（Arc<Mutex<>> 包装）
-    state: Arc<Mutex<SessionState>>,
-    
-    /// 服务集合（MCP、模型客户端等）
-    services: Arc<SessionServices>,
-    
-    /// 当前活跃任务管理
-    task_tracker: Arc<TaskTracker>,
-    
-    /// 事件发送通道（到 TUI）
-    event_sender: Sender<Event>,
-}
-```
-
-### 3.2 SessionState 详情
-
-```rust
-// codex/codex-rs/core/src/state/session.rs
-pub(crate) struct SessionState {
-    /// 会话配置
-    pub(crate) session_configuration: SessionConfiguration,
-    
-    /// 历史记录管理（ContextManager）
-    pub(crate) history: ContextManager,
-    
-    /// 最新速率限制信息
-    pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
-    
-    /// MCP 依赖已提示集合（避免重复提示）
-    pub(crate) mcp_dependency_prompted: HashSet<String>,
-    
-    /// 初始上下文已注入标记
-    pub(crate) initial_context_seeded: bool,
-    
-    /// 之前的模型（用于检测切换）
-    pub(crate) previous_model: Option<String>,
-}
-```
-
-**设计意图**：
-- `history` 使用 `ContextManager` 管理对话历史，支持 Token 估算和压缩
-- `mcp_dependency_prompted` 防止重复询问用户安装 MCP 依赖
-- `initial_context_seeded` 确保系统提示只注入一次
-
-### 3.3 SessionServices 服务集合
-
-```rust
-// codex/codex-rs/core/src/state/service.rs
-pub struct SessionServices {
-    /// MCP 连接管理器
-    pub mcp_connection_manager: RwLock<McpConnectionManager>,
-    
-    /// 模型客户端
-    pub model_client: Arc<ModelClient>,
-    
-    /// 工具审批缓存
-    pub tool_approvals: Mutex<ApprovalStore>,
-    
-    /// OpenTelemetry 管理器
-    pub otel_manager: Arc<OtelManager>,
-    
-    /// 分析事件客户端
-    pub analytics: Arc<AnalyticsEventsClient>,
-}
-```
-
----
-
-## 4. Turn 生命周期管理
-
-### 4.1 Turn 创建流程
-
-```rust
-// codex/codex-rs/core/src/codex.rs
-async fn new_turn_with_sub_id(
-    &self,
-    sub_id: String,
-    items: Vec<ResponseInputItem>,
-    cwd: PathBuf,
-    model_override: Option<String>,
-) -> Result<Arc<TurnContext>> {
-    // 1. 获取模型信息
-    let model_info = self.get_model_info(model_override).await?;
-    
-    // 2. 构建 TurnContext
-    let turn_context = Arc::new(TurnContext {
-        sub_id,
-        model_info,
-        sandbox_policy: self.get_sandbox_policy().await,
-        approval_policy: self.get_approval_policy().await,
-        tools_config: self.build_tools_config().await,
-        cwd,
-        // ... 其他字段
-    });
-    
-    Ok(turn_context)
-}
-```
-
-### 4.2 TurnContext 关键字段
-
-```rust
-// codex/codex-rs/core/src/codex.rs
-pub struct TurnContext {
-    /// Turn 唯一标识
-    pub sub_id: String,
-    
-    /// 模型信息（capabilities, context window 等）
-    pub model_info: ModelInfo,
-    
-    /// 沙箱策略
-    pub sandbox_policy: SandboxPolicy,
-    
-    /// 审批策略
-    pub approval_policy: AskForApproval,
-    
-    /// 工具配置
-    pub tools_config: ToolsConfig,
-    
-    /// 当前工作目录
-    pub cwd: PathBuf,
-    
-    /// 工具调用门控（ReadinessFlag）
-    pub tool_call_gate: ReadinessFlag,
-    
-    /// 协作模式
-    pub collaboration_mode: CollaborationMode,
-}
-```
-
-**工程 Trade-off**：
-- ✅ `TurnContext` 包含单次交互的所有上下文，避免全局状态污染
-- ✅ `tool_call_gate` 用于控制 mutating 工具的执行时机
-- ⚠️ 字段较多，但通过 `Arc<TurnContext>` 共享，避免克隆开销
-
----
-
-## 5. 任务调度机制
-
-### 5.1 任务类型
-
-```rust
-// codex/codex-rs/core/src/tasks/mod.rs
-pub enum Task {
-    /// 普通用户交互 Turn
-    Regular(RegularTask),
-    
-    /// 上下文压缩任务
-    Compact(CompactTask),
-    
-    /// 远程压缩任务
-    RemoteCompact(RemoteCompactTask),
-}
-```
-
-### 5.2 任务启动与取消
-
-```rust
-// codex/codex-rs/core/src/codex.rs
-pub async fn spawn_task(
-    &self,
-    turn_context: Arc<TurnContext>,
-    task: RegularTask,
-) -> Result<()> {
-    // 1. 取消所有现有任务
-    self.abort_all_tasks(TurnAbortReason::Replaced).await;
-    
-    // 2. 创建新的任务句柄
-    let task_handle = tokio::spawn(task.run(turn_context.clone()));
-    
-    // 3. 记录活跃任务
-    self.task_tracker.set_active(turn_context.sub_id.clone(), task_handle);
-    
-    Ok(())
-}
-```
-
-**关键设计**：
-- 新任务启动时自动取消旧任务（`Replaced` 原因）
-- 使用 `TaskTracker` 管理任务生命周期
-- 支持优雅取消（通过 `CancellationToken`）
-
-### 5.3 任务状态流转
-
-```
-┌─────────┐    spawn     ┌─────────┐   complete   ┌─────────┐
-│ Pending │ ───────────▶ │ Running │ ───────────▶ │ Done    │
-└─────────┘              └─────────┘              └─────────┘
-                              │
-                              │ abort
-                              ▼
-                         ┌─────────┐
-                         │ Aborted │
-                         └─────────┘
-```
-
----
-
-## 6. 状态持久化
-
-### 6.1 RolloutRecorder 事件持久化
-
-```rust
-// codex/codex-rs/core/src/rollout/mod.rs
-pub struct RolloutRecorder {
-    /// 会话 ID
-    conversation_id: ThreadId,
-    
-    /// 事件存储（JSON Lines 格式）
-    storage: Box<dyn RolloutStorage>,
-}
-
-/// 持久化事件
-pub async fn record_item(&mut self, item: RolloutItem) -> Result<()> {
-    self.storage.append(item).await
-}
-```
-
-### 6.2 持久化内容
-
-| 数据类型 | 存储格式 | 用途 |
-|----------|----------|------|
-| 对话历史 | JSON Lines | 会话恢复、分叉 |
-| Token 使用 | 结构化数据 | 限流控制 |
-| 工具调用记录 | 事件流 | 审计、调试 |
-| 压缩历史 | 摘要内容 | 长会话管理 |
-
-### 6.3 恢复机制
-
-```rust
-/// 从 rollout 文件恢复会话
-pub async fn resume_from_rollout(
-    conversation_id: ThreadId,
-    storage: Arc<dyn RolloutStorage>,
-) -> Result<SessionState> {
-    // 1. 读取所有历史事件
-    let items = storage.read_all().await?;
-    
-    // 2. 重建 ContextManager
-    let mut history = ContextManager::new();
-    for item in items {
-        history.record_items(&[item.into()], TruncationPolicy::default());
-    }
-    
-    // 3. 重建 SessionState
-    Ok(SessionState {
-        history,
-        // ... 其他字段
-    })
-}
-```
-
----
-
-## 7. 与 Agent Loop 的关系
-
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
-│                     Session Runtime                          │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
-│  │  Session    │──▶│  TurnContext│──▶│  Agent Loop         │  │
-│  │             │  │             │  │  (run_turn)         │  │
-│  │ - 状态管理   │  │ - 单次上下文 │  │  - 采样请求         │  │
-│  │ - 任务调度   │  │ - 工具配置   │  │  - 工具调用         │  │
-│  │ - 事件路由   │  │ - 沙箱策略   │  │  - 历史更新         │  │
-│  └─────────────┘  └─────────────┘  └─────────────────────┘  │
-│         │                │                                      │
-│         ▼                ▼                                      │
-│  ┌──────────────────────────────────┐                        │
-│  │     SessionState (持久化)         │                        │
-│  │  - history: ContextManager        │                        │
-│  │  - configuration                  │                        │
-│  └──────────────────────────────────┘                        │
-└─────────────────────────────────────────────────────────────┘
+│ Core Agent Layer（core/src/codex.rs）                       │
+│ Codex::spawn() -> Session::new()                            │
+└───────────────────────┬─────────────────────────────────────┘
+                        │
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│ ▓▓▓ Session Runtime ▓▓▓                                     │
+│ Session (conversation_id, state, active_turn, services)      │
+│ TurnContext (单次 turn 的完整执行上下文)                      │
+└───────────────────────┬─────────────────────────────────────┘
+                        │
+        ┌───────────────┼──────────────────────┐
+        ▼               ▼                      ▼
+┌──────────────┐ ┌──────────────┐       ┌──────────────┐
+│ tasks/mod.rs │ │ SessionState │       │ RolloutRecorder │
+│ spawn/abort  │ │ history/token│       │ 事件持久化      │
+└──────────────┘ └──────────────┘       └──────────────┘
+```
+
+### 2.2 核心组件职责
+
+| 组件 | 职责 | 代码位置 |
+|-----|------|---------|
+| `Session` | 会话生命周期与任务切换 | `core/src/codex.rs:525` |
+| `TurnContext` | 单 turn 执行上下文 | `core/src/codex.rs:543` |
+| `SessionState` | 会话级可变状态（history/token 等） | `core/src/state/session.rs:17` |
+| `spawn_task` | 启动新任务前替换旧任务 | `core/src/tasks/mod.rs:116` |
+| `abort_all_tasks` | 取消当前运行任务 | `core/src/tasks/mod.rs:179` |
+| `RolloutRecorder` | 事件 JSONL 持久化 | `core/src/rollout/recorder.rs:70` |
+
+### 2.3 核心交互时序
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Core as Codex
+    participant Sess as Session
+    participant Turn as TurnContext
+    participant Task as SessionTask
+    participant State as SessionState
+
+    Core->>Sess: new_turn_with_sub_id(...)
+    Sess->>Turn: 构建 Arc<TurnContext>
+    Sess->>Task: spawn_task(turn_context, input, task)
+    Task->>Task: run(...)
+    Task->>State: 更新 history/token
+    Task-->>Sess: on_task_finished
 ```
 
 ---
 
-## 8. 证据索引
+## 3. 核心机制详细分析
 
-| 组件 | 文件路径 | 关键职责 |
-|------|----------|----------|
-| Session | `core/src/codex.rs` | 会话主结构，任务调度 |
-| SessionState | `core/src/state/session.rs` | 持久化状态 |
-| SessionServices | `core/src/state/service.rs` | 服务集合 |
-| TurnContext | `core/src/codex.rs` | 回合上下文 |
-| Task | `core/src/tasks/mod.rs` | 任务定义 |
-| RolloutRecorder | `core/src/rollout/mod.rs` | 事件持久化 |
-| ContextManager | `core/src/context_manager/history.rs` | 历史管理 |
+### 3.1 Session 与 TurnContext（真实结构）
+
+```rust
+// core/src/codex.rs（摘要）
+pub(crate) struct Session {
+    pub(crate) conversation_id: ThreadId,
+    tx_event: Sender<Event>,
+    state: Mutex<SessionState>,
+    pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
+    pub(crate) services: SessionServices,
+}
+
+pub(crate) struct TurnContext {
+    pub(crate) sub_id: String,
+    pub(crate) model_info: ModelInfo,
+    pub(crate) cwd: PathBuf,
+    pub(crate) approval_policy: Constrained<AskForApproval>,
+    pub(crate) sandbox_policy: Constrained<SandboxPolicy>,
+    pub(crate) tools_config: ToolsConfig,
+    pub(crate) tool_call_gate: Arc<ReadinessFlag>,
+    // ... 其他 turn 级配置
+}
+```
+
+代码依据：`core/src/codex.rs:525-577`。
+
+### 3.2 任务调度与取消（真实主链路）
+
+`spawn_task` 的关键行为不是“并行堆叠”，而是“替换式启动”：
+1. `abort_all_tasks(TurnAbortReason::Replaced)`
+2. 启动新 task（tokio）
+3. 注册为当前 `active_turn`
+
+```rust
+// core/src/tasks/mod.rs（摘要）
+pub async fn spawn_task<T: SessionTask>(...) {
+    self.abort_all_tasks(TurnAbortReason::Replaced).await;
+    // spawn + register_new_active_task
+}
+```
+
+代码依据：`core/src/tasks/mod.rs:116-177`、`core/src/tasks/mod.rs:226-231`。
+
+### 3.3 SessionState（当前字段）
+
+```rust
+// core/src/state/session.rs（摘要）
+pub(crate) struct SessionState {
+    pub(crate) session_configuration: SessionConfiguration,
+    pub(crate) history: ContextManager,
+    pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
+    pub(crate) server_reasoning_included: bool,
+    pub(crate) dependency_env: HashMap<String, String>,
+    pub(crate) mcp_dependency_prompted: HashSet<String>,
+    previous_model: Option<String>,
+    pub(crate) startup_regular_task: Option<RegularTask>,
+    pub(crate) active_mcp_tool_selection: Option<Vec<String>>,
+    pub(crate) active_connector_selection: HashSet<String>,
+}
+```
+
+代码依据：`core/src/state/session.rs:17-32`。
+
+### 3.4 自动压缩（compact）触发链路
+
+Turn 执行后会检查 token 使用量并与 `auto_compact_limit` 对比：
+- 达到阈值且仍需 follow-up -> `run_auto_compact(...)`
+- `run_auto_compact` 根据 provider 选择 inline 或 remote compact 实现
+
+代码依据：
+- token 检查：`core/src/codex.rs:4728-4757`
+- pre-sampling compact：`core/src/codex.rs:4855-4874`
+- compact 路由：`core/src/codex.rs:4923-4944`
 
 ---
 
-## 9. 架构特点总结
+## 4. 端到端数据流转
 
-- **单活跃 Turn**：同一 Session 同时只有一个活跃 Turn，新 Turn 自动替换旧 Turn
-- **分层状态**：Session 级状态持久化 + Turn 级上下文隔离
-- **事件驱动**：通过通道（Channel）与 TUI 层解耦
-- **可恢复性**：完整的 rollout 机制支持会话恢复和分叉
+### 4.1 正常路径
+
+```mermaid
+flowchart LR
+    A[UserInput] --> B[new_turn_with_sub_id]
+    B --> C[Arc<TurnContext>]
+    C --> D[spawn_task]
+    D --> E[task.run]
+    E --> F[record history/token]
+    F --> G[flush rollout]
+    G --> H[TurnComplete event]
+```
+
+### 4.2 取消路径（新任务替换）
+
+```mermaid
+flowchart TD
+    A[新请求到达] --> B[spawn_task]
+    B --> C[abort_all_tasks Replaced]
+    C --> D[取消旧任务 token]
+    D --> E[启动新任务]
+    E --> F[active_turn 指向新任务]
+```
+
+### 4.3 数据关系图
+
+```mermaid
+flowchart TD
+    Session -->|Mutex| SessionState
+    Session -->|Mutex<Option>| ActiveTurn
+    Session -->|holds| SessionServices
+    ActiveTurn --> RunningTask
+    RunningTask --> TurnContext
+    TurnContext --> ToolCallGate
+    SessionServices --> RolloutRecorder
+```
+
+---
+
+## 5. 工程设计意图与 Trade-off
+
+| 维度 | Codex 的选择 | 替代方案 | Trade-off |
+|-----|-------------|---------|-----------|
+| Turn 并发 | 单活跃 turn（替换式） | 多 turn 并行 | 一致性更强，但吞吐受限 |
+| 取消策略 | `CancellationToken` + graceful timeout | 直接 kill | 更安全，但实现复杂 |
+| 状态管理 | `Mutex<SessionState>` | 完全事件溯源内存态 | 直观易维护，但需谨慎锁粒度 |
+| 持久化 | Rollout JSONL + 状态 DB | 仅内存 | 恢复能力强，但 IO 成本更高 |
+
+---
+
+## 6. 边界条件与错误处理
+
+### 6.1 常见终止/中断原因
+
+| 场景 | 触发条件 | 代码位置 |
+|-----|---------|---------|
+| 新任务替换旧任务 | 新 `spawn_task` 到达 | `core/src/tasks/mod.rs:122` |
+| 用户中断 | `Interrupted` 取消原因 | `core/src/tasks/mod.rs:183-185` |
+| 任务未优雅结束 | 超时后强制 abort handle | `core/src/tasks/mod.rs:265-274` |
+| turn 执行异常 | 发送 `EventMsg::Error` | `core/src/codex.rs:4842-4847` |
+
+### 6.2 恢复相关
+
+- Rollout 以 JSONL 持久化，支持 resume/fork。
+- `RolloutRecorder` 负责持久化命令队列与 flush/shutdown 语义。
+
+代码依据：`core/src/rollout/recorder.rs:60-105`。
+
+---
+
+## 7. 关键代码索引
+
+| 功能 | 文件 | 行号 |
+|-----|------|------|
+| `Session` 结构 | `codex/codex-rs/core/src/codex.rs` | 525 |
+| `TurnContext` 结构 | `codex/codex-rs/core/src/codex.rs` | 543 |
+| `new_turn_with_sub_id` | `codex/codex-rs/core/src/codex.rs` | 1978 |
+| `spawn_task` | `codex/codex-rs/core/src/tasks/mod.rs` | 116 |
+| `abort_all_tasks` | `codex/codex-rs/core/src/tasks/mod.rs` | 179 |
+| `on_task_finished` | `codex/codex-rs/core/src/tasks/mod.rs` | 188 |
+| `SessionState` 结构 | `codex/codex-rs/core/src/state/session.rs` | 17 |
+| 自动 compact 主链路 | `codex/codex-rs/core/src/codex.rs` | 4728 |
+| `run_auto_compact` | `codex/codex-rs/core/src/codex.rs` | 4923 |
+| Rollout 记录器 | `codex/codex-rs/core/src/rollout/recorder.rs` | 70 |
+
+---
+
+## 8. 延伸阅读
+
+- 概览：`01-codex-overview.md`
+- CLI Entry：`02-codex-cli-entry.md`
+- Agent Loop：`04-codex-agent-loop.md`
+
+---
+
+*✅ Verified: 基于 codex/codex-rs/core/src/ 源码分析*  
+*基于版本：2026-02-08 | 最后更新：2026-02-24*

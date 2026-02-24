@@ -1,613 +1,265 @@
-# Codex 概述文档
+# Codex 概述
 
-## 1. 项目简介
+## TL;DR（结论先行）
 
-**Codex** 是 OpenAI 推出的官方 CLI Agent，采用 Rust 语言实现，旨在提供高效、安全的 AI 辅助编程体验。
+一句话定义：Codex 是基于 Rust 的本地代码 Agent CLI，采用「**顶层 CLI 分发 + TUI 交互运行时 + Core 会话执行内核**」的分层架构。
 
-### 项目定位和目标
-- 定位为开发者日常编程助手，支持交互式 TUI 和非交互式执行模式
-- 强调安全性，提供多层级沙箱机制（Seatbelt/Landlock/Windows 受限令牌）
-- 支持复杂的 Agent 协作模式（Collaboration Mode）
-- 提供 MCP（Model Context Protocol）服务器扩展能力
-
-### 技术栈
-- **语言**: Rust
-- **核心依赖**:
-  - `tokio` - 异步运行时
-  - `clap` - CLI 参数解析
-  - `reqwest`/`tokio-tungstenite` - HTTP/WebSocket 通信
-  - `serde`/`serde_json` - 序列化
-  - `rmcp` - MCP 协议支持
-
-### 官方仓库
-- https://github.com/openai/codex
+核心取舍：
+- 入口与交互解耦（`cli` vs `tui`）
+- 会话运行时以一致性优先（单活跃 turn）
+- 工具调用采用统一注册与门控执行
 
 ---
 
-## 2. 架构概览
+## 1. 为什么需要这个架构？
 
-### 分层架构图
+### 1.1 问题场景
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        CLI Layer                            │
-│  (codex/codex-rs/cli/src/main.rs:545)                      │
-│  - MultitoolCli: 命令解析                                   │
-│  - Subcommand: exec/review/login/mcp/etc                   │
-└─────────────────────────────────────────────────────────────┘
-                              │
-┌─────────────────────────────────────────────────────────────┐
-│                      TUI Layer                              │
-│  (codex/codex-rs/tui/)                                      │
-│  - 交互式界面渲染                                           │
-│  - 用户输入处理                                             │
-└─────────────────────────────────────────────────────────────┘
-                              │
-┌─────────────────────────────────────────────────────────────┐
-│                    Core Agent Layer                         │
-│  (codex/codex-rs/core/src/)                                 │
-│  ├─ codex.rs:266 - Codex 主结构体                           │
-│  ├─ codex.rs:292 - spawn() 初始化                           │
-│  └─ agent/: Agent 控制与状态管理                            │
-└─────────────────────────────────────────────────────────────┘
-                              │
-┌─────────────────────────────────────────────────────────────┐
-│                    Session Layer                            │
-│  (codex/codex-rs/core/src/codex.rs:806)                     │
-│  ├─ Session: 会话管理                                       │
-│  ├─ SessionState: 状态存储 (state/session.rs:16)           │
-│  └─ TurnContext: 单次回合上下文                             │
-└─────────────────────────────────────────────────────────────┘
-                              │
-┌─────────────────────────────────────────────────────────────┐
-│                    Tools Layer                              │
-│  (codex/codex-rs/core/src/tools/)                           │
-│  ├─ registry.rs:57 - ToolRegistry                           │
-│  ├─ spec.rs - 工具定义                                      │
-│  └─ handlers/ - 工具实现                                    │
-└─────────────────────────────────────────────────────────────┘
-                              │
-┌─────────────────────────────────────────────────────────────┐
-│                   Model Client Layer                        │
-│  (codex/codex-rs/core/src/client.rs:150)                    │
-│  ├─ ModelClient: 会话级客户端                               │
-│  ├─ ModelClientSession: 回合级会话                          │
-│  └─ Responses API / WebSocket 通信                          │
-└─────────────────────────────────────────────────────────────┘
+```text
+问题：同一个 Agent 既要支持交互式开发，又要支持自动化执行，还要保证安全与可恢复。
+
+如果单层混合：
+  参数解析、UI、任务执行、工具调用耦合在一起
+  -> 难扩展，难定位故障，易引入状态污染
+
+Codex 的分层做法：
+  CLI 负责命令分发
+  TUI 负责交互渲染
+  Core 负责 Session/Turn/Tool/Model 主循环
 ```
 
-### 各层职责说明
+### 1.2 核心挑战
 
-| 层级 | 文件路径 | 核心职责 |
-|------|----------|----------|
-| CLI | `cli/src/main.rs` | 命令解析、子命令分发、配置覆盖 |
-| TUI | `tui/src/` | 交互式界面、事件循环、渲染 |
-| Core | `core/src/codex.rs` | Agent 生命周期、消息路由、事件分发 |
-| Session | `core/src/codex.rs` | 会话状态管理、历史记录、Token 追踪 |
-| Tools | `core/src/tools/` | 工具注册、调度、执行、沙箱控制 |
-| Client | `core/src/client.rs` | 模型 API 调用、流式响应、重试逻辑 |
-
-### 核心组件列表
-
-1. **Codex** (codex.rs:266) - 主入口，提供 spawn 方法创建会话
-2. **Session** (codex.rs:806) - 管理会话生命周期和状态
-3. **TurnContext** (codex.rs:919) - 单次交互的完整上下文
-4. **ToolRegistry** (tools/registry.rs:57) - 工具注册与调度
-5. **ModelClient** (client.rs:150) - 模型 API 客户端
-6. **AgentControl** - Agent 执行控制（暂停/恢复/停止）
+| 挑战 | 不解决的后果 |
+|-----|-------------|
+| 安全边界 | 高风险命令缺少审批与门控 |
+| 状态一致性 | 多轮对话和工具输出相互污染 |
+| 可恢复性 | 崩溃后无法恢复上下文 |
+| 扩展性 | 新子命令/新工具集成成本高 |
 
 ---
 
-## 3. 入口与 CLI
+## 2. 整体架构
 
-### 入口文件路径
+### 2.1 分层架构图
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│ CLI Layer（codex-rs/cli）                                   │
+│ main.rs                                                      │
+│ - main()                                                     │
+│ - MultitoolCli / Subcommand                                 │
+│ - cli_main()                                                 │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ 分发
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│ TUI Layer（codex-rs/tui）                                   │
+│ - TuiCli 参数结构                                            │
+│ - codex_tui::run_main()                                      │
+│ - 交互渲染与输入事件                                          │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ 事件/操作
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│ ▓▓▓ Core Agent Layer（codex-rs/core）▓▓▓                   │
+│ codex.rs: Codex / Session / TurnContext                     │
+│ tasks/mod.rs: spawn_task / abort_all_tasks                  │
+│ tools/registry.rs: ToolRegistry::dispatch                   │
+│ client.rs: ModelClientSession::stream                       │
+└───────────────────────┬─────────────────────────────────────┘
+                        │
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│ SessionState │ │ ToolRegistry │ │ ModelClient  │
+│ history/token│ │ tool handler │ │ stream/fallback |
+└──────────────┘ └──────────────┘ └──────────────┘
 ```
-codex/codex-rs/cli/src/main.rs:545
-```
 
-### CLI 参数解析方式
+### 2.2 核心组件职责
 
-使用 `clap` 库进行命令解析，支持以下主要命令：
+| 组件 | 职责 | 代码位置 |
+|-----|------|---------|
+| `MultitoolCli` | 根命令参数解析与子命令分发 | `cli/src/main.rs:67` |
+| `Codex` | 提交队列与事件队列封装 | `core/src/codex.rs:274` |
+| `Session` | 会话生命周期与任务管理 | `core/src/codex.rs:525` |
+| `TurnContext` | 单 turn 完整上下文 | `core/src/codex.rs:543` |
+| `ToolRegistry` | 工具匹配、门控与执行 | `core/src/tools/registry.rs:58` |
+| `ModelClient` | 会话级模型客户端 | `core/src/client.rs:175` |
 
-```rust
-// main.rs:67-146
-#[derive(Debug, Parser)]
-struct MultitoolCli {
-    #[clap(flatten)]
-    pub config_overrides: CliConfigOverrides,
-    #[clap(flatten)]
-    pub feature_toggles: FeatureToggles,
-    #[clap(flatten)]
-    interactive: TuiCli,
-    #[clap(subcommand)]
-    subcommand: Option<Subcommand>,
-}
+### 2.3 组件交互时序
 
-enum Subcommand {
-    Exec(ExecCli),           // 非交互式执行
-    Review(ReviewArgs),      // 代码审查
-    Login(LoginCommand),     // 登录管理
-    Mcp(McpCli),             // MCP 服务器管理
-    Resume(ResumeCommand),   // 恢复会话
-    Fork(ForkCommand),       // 分叉会话
-    // ... 更多命令
-}
-```
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CLI as Top-level CLI
+    participant Core as Codex/Session
+    participant Model as ModelClientSession
+    participant Tools as ToolRegistry
 
-### 启动流程
+    CLI->>Core: 提交用户输入（Op）
+    Core->>Core: new_turn_with_sub_id()
+    Core->>Model: stream(prompt,...)
+    Model-->>Core: 响应流（文本/工具调用）
 
-```
-main()@main.rs:545
-  ├─ cli_main()@main.rs:555
-  │   ├─ MultitoolCli::parse() 解析参数
-  │   ├─ match subcommand
-  │   │   ├─ None -> run_interactive_tui() 启动交互模式
-  │   │   ├─ Some(Subcommand::Exec) -> codex_exec::run_main()
-  │   │   ├─ Some(Subcommand::Resume) -> 恢复会话
-  │   │   └─ ... 其他子命令
-  │   └─ handle_app_exit() 处理退出
+    alt 文本
+        Core-->>CLI: 事件输出
+    else 工具调用
+        Core->>Tools: dispatch(invocation)
+        Tools-->>Core: tool output
+        Core->>Model: 继续采样
+    end
+
+    Core->>Core: 更新 history/token/rollout
 ```
 
 ---
 
-## 4. Agent 循环机制
+## 3. 核心机制概览
 
-### 主循环代码位置
+### 3.1 Agent 主循环（宏观）
 
-```
-codex/codex-rs/core/src/codex.rs:264-272 (Codex 结构体定义)
-codex/codex-rs/core/src/codex.rs:292-300 (spawn 方法)
-codex/codex-rs/core/src/agent/mod.rs (Agent 控制逻辑)
-```
-
-### 流程图（文本形式）
-
-```
-┌─────────────┐
-│   启动      │
-│ spawn()     │
-└──────┬──────┘
-       │
-       ▼
-┌─────────────┐     ┌─────────────┐
-│  创建 Session │───▶│ 初始化状态   │
-│  new()      │     │ RolloutRecorder
-└──────┬──────┘     └──────┬──────┘
-       │                    │
-       ▼                    ▼
-┌─────────────────────────────────────┐
-│            事件循环                  │
-│  while let Ok(event) = rx.recv()    │
-│  ┌───────────────────────────────┐  │
-│  │ 1. 接收 Submission (用户输入) │  │
-│  │ 2. 创建 TurnContext           │  │
-│  │ 3. 调用 model_client.stream() │  │
-│  │ 4. 处理流式响应                │  │
-│  │ 5. 执行 Tool Calls            │  │
-│  │ 6. 发送事件到 TUI              │  │
-│  └───────────────────────────────┘  │
-└─────────────────────────────────────┘
-       │
-       ▼
-┌─────────────┐
-│  会话结束   │
-│ 保存状态    │
-└─────────────┘
+```text
+spawn Codex
+  -> submission_loop
+    -> 创建 TurnContext
+    -> 运行 task（regular/review/...）
+    -> 模型采样 + 工具调用 + 状态更新
+    -> flush rollout + TurnComplete
 ```
 
-### 单次循环的执行步骤
+代码依据：
+- `core/src/codex.rs:300`（`Codex::spawn`）
+- `core/src/codex.rs:1978`（`new_turn_with_sub_id`）
+- `core/src/tasks/mod.rs:116`（`spawn_task`）
 
-1. **接收 Submission** - 从 `tx_sub` 通道接收用户输入或系统指令
-2. **创建 TurnContext** (codex.rs:919) - 构建单次交互的完整上下文
-3. **构建 Prompt** - 组合系统提示、历史记录、当前输入
-4. **调用模型** - 通过 `ModelClientSession::stream()` 发起流式请求
-5. **处理响应流** - 解析 SSE/WebSocket 事件，处理内容增量
-6. **执行工具调用** - 通过 `ToolRegistry::dispatch()` 执行工具
-7. **发送事件** - 通过 `tx_event` 通道发送事件到 TUI
-8. **更新状态** - 记录历史、Token 使用、Rate Limit
+### 3.2 工具系统（门控执行）
 
-### 循环终止条件
+```text
+ToolRegistry::dispatch
+  -> handler 查找
+  -> is_mutating() 判断
+  -> mutating 时等待 tool_call_gate
+  -> handler.handle()
+```
 
-- 用户主动退出（ExitReason::UserRequested）
-- 发生致命错误（ExitReason::Fatal）
-- 会话被明确关闭
-- 达到最大回合数限制
+代码依据：`core/src/tools/registry.rs:79-223`。
 
----
-
-## 5. 工具系统
-
-### 工具定义方式
-
-工具定义位于 `codex/codex-rs/core/src/tools/spec.rs`，使用 JSON Schema 格式：
+### 3.3 会话状态与持久化
 
 ```rust
-// tools/spec.rs
-pub struct ToolsConfig {
-    pub specs: Vec<ConfiguredToolSpec>,
-    pub web_search_mode: Option<WebSearchMode>,
-}
-
-pub struct ConfiguredToolSpec {
-    pub spec: ToolSpec,
-    pub supports_parallel_tool_calls: bool,
-}
-```
-
-### 工具注册表位置
-
-```
-codex/codex-rs/core/src/tools/registry.rs:57
-```
-
-```rust
-pub struct ToolRegistry {
-    handlers: HashMap<String, Arc<dyn ToolHandler>>,
-}
-
-pub trait ToolHandler: Send + Sync {
-    fn kind(&self) -> ToolKind;
-    async fn is_mutating(&self, invocation: &ToolInvocation) -> bool;
-    async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError>;
-}
-```
-
-### 工具执行流程
-
-```
-接收 Tool Call
-      │
-      ▼
-┌─────────────────┐
-│ ToolRegistry    │
-│ ::dispatch()    │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐    ┌─────────────────┐
-│ 查找 Handler    │───▶│ 未找到 -> 错误  │
-└────────┬────────┘    └─────────────────┘
-         │
-         ▼
-┌─────────────────┐    ┌─────────────────┐
-│ is_mutating()?  │───▶│ 是 -> 等待审批   │
-└────────┬────────┘    │ (tool_call_gate) │
-         │             └─────────────────┘
-         ▼
-┌─────────────────┐
-│ handler.handle()│
-│ 执行工具        │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ 返回 ToolOutput │
-│ 转换为响应项    │
-└─────────────────┘
-```
-
-### 审批机制
-
-```rust
-// tools/registry.rs:137-156
-let is_mutating = handler.is_mutating(&invocation).await;
-if is_mutating {
-    tracing::trace!("waiting for tool gate");
-    invocation_for_tool.turn.tool_call_gate.wait_ready().await;
-    tracing::trace!("tool gate released");
-}
-```
-
-- 变更性操作（mutating）需要等待审批
-- `tool_call_gate` 是 `ReadinessFlag` 类型，用于控制执行时机
-- 审批策略由 `approval_policy` 配置控制
-
----
-
-## 6. 状态管理
-
-### Session 状态存储位置
-
-```
-codex/codex-rs/core/src/state/session.rs:16
-```
-
-```rust
+// core/src/state/session.rs（摘要）
 pub(crate) struct SessionState {
     pub(crate) session_configuration: SessionConfiguration,
-    pub(crate) history: ContextManager,        // 历史记录管理
+    pub(crate) history: ContextManager,
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
     pub(crate) server_reasoning_included: bool,
     pub(crate) dependency_env: HashMap<String, String>,
     pub(crate) mcp_dependency_prompted: HashSet<String>,
-    pub(crate) initial_context_seeded: bool,
-    pub(crate) previous_model: Option<String>,
+    previous_model: Option<String>,
     pub(crate) startup_regular_task: Option<RegularTask>,
     pub(crate) active_mcp_tool_selection: Option<Vec<String>>,
     pub(crate) active_connector_selection: HashSet<String>,
 }
 ```
 
-### Checkpoint 机制
-
-- **RolloutRecorder** (codex.rs:1073-1080) - 持久化会话事件
-- **状态数据库** (`state_db`) - SQLite 存储（可选）
-- **事件持久化模式**: Limited / Extended
-
-```rust
-pub struct RolloutRecorderParams {
-    pub conversation_id: ThreadId,
-    pub forked_from_id: Option<ThreadId>,
-    pub session_source: SessionSource,
-    pub base_instructions: BaseInstructions,
-    pub event_persistence_mode: EventPersistenceMode,
-}
-```
-
-### 历史记录管理
-
-**ContextManager** 负责管理对话历史：
-
-```rust
-// context_manager.rs
-pub struct ContextManager {
-    items: Vec<ResponseItem>,
-    token_info: Option<TokenUsageInfo>,
-}
-```
-
-- 支持历史记录截断（Truncation）
-- 支持 Compact 压缩（当 Token 超限）
-- 支持从检查点恢复
-
-### 状态恢复方式
-
-```
-Resume 流程:
-1. 从命令行获取 session_id 或使用选择器
-2. 加载 rollout 文件
-3. 恢复 SessionState
-4. 重建 ContextManager 历史
-5. 继续会话
-
-Fork 流程:
-1. 复制原会话历史
-2. 生成新的 conversation_id
-3. 保留原状态但独立演化
-```
+持久化组件：`RolloutRecorder`（JSONL 事件流）。
+代码依据：`core/src/rollout/recorder.rs:70`。
 
 ---
 
-## 7. 模型调用方式
+## 4. 端到端数据流
 
-### 支持的模型提供商
+### 4.1 数据流转图
 
-- **OpenAI** - 官方 API（默认）
-- **Azure OpenAI** - 企业部署
-- **OpenRouter** - 第三方聚合
-- **OSS 模型** - 本地/自托管模型
-
-### 模型调用封装位置
-
+```mermaid
+flowchart LR
+    A[User/Shell] --> B[CLI parse & dispatch]
+    B --> C[Session.new_turn]
+    C --> D[Task.run]
+    D --> E[ModelClient stream]
+    E --> F{Tool call?}
+    F -->|Yes| G[ToolRegistry dispatch]
+    G --> E
+    F -->|No| H[Emit events]
+    H --> I[Update SessionState]
+    I --> J[Rollout flush]
 ```
-codex/codex-rs/core/src/client.rs:150
-```
+
+### 4.2 关键数据结构
 
 ```rust
-pub struct ModelClient {
-    state: Arc<ModelClientState>,
-}
-
-pub struct ModelClientSession {
-    client: ModelClient,
-    connection: Option<ApiWebSocketConnection>,
-    websocket_last_request: Option<ResponsesApiRequest>,
-    turn_state: Arc<OnceLock<String>>,  // Sticky routing
-}
-```
-
-### 流式响应处理
-
-```rust
-// client.rs:887-932
-pub async fn stream(...) -> Result<ResponseStream> {
-    match wire_api {
-        WireApi::Responses => {
-            let websocket_enabled = self.client.responses_websocket_enabled(model_info);
-            if websocket_enabled {
-                match self.stream_responses_websocket(...).await? {
-                    WebsocketStreamOutcome::Stream(stream) => return Ok(stream),
-                    WebsocketStreamOutcome::FallbackToHttp => {
-                        self.try_switch_fallback_transport(...);
-                    }
-                }
-            }
-            self.stream_responses_api(...).await
-        }
-    }
-}
-```
-
-### Token 管理
-
-```rust
-// state/session.rs:83-95
-pub(crate) fn update_token_info_from_usage(...) {
-    self.history.update_token_info(usage, model_context_window);
-}
-
-pub(crate) fn token_info(&self) -> Option<TokenUsageInfo> {
-    self.history.token_info()
-}
-```
-
-- Token 使用从 API 响应中提取
-- 存储在 `TokenUsageInfo` 中
-- 用于触发 Compact（压缩）决策
-
----
-
-## 8. 数据流转图
-
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                           完整数据流                                    │
-└────────────────────────────────────────────────────────────────────────┘
-
-用户输入 (TUI/CLI)
-       │
-       ▼
-┌─────────────────┐
-│   Submission    │  ──▶  codex.rs:264 (Codex.tx_sub)
-│   (用户消息)     │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  SessionState   │  ──▶  state/session.rs:16
-│  加载历史记录   │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  TurnContext    │  ──▶  codex.rs:919
-│  构建回合上下文 │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│   Prompt        │  ──▶  client_common.rs
-│   (系统+历史+输入)│
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ ModelClient     │  ──▶  client.rs:150
-│ ::stream()      │     WebSocket/SSE 流式请求
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ 模型响应流      │
-│ - 文本增量      │
-│ - 工具调用请求  │
-└────────┬────────┘
-         │
-    ┌────┴────┐
-    ▼         ▼
-┌────────┐  ┌──────────┐
-│ 文本   │  │ Tool Call │
-│ 输出   │  └────┬──────┘
-└────────┘       │
-                 ▼
-        ┌─────────────────┐
-        │ ToolRegistry    │  ──▶  tools/registry.rs:57
-        │ ::dispatch()    │
-        └────────┬────────┘
-                 │
-                 ▼
-        ┌─────────────────┐
-        │ 工具执行        │
-        │ (Sandboxed)     │
-        └────────┬────────┘
-                 │
-                 ▼
-        ┌─────────────────┐
-        │ ToolOutput      │
-        │ 转换为响应项    │
-        └────────┬────────┘
-                 │
-                 ▼
-        ┌─────────────────┐
-        │ 发送到模型      │
-        │ (下一轮迭代)    │
-        └─────────────────┘
-```
-
-### 关键数据结构定义
-
-```rust
-// 事件类型 (protocol/protocol.rs)
+// protocol/src/protocol.rs
 pub struct Event {
     pub id: String,
     pub msg: EventMsg,
 }
 
 pub enum EventMsg {
-    ItemStarted(ItemStartedEvent),
-    ItemCompleted(ItemCompletedEvent),
-    ResponseOutputItemDelta(...),
-    ToolCallRequest(ToolCallRequest),
-    ExecApprovalRequest(ExecApprovalRequestEvent),
+    ExecApprovalRequest(...),
+    ItemStarted(...),
+    ItemCompleted(...),
     // ...
-}
-
-// 工具调用 (tools/context.rs)
-pub struct ToolInvocation {
-    pub session: Weak<Session>,
-    pub turn: Arc<TurnContext>,
-    pub tool_name: Arc<str>,
-    pub call_id: Arc<str>,
-    pub payload: ToolPayload,
-}
-
-// 模型请求 (client_common.rs)
-pub struct Prompt {
-    pub base_instructions: BaseInstructions,
-    pub input: Vec<ResponseInputItem>,
-    pub tools: Vec<Tool>,
-    pub parallel_tool_calls: bool,
 }
 ```
 
+代码依据：`protocol/src/protocol.rs:928`、`protocol/src/protocol.rs:941`。
+
 ---
 
-## 9. 源码索引
+## 5. 设计意图与 Trade-off
 
-### 核心文件
+| 维度 | Codex 的选择 | 替代方案 | 取舍分析 |
+|-----|-------------|---------|---------|
+| 入口分层 | `cli` 分发 + `tui` 交互 | 单体入口 | 边界清晰，但模块更多 |
+| 运行时并发 | 单活跃 turn | 多 turn 并发 | 一致性更好，但并行度有限 |
+| 工具执行 | 统一 registry + mutating gate | 工具各自执行 | 审批与控制集中，但链路更长 |
+| 持久化 | rollout 事件流 | 仅内存快照 | 恢复和审计更强，但有 IO 成本 |
+
+---
+
+## 6. 关键代码索引
 
 | 组件 | 文件路径 | 行号 | 说明 |
 |------|----------|------|------|
-| CLI 入口 | `codex/codex-rs/cli/src/main.rs` | 545 | main() 函数 |
-| Codex 主结构 | `codex/codex-rs/core/src/codex.rs` | 266 | Codex struct |
-| Session 管理 | `codex/codex-rs/core/src/codex.rs` | 806 | Session impl |
-| TurnContext | `codex/codex-rs/core/src/codex.rs` | 919 | make_turn_context() |
-| SessionState | `codex/codex-rs/core/src/state/session.rs` | 16 | SessionState struct |
-| 工具注册表 | `codex/codex-rs/core/src/tools/registry.rs` | 57 | ToolRegistry |
-| 工具 Trait | `codex/codex-rs/core/src/tools/registry.rs` | 32 | ToolHandler trait |
-| 模型客户端 | `codex/codex-rs/core/src/client.rs` | 150 | ModelClient |
-| 流式请求 | `codex/codex-rs/core/src/client.rs` | 887 | stream() 方法 |
-| 响应流映射 | `codex/codex-rs/core/src/client.rs` | 1002 | map_response_stream() |
+| CLI 入口 | `codex/codex-rs/cli/src/main.rs` | 545 | `main()` |
+| CLI 分发 | `codex/codex-rs/cli/src/main.rs` | 555 | `cli_main()` |
+| 根命令结构 | `codex/codex-rs/cli/src/main.rs` | 67 | `MultitoolCli` |
+| Codex 主结构 | `codex/codex-rs/core/src/codex.rs` | 274 | `Codex` |
+| Session | `codex/codex-rs/core/src/codex.rs` | 525 | 会话结构 |
+| TurnContext | `codex/codex-rs/core/src/codex.rs` | 543 | 回合上下文 |
+| 新建 turn | `codex/codex-rs/core/src/codex.rs` | 1978 | `new_turn_with_sub_id` |
+| 任务调度 | `codex/codex-rs/core/src/tasks/mod.rs` | 116 | `spawn_task` |
+| 工具注册表 | `codex/codex-rs/core/src/tools/registry.rs` | 58 | `ToolRegistry` |
+| 模型流式调用 | `codex/codex-rs/core/src/client.rs` | 946 | `stream()` |
+| SessionState | `codex/codex-rs/core/src/state/session.rs` | 17 | 状态结构 |
+| RolloutRecorder | `codex/codex-rs/core/src/rollout/recorder.rs` | 70 | 持久化 |
 
 ### 子命令实现
 
-| 命令 | 文件路径 | 行号 |
-|------|----------|------|
-| exec | `codex/codex-rs/exec/src/lib.rs` | - |
-| review | `codex/codex-rs/exec/src/lib.rs` | - |
-| mcp | `codex/codex-rs/cli/src/mcp_cmd.rs` | - |
-| resume | `codex/codex-rs/cli/src/main.rs` | 634-650 |
-| fork | `codex/codex-rs/cli/src/main.rs` | 651-667 |
+| 命令 | 文件路径 |
+|------|----------|
+| exec/review | `codex/codex-rs/exec/src/lib.rs` |
+| mcp | `codex/codex-rs/cli/src/mcp_cmd.rs` |
 
-### 工具实现
+### 工具实现（示例）
 
 | 工具类型 | 文件路径 |
 |----------|----------|
-| Shell | `core/src/tools/handlers/shell.rs` |
-| File | `core/src/tools/handlers/file.rs` |
-| Search | `core/src/tools/handlers/search.rs` |
-| Web Search | `core/src/tools/handlers/web_search.rs` |
-| Apply Patch | `core/src/tools/handlers/apply_patch.rs` |
-| MCP 工具 | `core/src/mcp/` |
+| Shell | `codex/codex-rs/core/src/tools/handlers/shell.rs` |
+| ReadFile | `codex/codex-rs/core/src/tools/handlers/read_file.rs` |
+| Search(BM25) | `codex/codex-rs/core/src/tools/handlers/search_tool_bm25.rs` |
 
 ---
 
-## 总结
+## 7. 延伸阅读
 
-Codex 是一个架构清晰、注重安全的 Rust CLI Agent：
+- CLI 入口：`02-codex-cli-entry.md`
+- Session Runtime：`03-codex-session-runtime.md`
+- Agent Loop：`04-codex-agent-loop.md`
 
-1. **分层架构** - CLI → TUI → Core → Session → Tools → Client
-2. **安全优先** - 多层沙箱、审批机制、变更性操作控制
-3. **流式处理** - 支持 WebSocket 和 SSE，优先 WebSocket
-4. **状态持久化** - RolloutRecorder 支持会话恢复和分叉
-5. **扩展能力** - MCP 协议支持外部工具集成
+---
+
+*✅ Verified: 基于 codex/codex-rs/core/src/ 源码分析*  
+*基于版本：2026-02-08 | 最后更新：2026-02-24*

@@ -1,141 +1,210 @@
 # Memory Context 管理（codex）
 
-本文基于 `./codex/codex-rs` 源码，解释 codex 如何实现对话历史（History）和上下文（Context）的管理，包括 Token 估算、上下文压缩和记忆持久化。
+## TL;DR（结论先行）
+
+一句话定义：Codex 的 Memory Context 是**双层存储 + 惰性压缩**的对话历史管理方案，在内存中维护完整历史，通过字节启发式估算 Token 使用量，接近上下文窗口限制时触发 LLM 驱动的摘要压缩。
+
+Codex 的核心取舍：**内存完整存储 + 惰性压缩**（对比 Gemini CLI 的分层记忆、Kimi CLI 的 Checkpoint 回滚）
 
 ---
 
-## 1. 先看全局（流程图）
+## 1. 为什么需要这个机制？（解决什么问题）
 
-### 1.1 ContextManager → History → Prompt 流程
+### 1.1 问题场景
+
+没有 Memory Context 管理：
+```
+长对话 → 历史累积 → Token 超限 → 模型报错 → 对话中断
+```
+
+有 Memory Context 管理：
+```
+长对话 → Token 接近阈值 → 触发压缩 → 历史摘要化 → 对话继续
+         ↓ 压缩后仍超限
+         移除最旧历史项 → 保证上下文窗口内
+```
+
+### 1.2 核心挑战
+
+| 挑战 | 不解决的后果 |
+|-----|-------------|
+| Token 估算 | 无法准确判断是否接近上下文限制 |
+| 历史规范化 | 孤立的 call/output 导致模型困惑 |
+| 上下文压缩 | 超限后无法继续对话 |
+| 持久化恢复 | 程序重启后丢失对话历史 |
+| 多模态支持 | 图片等非文本内容处理复杂 |
+
+---
+
+## 2. 整体架构（ASCII 图）
+
+### 2.1 在系统中的位置
 
 ```text
-┌─────────────────────────────────────────────────────────────────┐
-│  用户输入 / 工具输出                                               │
-│  ┌────────────────────────────────────────┐                     │
-│  │ ResponseInputItem::Message { role:     │                     │
-│  │   "user", content: [...] }             │                     │
-│  │ ResponseInputItem::FunctionCallOutput  │                     │
-│  └────────┬───────────────────────────────┘                     │
-└───────────┼─────────────────────────────────────────────────────┘
-            │
-            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  ContextManager 管理历史                                          │
-│  ┌────────────────────────────────────────┐                     │
-│  │ ContextManager::record_items()         │                     │
-│  │  ├── items: Vec<ResponseItem>          │                     │
-│  │  ├── token_info: TokenUsageInfo        │                     │
-│  │  └── process_item() 应用截断策略      │                     │
-│  │       └── truncate_text() /            │                     │
-│  │           truncate_function_output_    │                     │
-│  │           items_with_policy()          │                     │
-│  └────────┬───────────────────────────────┘                     │
-└───────────┼─────────────────────────────────────────────────────┘
-            │
-            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Prompt 构建时规范化处理                                          │
-│  ┌────────────────────────────────────────┐                     │
-│  │ ContextManager::for_prompt()           │                     │
-│  │  └── normalize_history()               │                     │
-│  │       ├── ensure_call_outputs_present  │                     │
-│  │       ├── remove_orphan_outputs        │                     │
-│  │       └── strip_images_when_unsupported│                     │
-│  └────────────────────────────────────────┘                     │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│ Agent Loop                                                   │
+│ codex-rs/core/src/loop.rs                                    │
+└───────────────────────┬─────────────────────────────────────┘
+                        │
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│ ContextManager│ │ Compact Task │ │ RolloutRecorder│
+│ 历史管理     │ │ 上下文压缩   │ │ 持久化存储   │
+└──────┬───────┘ └──────┬───────┘ └──────┬───────┘
+       │                │                │
+       ▼                ▼                ▼
+┌─────────────────────────────────────────────────────────────┐
+│ ▓▓▓ Memory Context ▓▓▓                                      │
+│ codex-rs/core/src/context_manager/                           │
+│ - history.rs    : ContextManager 核心结构                   │
+│ - normalize.rs  : 历史规范化处理                             │
+│ - compact.rs    : 上下文压缩逻辑                             │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ 依赖
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│ truncate.rs  │ │ truncate.rs  │ │ protocol/src │
+│ Token 估算   │ │ 截断策略     │ │ RolloutItem  │
+└──────────────┘ └──────────────┘ └──────────────┘
 ```
 
-### 1.2 上下文压缩流程
+### 2.2 核心组件职责
+
+| 组件 | 职责 | 代码位置 |
+|-----|------|---------|
+| `ContextManager` | 对话历史的内存存储与管理 | `context_manager/history.rs:106` |
+| `normalize` | 历史规范化（call/output 配对） | `context_manager/normalize.rs` |
+| `compact` | 上下文压缩任务执行 | `compact.rs:64` |
+| `truncate` | Token 估算与截断策略 | `truncate.rs` |
+| `RolloutRecorder` | 持久化存储（JSON Lines） | `protocol/src/protocol.rs` |
+
+### 2.3 核心组件交互关系
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Agent Loop
+    participant C as ContextManager
+    participant N as Normalize
+    participant T as Truncate
+    participant L as LLM API
+
+    A->>C: record_items(new_items)
+    Note over C: 添加新对话项
+    C->>T: estimate_token_count()
+    T-->>C: token_count
+
+    alt token_count > threshold
+        C->>A: 触发 compact task
+        A->>C: run_compact_task()
+        C->>L: 发送历史请求摘要
+        L-->>C: 返回摘要内容
+        C->>C: 用 Compaction 项替换旧历史
+    end
+
+    A->>C: for_prompt()
+    C->>N: normalize_history()
+    N->>N: ensure_call_outputs_present()
+    N->>N: remove_orphan_outputs()
+    N->>N: strip_images_when_unsupported()
+    N-->>C: 规范化后的历史
+    C-->>A: Prompt 就绪
+```
+
+**关键交互说明**：
+
+| 步骤 | 交互内容 | 设计意图 |
+|-----|---------|---------|
+| 1 | 记录新对话项 | 完整保存所有交互 |
+| 2-3 | Token 估算 | 提前发现超限风险 |
+| 4-7 | 触发压缩 | 将旧历史转换为摘要 |
+| 8 | Prompt 构建请求 | 准备发送给模型 |
+| 9-12 | 历史规范化 | 保证 call/output 配对完整性 |
+
+---
+
+## 3. 核心组件详细分析
+
+### 3.1 ContextManager 内部结构
+
+#### 职责定位
+
+ContextManager 是 Memory Context 的核心，在内存中维护完整的对话历史，提供 Token 估算、历史记录和 Prompt 构建功能。
+
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Empty: 初始化
+    Empty --> Recording: record_items()
+    Recording --> Checking: estimate_token_count()
+
+    Checking --> Normal: token < threshold
+    Checking --> Compacting: token >= threshold
+
+    Compacting --> Compacted: 压缩完成
+    Compacting --> Truncating: 压缩后仍超限
+
+    Truncating --> Truncated: 移除旧项
+    Normal --> Recording: 继续对话
+    Compacted --> Recording: 继续对话
+    Truncated --> Recording: 继续对话
+```
+
+#### 内部数据流
 
 ```text
-┌─────────────────────────────────────────────────────────────────┐
-│  Token 超出阈值检测                                                │
-│  ┌────────────────────────────────────────┐                     │
-│  │ estimate_token_count() > threshold     │                     │
-│  │   └── 触发上下文压缩                  │                     │
-│  └────────┬───────────────────────────────┘                     │
-└───────────┼─────────────────────────────────────────────────────┘
-            │
-            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Context Compaction 执行                                          │
-│  ┌────────────────────────────────────────┐                     │
-│  │ run_compact_task_inner()               │                     │
-│  │  ├── 创建 Compaction Turn              │                     │
-│  │  ├── 发送历史到模型进行总结           │                     │
-│  │  │   └── SUMMARIZATION_PROMPT         │                     │
-│  │  └── 生成 Compaction 项替换旧历史     │                     │
-│  │       └── ResponseItem::Compaction    │                     │
-│  └────────┬───────────────────────────────┘                     │
-└───────────┼─────────────────────────────────────────────────────┘
-            │
-            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  压缩后历史结构                                                   │
-│  ┌────────────────────────────────────────┐                     │
-│  │ [Compaction] 总结内容                  │                     │
-│  │ [Message] 最近的用户消息               │                     │
-│  │ [FunctionCallOutput] 最近的工具输出    │                     │
-│  │ ...                                    │                     │
-│  └────────────────────────────────────────┘                     │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  输入层                                                      │
+│  ├── ResponseInputItem::Message { role, content }           │
+│  ├── ResponseInputItem::FunctionCallOutput { ... }          │
+│  ├── ResponseItem::FunctionCall { ... }                     │
+│  └── ResponseItem::Compaction { summary }                   │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  处理层                                                      │
+│  ├── record_items()                                         │
+│  │   └── apply TruncationPolicy                            │
+│  ├── estimate_token_count()                                 │
+│  │   └── approx_token_count() 字节启发式估算                │
+│  └── for_prompt()                                           │
+│      └── normalize_history()                                │
+│          ├── ensure_call_outputs_present()                  │
+│          ├── remove_orphan_outputs()                        │
+│          └── strip_images_when_unsupported()                │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  输出层                                                      │
+│  ├── Vec<ResponseItem> (用于 Prompt 构建)                   │
+│  ├── TokenUsageInfo (Token 使用统计)                        │
+│  └── 触发 compact task (如果超限)                           │
+└─────────────────────────────────────────────────────────────┘
 ```
 
----
+#### 关键接口
 
-## 2. 阅读路径（30 秒 / 3 分钟 / 10 分钟）
+| 接口 | 输入 | 输出 | 说明 | 代码位置 |
+|-----|------|------|------|---------|
+| `new()` | - | ContextManager | 创建空管理器 | `history.rs:113` |
+| `record_items()` | Vec<ResponseInputItem> | - | 记录新项 | `history.rs:?` |
+| `for_prompt()` | modalities | Vec<ResponseItem> | 构建 Prompt | `history.rs:?` |
+| `estimate_token_count()` | BaseInstructions | Option<i64> | Token 估算 | `history.rs:398` |
+| `remove_first_item()` | - | Option<ResponseItem> | 移除最旧项 | `history.rs:?` |
 
-- **30 秒版**：只看 `1.1` + `3.1`（知道 ContextManager 存储历史和 Prompt 构建流程）。
-- **3 分钟版**：看 `1.1` + `1.2` + `4` + `5`（知道 Token 管理、压缩机制和持久化）。
-- **10 分钟版**：通读全文（能定位上下文相关问题，理解压缩策略）。
+### 3.2 历史规范化 (Normalize) 内部结构
 
-### 2.1 一句话定义
+#### 职责定位
 
-codex 的 Memory Context 采用"**双层存储 + 惰性压缩**"的设计：使用 `ContextManager` 在内存中维护完整的对话历史，通过字节启发式算法估算 Token 使用量，当接近上下文窗口限制时触发 LLM 驱动的上下文压缩，将旧历史转换为摘要形式。
+在构建 Prompt 前执行三项规范化，确保历史数据的一致性和完整性。
 
----
-
-## 3. 核心组件详解
-
-### 3.1 ContextManager 结构
-
-**文件**: `core/src/context_manager/history.rs:25-49`
+#### 关键算法逻辑
 
 ```rust
-#[derive(Debug, Clone, Default)]
-pub(crate) struct ContextManager {
-    /// The oldest items are at the beginning of the vector.
-    items: Vec<ResponseItem>,
-    token_info: Option<TokenUsageInfo>,
-}
-
-impl ContextManager {
-    pub(crate) fn new() -> Self {
-        Self {
-            items: Vec::new(),
-            token_info: TokenUsageInfo::new_or_append(&None, &None, None),
-        }
-    }
-}
-```
-
-**关键方法**:
-
-| 方法 | 职责 |
-|------|------|
-| `record_items()` | 记录新的对话项，应用截断策略 |
-| `for_prompt()` | 构建发送给模型的 Prompt，执行规范化 |
-| `estimate_token_count()` | 估算当前历史的 Token 使用量 |
-| `remove_first_item()` | 移除最旧的项（用于压缩） |
-| `drop_last_n_user_turns()` | 回滚最近 N 个用户回合 |
-
-### 3.2 历史规范化 (Normalize)
-
-**文件**: `core/src/context_manager/normalize.rs`
-
-在构建 Prompt 前，codex 会执行三项规范化：
-
-```rust
+// context_manager/normalize.rs
 fn normalize_history(&mut self, input_modalities: &[InputModality]) {
     // 1. 确保每个 function call 都有对应的 output
     normalize::ensure_call_outputs_present(&mut self.items);
@@ -148,18 +217,268 @@ fn normalize_history(&mut self, input_modalities: &[InputModality]) {
 }
 ```
 
-**不变性保证**:
-- 每个 function call 必须有对应的 output
-- 每个 output 必须有对应的 function call
-- 图片内容仅在模型支持时保留
+**算法要点**：
 
-### 3.3 Token 估算机制
+1. **Call/Output 配对**：每个工具调用必须有对应的结果，否则模型无法关联
+2. **孤儿清理**：移除无效的历史项，减少 Token 消耗
+3. **多模态处理**：根据模型能力动态调整内容
 
-**文件**: `core/src/context_manager/history.rs:398-417`
+### 3.3 上下文压缩 (Compact) 内部结构
 
-codex 使用字节启发式算法估算 Token 数量：
+#### 职责定位
+
+当 Token 接近上下文窗口限制时，触发 LLM 驱动的历史摘要，将旧历史替换为 Compaction 项。
+
+#### 关键算法逻辑
 
 ```rust
+// compact.rs:64-120
+pub(crate) async fn run_compact_task_inner(...) -> CodexResult<()> {
+    // 1. 克隆当前历史
+    let mut history = sess.clone_history().await;
+
+    // 2. 记录压缩提示词
+    history.record_items(&[initial_input_for_turn.into()], policy);
+
+    loop {
+        // 3. 构建压缩 Prompt
+        let turn_input = history.for_prompt(&turn_context.model_info.input_modalities);
+        let prompt = Prompt {
+            input: turn_input,
+            base_instructions: sess.get_base_instructions().await,
+            ..Default::default()
+        };
+
+        // 4. 发送给模型生成摘要
+        match drain_to_completed(&sess, turn_context, ...).await {
+            Ok(()) => break,
+            Err(CodexErr::ContextWindowExceeded) => {
+                // 5. 超出窗口则移除最旧项重试
+                history.remove_first_item();
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+```
+
+**算法要点**：
+
+1. **渐进式压缩**：优先尝试完整压缩，失败则移除最旧项重试
+2. **自洽循环**：使用相同的 LLM API 进行摘要生成
+3. **幂等替换**：用 Compaction 项原子替换旧历史
+
+### 3.4 组件间协作时序
+
+```mermaid
+sequenceDiagram
+    participant U as Agent Loop
+    participant C as ContextManager
+    participant N as Normalize
+    participant T as Truncate
+    participant L as LLM
+
+    U->>C: record_items(new_items)
+    activate C
+
+    C->>T: apply TruncationPolicy
+    activate T
+    T->>T: truncate_text() / truncate_function_output_items()
+    T-->>C: 截断后的 items
+    deactivate T
+
+    C->>C: items.extend()
+    C->>T: estimate_token_count()
+    T-->>C: token_count
+
+    alt token_count > compact_threshold
+        C-->>U: 需要压缩
+        U->>C: run_compact_task()
+        activate C
+
+        loop 直到成功或无法继续
+            C->>C: for_prompt()
+            C->>N: normalize_history()
+            N-->>C: 规范化历史
+
+            C->>L: 发送摘要请求
+            alt 成功
+                L-->>C: 摘要内容
+                C->>C: 生成 Compaction 项
+                C->>C: 替换旧历史
+            else ContextWindowExceeded
+                C->>C: remove_first_item()
+            end
+        end
+
+        C-->>U: 压缩完成
+        deactivate C
+    end
+
+    deactivate C
+
+    U->>C: for_prompt()
+    C->>N: normalize_history()
+    N->>N: ensure_call_outputs_present()
+    N->>N: remove_orphan_outputs()
+    N->>N: strip_images_when_unsupported()
+    N-->>C: 规范化历史
+    C-->>U: Prompt
+```
+
+### 3.4 关键数据路径
+
+#### 主路径（正常流程）
+
+```mermaid
+flowchart LR
+    subgraph Input["输入阶段"]
+        I1[ResponseInputItem] --> I2[record_items]
+    end
+
+    subgraph Process["处理阶段"]
+        P1[apply TruncationPolicy] --> P2[estimate_token_count]
+        P2 --> P3{超限?}
+        P3 -->|否| P4[for_prompt]
+        P3 -->|是| P5[run_compact_task]
+        P5 --> P6[normalize_history]
+        P6 --> P7[LLM 摘要]
+        P7 --> P8[Compaction 替换]
+        P8 --> P4
+    end
+
+    subgraph Output["输出阶段"]
+        O1[规范化历史] --> O2[构建 Prompt]
+    end
+
+    I2 --> P1
+    P4 --> O1
+
+    style Process fill:#e1f5e1,stroke:#333
+```
+
+#### 异常路径（压缩失败）
+
+```mermaid
+flowchart TD
+    E[ContextWindowExceeded] --> E1{还能移除?}
+    E1 -->|是| R1[remove_first_item]
+    R1 --> R2[重试压缩]
+    R2 --> E
+
+    E1 -->|否| R3[返回错误]
+    R3 --> End[结束对话]
+
+    style R3 fill:#FF6B6B
+```
+
+---
+
+## 4. 端到端数据流转
+
+### 4.1 正常流程（详细版）
+
+```mermaid
+sequenceDiagram
+    participant User as 用户
+    participant Agent as Agent Loop
+    participant CM as ContextManager
+    participant Norm as Normalize
+    participant LLM as LLM
+
+    User->>Agent: 输入消息
+    Agent->>CM: record_items([user_message])
+
+    Agent->>CM: estimate_token_count()
+    CM-->>Agent: token_count
+
+    alt token_count > threshold
+        Agent->>CM: run_compact_task()
+        CM->>CM: 构建压缩 Prompt
+        CM->>LLM: 请求历史摘要
+        LLM-->>CM: 摘要文本
+        CM->>CM: 创建 Compaction 项
+        CM->>CM: 替换旧历史
+    end
+
+    Agent->>CM: for_prompt()
+    CM->>Norm: normalize_history()
+    Norm->>Norm: ensure_call_outputs_present()
+    Norm->>Norm: remove_orphan_outputs()
+    Norm-->>CM: 规范化历史
+    CM-->>Agent: Prompt
+
+    Agent->>LLM: 发送 Prompt
+    LLM-->>Agent: 响应
+
+    Agent->>CM: record_items([assistant_response])
+```
+
+**数据变换详情**：
+
+| 阶段 | 输入 | 处理 | 输出 | 代码位置 |
+|-----|------|------|------|---------|
+| 记录 | ResponseInputItem | 应用 TruncationPolicy | 存储到 items | `history.rs:?` |
+| 估算 | BaseInstructions + items | approx_token_count() | token_count | `history.rs:398` |
+| 压缩 | 完整历史 | LLM 摘要 + 替换 | Compaction 项 | `compact.rs:64` |
+| 规范化 | raw items | ensure/remove/strip | clean items | `normalize.rs` |
+| 持久化 | TurnItem | RolloutRecorder | JSON Lines | `protocol.rs` |
+
+### 4.2 数据流向图
+
+```mermaid
+flowchart LR
+    subgraph Input["输入"]
+        I1[User Message]
+        I2[Tool Output]
+        I3[Assistant Response]
+    end
+
+    subgraph Manager["ContextManager"]
+        M1[items: Vec<ResponseItem>]
+        M2[token_info: TokenUsageInfo]
+    end
+
+    subgraph Process["处理"]
+        P1[record_items]
+        P2[estimate_token_count]
+        P3[compact]
+        P4[normalize_history]
+    end
+
+    subgraph Output["输出"]
+        O1[Prompt]
+        O2[Rollout JSONL]
+    end
+
+    I1 --> M1
+    I2 --> M1
+    I3 --> M1
+    M1 --> P1
+    P1 --> P2
+    P2 --> P3
+    P3 --> P4
+    P4 --> O1
+    M1 --> O2
+```
+
+---
+
+## 5. 关键代码实现
+
+### 5.1 核心数据结构
+
+```rust
+// codex-rs/core/src/context_manager/history.rs:106-119
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ContextManager {
+    /// The oldest items are at the beginning of the vector.
+    items: Vec<ResponseItem>,
+    token_info: Option<TokenUsageInfo>,
+}
+
+// codex-rs/core/src/context_manager/history.rs:398-417
 pub(crate) fn estimate_token_count(
     &self,
     base_instructions: &BaseInstructions,
@@ -178,166 +497,113 @@ pub(crate) fn estimate_token_count(
 
     Some(base_tokens.saturating_add(items_tokens))
 }
-
-fn estimate_item_token_count(item: &ResponseItem) -> i64 {
-    let model_visible_bytes = estimate_response_item_model_visible_bytes(item);
-    approx_tokens_from_byte_count_i64(model_visible_bytes)
-}
 ```
 
-**估算策略**:
-- 普通项：使用 JSON 序列化后的字节数
-- Reasoning/Compaction 项：使用加密内容的长度（base64 解码后估算）
-- 转换系数：字节数 → Token 数的近似转换
+**字段说明**：
 
----
+| 字段 | 类型 | 用途 |
+|-----|------|------|
+| `items` | `Vec<ResponseItem>` | 对话历史存储（旧→新） |
+| `token_info` | `Option<TokenUsageInfo>` | Token 使用统计 |
 
-## 4. 上下文压缩 (Context Compaction)
-
-### 4.1 压缩触发条件
-
-当满足以下条件时触发压缩：
-- Token 估算值接近模型上下文窗口限制
-- 用户显式请求压缩（`/compact` 命令）
-
-### 4.2 压缩执行流程
-
-**文件**: `core/src/compact.rs:64-120`
+### 5.2 主链路代码
 
 ```rust
-pub(crate) async fn run_compact_task_inner(
-    sess: Arc<Session>,
-    turn_context: Arc<TurnContext>,
-    input: Vec<UserInput>,
-) -> CodexResult<()> {
-    // 1. 克隆当前历史
-    let mut history = sess.clone_history().await;
+// codex-rs/core/src/context_manager/normalize.rs
+fn normalize_history(&mut self, input_modalities: &[InputModality]) {
+    // 1. 确保每个 function call 都有对应的 output
+    normalize::ensure_call_outputs_present(&mut self.items);
 
-    // 2. 记录压缩提示词
-    history.record_items(&[initial_input_for_turn.into()], policy);
+    // 2. 移除孤立的 outputs（没有对应 call 的）
+    normalize::remove_orphan_outputs(&mut self.items);
 
-    loop {
-        // 3. 构建压缩 Prompt
-        let turn_input = history.for_prompt(&turn_context.model_info.input_modalities);
-        let prompt = Prompt {
-            input: turn_input,
-            base_instructions: sess.get_base_instructions().await,
-            ..Default::default()
-        };
-
-        // 4. 发送给模型生成摘要
-        match drain_to_completed(&sess, turn_context.as_ref(), &mut client_session, ...).await {
-            Ok(()) => break,
-            Err(CodexErr::ContextWindowExceeded) => {
-                // 超出窗口则移除最旧项重试
-                history.remove_first_item();
-                continue;
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    // 3. 当模型不支持图片时，从消息中移除图片
+    normalize::strip_images_when_unsupported(input_modalities, &mut self.items);
 }
 ```
 
-### 4.3 压缩提示词
+**代码要点**：
 
-**文件**: `core/src/templates/compact/prompt.md`
+1. **配对保证**：确保每个工具调用都有对应的结果返回
+2. **孤儿清理**：移除无效的历史项，减少 Token 浪费
+3. **多模态适配**：根据模型输入模态能力动态过滤
 
-```markdown
-请总结以下对话历史，保留关键信息：
-- 用户的主要意图和目标
-- 已执行的操作和结果
-- 当前的代码状态
-- 待解决的问题
+### 5.3 关键调用链
 
-请用简洁的语言总结，作为后续对话的上下文。
+```text
+Agent Loop::run_turn()
+  -> ContextManager::record_items()    [context_manager/history.rs]
+    -> apply TruncationPolicy           [truncate.rs]
+    -> items.extend()
+  -> ContextManager::estimate_token_count() [history.rs:398]
+    -> approx_token_count()             [truncate.rs]
+    -> estimate_item_token_count()
+  -> [if needed] run_compact_task()     [compact.rs:64]
+    -> clone_history()
+    -> for_prompt() -> normalize_history() [normalize.rs]
+    -> drain_to_completed() -> LLM
+    -> 生成 Compaction 项
+  -> ContextManager::for_prompt()       [history.rs]
+    -> normalize_history()              [normalize.rs]
+    -> return items for Prompt
 ```
 
 ---
 
-## 5. 持久化存储
+## 6. 设计意图与 Trade-off
 
-### 5.1 历史持久化
+### 6.1 Codex 的选择
 
-对话历史通过 `RolloutRecorder` 以 JSON Lines 格式存储：
+| 维度 | Codex 的选择 | 替代方案 | 取舍分析 |
+|-----|-------------|---------|---------|
+| 存储方式 | 内存完整存储 | 数据库存储 (Gemini) / 文件映射 | 访问快，但受限于内存 |
+| Token 估算 | 字节启发式 | 精确 Tokenizer | 快速近似，但可能不准 |
+| 压缩策略 | 惰性压缩（触发式） | 实时压缩 (Gemini) | 减少压缩频率，但可能突增 |
+| 压缩粒度 | 整段历史摘要 | 逐条摘要 / 分层记忆 | 简单有效，但粒度粗 |
+| 持久化 | JSON Lines | 数据库 / 二进制 | 可读性好，但体积大 |
 
-```
-~/.codex/rollouts/
-└── {session_id}.jsonl
-```
+### 6.2 为什么这样设计？
 
-**RolloutItem 结构**（`protocol/src/protocol.rs`）：
-```rust
-pub struct RolloutItem {
-    pub id: String,
-    pub item: TurnItem,  // UserMessage, AssistantMessage, FunctionCall 等
-    pub timestamp: DateTime<Utc>,
-}
-```
+**核心问题**：如何在有限的上下文窗口内支持长对话？
 
-**格式示例**:
-```jsonl
-{"id":"msg_001","item":{"type":"user_message","content":"Hello"},"timestamp":"2024-01-20T10:00:00Z"}
-{"id":"msg_002","item":{"type":"assistant_message","content":"Hi!"},"timestamp":"2024-01-20T10:00:01Z"}
-{"id":"call_001","item":{"type":"function_call","name":"shell","arguments":"{\"cmd\": \"ls\"}"},"timestamp":"2024-01-20T10:00:02Z"}
-```
+**Codex 的解决方案**：
+- 代码依据：`compact.rs:64-120` 的渐进式压缩逻辑
+- 设计意图：优先保留完整信息，超限后智能摘要
+- 带来的好处：
+  - 短对话无压缩开销
+  - 长对话通过摘要保留关键信息
+  - 渐进式处理确保不丢失全部历史
+- 付出的代价：
+  - 压缩时机不可预测（触发式）
+  - 摘要可能丢失细节
+  - 压缩过程需要额外的 LLM 调用
 
-**恢复机制**：启动时通过 `resume_from_rollout()` 读取并重建历史。
+### 6.3 与其他项目的对比
 
-### 5.2 记忆系统 (Memory Trace)
-
-**文件**: `core/src/memory_trace.rs`
-
-codex 实现了基于 Trace 文件的记忆构建系统：
-
-```rust
-// core/src/memory_trace.rs:16-21
-pub struct BuiltMemory {
-    pub memory_id: String,
-    pub source_path: PathBuf,
-    pub raw_memory: String,
-    pub memory_summary: String,
-}
-```
-
-**功能**：从 trace 文件加载原始记录，使用 LLM 生成记忆摘要。
-
-| 阶段 | 处理方式 | 用途 |
-|------|---------|------|
-| Trace 加载 | 从文件系统读取原始 trace | 获取会话历史 |
-| 摘要生成 | 调用模型生成结构化摘要 | 构建长期记忆 |
-| 存储 | 持久化到指定路径 | 跨会话复用 |
-
-**构建流程**：
-```rust
-// core/src/memory_trace.rs:36-50
-pub async fn build_memories_from_trace_files(
-    client: &ModelClient,
-    trace_paths: &[PathBuf],
-    model_info: &ModelInfo,
-    effort: Option<ReasoningEffortConfig>,
-    otel_manager: &OtelManager,
-) -> Result<Vec<BuiltMemory>> {
-    // 1. 准备 trace 文件
-    // 2. 调用模型生成摘要
-    // 3. 返回 BuiltMemory 列表
-}
-```
-
-**模板支持**：
-- `templates/memories/stage_one_system.md` - 记忆生成系统提示
-- `templates/memories/stage_one_input.md` - 输入格式化模板
-- `templates/memories/consolidation.md` - 记忆合并模板
+| 项目 | 核心差异 | 适用场景 |
+|-----|---------|---------|
+| Codex | 惰性压缩 + 字节估算 | 通用场景，平衡性能与精度 |
+| Gemini CLI | 分层记忆 (Working/Short/Long) | 需要精细记忆管理的场景 |
+| Kimi CLI | Checkpoint 回滚 | 需要精确状态恢复的场景 |
+| OpenCode | 简单截断 | 资源受限的场景 |
 
 ---
 
-## 6. Token 管理策略
+## 7. 边界情况与错误处理
 
-### 6.1 截断策略 (TruncationPolicy)
+### 7.1 终止条件
 
-**文件**: `core/src/truncate.rs`
+| 终止原因 | 触发条件 | 代码位置 |
+|---------|---------|---------|
+| 历史为空 | 对话刚开始 | `history.rs:106` |
+| 压缩后仍超限 | 移除所有可移除项后仍超限 | `compact.rs` |
+| Token 估算溢出 | i64::MAX 上限 | `history.rs:398` |
+| 规范化后为空 | 所有项被过滤 | `normalize.rs` |
+
+### 7.2 截断策略
 
 ```rust
+// truncate.rs
 pub struct TruncationPolicy {
     pub max_output_bytes: usize,
     pub max_item_bytes: usize,
@@ -345,10 +611,10 @@ pub struct TruncationPolicy {
 
 impl TruncationPolicy {
     pub fn truncate_text(text: &str, max_bytes: usize) -> String {
-        // 保留开头和结尾，中间用 ... 省略
         if text.len() <= max_bytes {
             text.to_string()
         } else {
+            // 保留开头和结尾，中间用 ... 省略
             let head_len = max_bytes / 2;
             let tail_len = max_bytes - head_len - 3;
             format!("{}...{}", &text[..head_len], &text[text.len()-tail_len..])
@@ -357,62 +623,38 @@ impl TruncationPolicy {
 }
 ```
 
-### 6.2 上下文窗口管理
+### 7.3 错误恢复策略
 
-| 场景 | 处理方式 |
-|------|---------|
-| 正常情况 | 完整历史发送到模型 |
-| Token 接近上限 | 触发上下文压缩 |
-| 压缩后仍超出 | 移除最旧的历史项 |
-| 单条消息过长 | 应用截断策略 |
-
----
-
-## 7. 与 Agent Loop 的集成
-
-```text
-┌──────────────────────────────────────────────────────────────────────┐
-│                        Agent Loop                                     │
-│  ┌─────────────┐  ┌─────────────────┐  ┌─────────────────────────┐  │
-│  │  run_turn() │──▶│  ContextManager │──▶│  Prompt::for_prompt()   │  │
-│  └─────────────┘  └─────────────────┘  └─────────────────────────┘  │
-│         │                  │                        │               │
-│         │                  │                        ▼               │
-│         │                  │           ┌───────────────────────┐    │
-│         │                  │           │ normalize_history()   │    │
-│         │                  │           │ - 确保 call/output 配对│    │
-│         │                  │           │ - 移除孤立项          │    │
-│         │                  │           │ - 图片处理            │    │
-│         │                  │           └───────────────────────┘    │
-│         │                  │                        │               │
-│         ▼                  ▼                        ▼               │
-│  ┌───────────────────────────────────────────────────────────────┐ │
-│  │  Token 检查                                                     │ │
-│  │  if estimate_token_count() > threshold {                        │ │
-│  │      trigger_compaction();                                      │ │
-│  │  }                                                              │ │
-│  └───────────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────────────┘
-```
+| 错误类型 | 处理策略 | 代码位置 |
+|---------|---------|---------|
+| 上下文超限 | 触发压缩任务 | `agent_loop.rs` |
+| 压缩失败 | 移除最旧项重试 | `compact.rs` |
+| 孤儿 output | 移除孤立项 | `normalize.rs` |
+| 图片不支持 | 从消息中移除 | `normalize.rs` |
 
 ---
 
-## 8. 排障速查
+## 8. 关键代码索引
 
-| 问题 | 检查点 | 文件 |
-|------|-------|------|
-| 上下文丢失 | 检查 `normalize_history()` 的过滤逻辑 | `context_manager/normalize.rs` |
-| Token 估算不准 | 查看 `approx_token_count()` 实现 | `truncate.rs` |
-| 压缩失败 | 检查 `run_compact_task_inner()` 的重试逻辑 | `compact.rs` |
-| 历史未持久化 | 检查 `message_history.jsonl` 文件 | `session/persistence.rs` |
-| 图片丢失 | 检查 `strip_images_when_unsupported()` | `context_manager/normalize.rs` |
+| 功能 | 文件 | 行号 | 说明 |
+|-----|------|------|------|
+| 核心结构 | `context_manager/history.rs` | 106 | ContextManager 定义 |
+| Token 估算 | `context_manager/history.rs` | 398 | estimate_token_count |
+| 规范化 | `context_manager/normalize.rs` | - | ensure/remove/strip |
+| 压缩 | `compact.rs` | 64 | run_compact_task_inner |
+| 截断 | `truncate.rs` | - | TruncationPolicy |
+| 持久化 | `protocol/src/protocol.rs` | - | RolloutItem |
+| Token 计算 | `truncate.rs` | - | approx_token_count |
 
 ---
 
-## 9. 架构特点总结
+## 9. 延伸阅读
 
-- **双层存储**: 内存中的 `ContextManager` + 磁盘上的 JSONL 持久化
-- **字节启发式 Token 估算**: 快速但不精确的 Token 使用量估算
-- **惰性压缩**: 仅在接近上下文限制时触发压缩，而非实时压缩
-- **不变性保证**: 通过规范化确保 function call/output 配对完整性
-- **渐进式截断**: 从压缩到移除旧项的渐进式上下文缩减策略
+- 前置知识：`04-codex-agent-loop.md`
+- 相关机制：`05-codex-tools-system.md`（工具输出也进入历史）
+- 深度分析：`docs/codex/questions/codex-context-compaction.md`
+
+---
+
+*✅ Verified: 基于 codex/codex-rs/core/src/context_manager/ 源码分析*
+*基于版本：2026-02-08 | 最后更新：2026-02-24*
