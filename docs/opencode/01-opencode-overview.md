@@ -1,261 +1,597 @@
-# opencode 概述文档
+# OpenCode 概述
 
-## 1. 项目简介
+## TL;DR（结论先行）
 
-**opencode** 是一个多模型支持的 TypeScript/Bun CLI Agent，提供丰富的交互体验和可扩展的工具系统。
+**OpenCode** 是一个基于 TypeScript/Bun 的多模型 CLI Agent，采用 **流式事件驱动架构** 和 **Git 快照状态管理** 实现多轮对话与状态恢复。
 
-### 项目定位和目标
-- 多模型支持的通用 CLI Agent
-- 支持 OpenAI、Anthropic、Google、本地模型等多种提供商
-- 提供 TUI（终端用户界面）和 Web 两种交互模式
-- 强调可扩展性，支持插件系统和 MCP 协议
-- 基于 Git 的快照机制实现状态管理
-
-### 技术栈
-- **语言**: TypeScript
-- **运行时**: Bun
-- **核心依赖**:
-  - `yargs` - CLI 框架
-  - `ai` - Vercel AI SDK（多模型统一接口）
-  - `@libsql/client` - SQLite 数据库
-  - `zod` - 数据验证
-  - `ink` - React TUI 渲染
-
-### 官方仓库
-- https://github.com/opencode-ai/opencode
+OpenCode 的核心取舍：**Vercel AI SDK 流式处理 + Git Snapshot 状态管理**（对比 Kimi CLI 的 Checkpoint 文件回滚、Codex 的 Rust 原生沙箱）
 
 ---
 
-## 2. 架构概览
+## 1. 为什么需要这个架构？（解决什么问题）
 
-### 分层架构图
+### 1.1 问题场景
+
+没有统一架构的 CLI Agent 面临的问题：
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      CLI Layer                              │
-│  (opencode/packages/opencode/src/index.ts:1)               │
-│  ├─ yargs: 命令解析                                         │
-│  ├─ 全局中间件: 日志初始化、数据库迁移                        │
-│  └─ 子命令: run, tui, agent, models, etc                    │
-└─────────────────────────────────────────────────────────────┘
-                              │
-┌─────────────────────────────────────────────────────────────┐
-│                   Commands Layer                            │
-│  (opencode/packages/opencode/src/cli/cmd/)                 │
-│  ├─ run.ts - 运行任务                                       │
-│  ├─ tui/ - TUI 相关命令                                     │
-│  ├─ agent.ts - Agent 管理                                   │
-│  └─ ...                                                     │
-└─────────────────────────────────────────────────────────────┘
-                              │
-┌─────────────────────────────────────────────────────────────┐
-│                 Session Layer                               │
-│  (opencode/packages/opencode/src/session/)                 │
-│  ├─ session.ts - 会话管理                                   │
-│  ├─ processor.ts:26 - SessionProcessor                      │
-│  ├─ message-v2.ts - 消息类型                                │
-│  └─ llm.ts - 模型调用                                       │
-└─────────────────────────────────────────────────────────────┘
-                              │
-┌─────────────────────────────────────────────────────────────┐
-│                    Agent Layer                              │
-│  (opencode/packages/opencode/src/agent/)                   │
-│  ├─ agent.ts - Agent 定义                                   │
-│  ├─ runtime.ts - 运行时                                     │
-│  └─ loop.ts - 循环控制                                      │
-└─────────────────────────────────────────────────────────────┘
-                              │
-┌─────────────────────────────────────────────────────────────┐
-│                    Tools Layer                              │
-│  (opencode/packages/opencode/src/tool/)                    │
-│  ├─ tool.ts - 工具定义                                      │
-│  ├─ registry.ts - 工具注册表                                │
-│  └─ handlers/ - 工具实现                                    │
-└─────────────────────────────────────────────────────────────┘
-                              │
-┌─────────────────────────────────────────────────────────────┐
-│                  Snapshot Layer                             │
-│  (opencode/packages/opencode/src/snapshot/index.ts)        │
-│  ├─ Git 快照管理                                            │
-│  ├─ 状态持久化                                              │
-│  └─ 会话恢复                                                │
-└─────────────────────────────────────────────────────────────┘
+场景：用户要求"修复这个 bug"
+
+无统一架构：
+  → 手动调用 LLM API → 解析响应 → 手动执行工具 → 拼凑结果 → 易出错
+
+OpenCode 架构：
+  → SessionProcessor 接管全流程
+  → 流式响应自动分发到 UI/工具/存储
+  → Git 快照自动保存状态
+  → 支持随时恢复
 ```
 
-### 各层职责说明
+### 1.2 核心挑战
 
-| 层级 | 文件路径 | 核心职责 |
-|------|----------|----------|
-| CLI | `src/index.ts` | 入口、命令解析、全局初始化 |
-| Commands | `src/cli/cmd/` | 子命令实现 |
-| Session | `src/session/` | 会话管理、消息处理、流式响应 |
-| Agent | `src/agent/` | Agent 定义、运行时、循环控制 |
-| Tools | `src/tool/` | 工具注册、调度、执行 |
-| Snapshot | `src/snapshot/` | Git 快照、状态管理 |
-
-### 核心组件列表
-
-1. **SessionProcessor** (session/processor.ts:26) - 会话处理器
-2. **Agent** (agent/agent.ts) - Agent 定义
-3. **ToolRegistry** (tool/registry.ts) - 工具注册表
-4. **Snapshot** (snapshot/index.ts) - Git 快照
-5. **LLM** (session/llm.ts) - 模型调用封装
-6. **Bus** (bus.ts) - 事件总线
+| 挑战 | 不解决的后果 | OpenCode 方案 |
+|-----|-------------|--------------|
+| 多模型适配 | 每个模型需要单独集成 | Vercel AI SDK 统一接口 `opencode/packages/opencode/src/session/llm.ts:708` |
+| 流式响应处理 | 用户体验差，需等待完整响应 | 事件驱动流处理 `processor.ts:272` |
+| 状态持久化 | 崩溃后丢失对话历史 | SQLite + Git Snapshot `snapshot/index.ts:549` |
+| 工具执行安全 | 危险操作无控制 | 权限系统 + 审批机制 `permission/next.ts:452` |
 
 ---
 
-## 3. 入口与 CLI
+## 2. 整体架构（ASCII 图）
 
-### 入口文件路径
+### 2.1 在系统中的位置
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│ User Input (CLI / TUI / Web)                                │
+│ opencode/packages/opencode/src/index.ts:1                   │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ yargs 解析
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Commands Layer                                              │
+│ src/cli/cmd/                                                │
+│ ├─ run.ts    : 单次任务执行                                 │
+│ ├─ tui/      : 交互式终端界面                               │
+│ └─ agent.ts  : Agent 管理                                   │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ 创建 Session
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│ ▓▓▓ Session Layer ▓▓▓                                       │
+│ src/session/                                                │
+│ ├─ session.ts      : 会话 CRUD                              │
+│ ├─ processor.ts:26 : SessionProcessor 流处理核心            │
+│ ├─ llm.ts:708      : Vercel AI SDK 封装                     │
+│ └─ message-v2.ts   : 消息类型定义                           │
+└───────────────────────┬─────────────────────────────────────┘
+                        │
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│ Agent Layer  │ │ Tools Layer  │ │ Snapshot     │
+│ src/agent/   │ │ src/tool/    │ │ src/snapshot/│
+│ 运行时配置   │ │ 工具注册执行 │ │ Git 状态管理 │
+└──────────────┘ └──────────────┘ └──────────────┘
+                        │
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Storage Layer                                               │
+│ src/storage/                                                │
+│ ├─ db.ts       : SQLite 数据库 (libsql)                     │
+│ ├─ schema.ts   : Drizzle ORM 表定义                         │
+│ └─ migrations/ : 数据库迁移                                 │
+└─────────────────────────────────────────────────────────────┘
 ```
-opencode/packages/opencode/src/index.ts:1
+
+### 2.2 核心组件职责
+
+| 组件 | 职责 | 代码位置 |
+|-----|------|---------|
+| `SessionProcessor` | 流式响应处理、事件分发、工具协调 | `src/session/processor.ts:26` |
+| `Session` | 会话 CRUD、消息管理 | `src/session/session.ts:1` |
+| `LLM` | 多模型统一调用、流式接口封装 | `src/session/llm.ts:708` |
+| `ToolRegistry` | 工具注册、发现、Schema 生成 | `src/tool/registry.ts:1` |
+| `Snapshot` | Git 快照创建、恢复、状态追踪 | `src/snapshot/index.ts:549` |
+| `PermissionNext` | 权限检查、用户审批交互 | `src/permission/next.ts:452` |
+
+### 2.3 核心组件交互关系
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant CLI as CLI Entry
+    participant SP as SessionProcessor
+    participant LLM as LLM (Vercel AI)
+    participant T as ToolRegistry
+    participant S as Snapshot
+    participant DB as SQLite
+
+    U->>CLI: 输入任务
+    CLI->>SP: create({sessionID, assistantMessage})
+    Note over SP: processor.ts:26
+
+    SP->>LLM: stream({model, messages, tools})
+    Note over LLM: llm.ts:708
+    LLM-->>SP: 返回 fullStream
+
+    loop 流式事件处理
+        SP->>SP: for await (value of stream)
+        Note over SP: processor.ts:272
+
+        alt text-delta
+            SP->>DB: updatePartDelta(text)
+        else tool-call
+            SP->>T: execute(toolName, input)
+            T-->>SP: ToolResult
+        else finish-step
+            SP->>S: track() 创建快照
+            Note over S: snapshot/index.ts:549
+            S-->>SP: snapshotId
+        end
+    end
+
+    SP->>DB: 保存完整消息
+    SP-->>CLI: 处理完成
+    CLI-->>U: 显示结果
 ```
 
-### CLI 参数解析方式
+**关键交互说明**：
 
-使用 `yargs` 库进行命令解析：
+| 步骤 | 交互内容 | 设计意图 |
+|-----|---------|---------|
+| 1 | 用户通过 CLI 发起任务 | 统一入口，支持多种交互模式 |
+| 2 | SessionProcessor 创建 | 每个会话独立处理器，隔离状态 |
+| 3 | LLM.stream 发起流式请求 | Vercel AI SDK 统一多模型接口 |
+| 4-7 | 循环处理流事件 | 事件驱动架构，实时响应各类事件 |
+| 5 | 工具调用执行 | 动态发现并执行注册工具 |
+| 6 | finish-step 触发快照 | 每步完成自动保存 Git 状态 |
+| 8 | 持久化到 SQLite | 会话历史持久化存储 |
+
+---
+
+## 3. 核心组件详细分析
+
+### 3.1 SessionProcessor 内部结构
+
+#### 职责定位
+
+SessionProcessor 是 OpenCode 的核心协调器，负责 **流式响应的事件分发、工具执行协调、状态同步**。
+
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle: create()
+    Idle --> Streaming: LLM.stream()
+    Streaming --> Processing: 收到事件
+
+    Processing --> Processing: text-delta / reasoning-delta
+    Processing --> ToolExecuting: tool-call
+    Processing --> StepCompleted: finish-step
+
+    ToolExecuting --> Processing: tool-result
+    ToolExecuting --> Error: 执行失败
+
+    StepCompleted --> Streaming: 继续对话
+    StepCompleted --> Completed: 无更多工具调用
+
+    Error --> Idle: 错误恢复
+    Completed --> [*]: 保存会话
+
+    Streaming --> Error: 网络/模型错误
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Idle | 等待开始 | Processor 创建 | 调用 LLM.stream() |
+| Streaming | 流式接收中 | LLM 返回流 | 流结束或错误 |
+| Processing | 处理事件中 | 收到流事件 | 事件处理完成 |
+| ToolExecuting | 工具执行中 | 收到 tool-call | 收到 tool-result |
+| StepCompleted | 单步完成 | finish-step | 继续或结束 |
+| Completed | 全部完成 | 无更多工具调用 | 保存并退出 |
+| Error | 错误状态 | 异常发生 | 恢复或终止 |
+
+#### 内部数据流
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  输入层                                                      │
+│  ├── LLM Stream ──► 事件解析 ──► StreamEvent 对象           │
+│  └── AbortSignal ──► 取消检查 ──► 提前终止                  │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  处理层 (processor.ts:272 switch-case)                       │
+│  ├── "start"          : 设置 SessionStatus = busy           │
+│  ├── "text-delta"     : Session.updatePartDelta()           │
+│  ├── "tool-call"      : Session.updatePart() + 执行工具     │
+│  ├── "tool-result"    : Session.updatePart() 更新状态       │
+│  ├── "finish-step"    : Snapshot.track() 创建快照           │
+│  └── "error"          : 抛出异常                            │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  输出层                                                      │
+│  ├── 实时 UI 更新 (通过 Bus 事件)                            │
+│  ├── SQLite 持久化 (messages 表)                             │
+│  └── Git 快照 (snapshot 表)                                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 关键算法逻辑
+
+```mermaid
+flowchart TD
+    A[stream.forEach] --> B{value.type}
+
+    B -->|start| C[SessionStatus.set busy]
+    B -->|text-delta| D[updatePartDelta text]
+    B -->|reasoning-delta| E[updatePartDelta reasoning]
+
+    B -->|tool-call| F[创建 ToolPart]
+    F --> G[Tool.execute]
+    G --> H{执行结果}
+    H -->|成功| I[updatePart completed]
+    H -->|失败| J[updatePart error]
+
+    B -->|finish-step| K[Snapshot.track]
+    K --> L[保存 Git 状态]
+
+    B -->|error| M[抛出异常]
+
+    C --> N[继续循环]
+    D --> N
+    E --> N
+    I --> N
+    J --> N
+    L --> N
+
+    N --> A
+
+    style K fill:#90EE90
+    style F fill:#87CEEB
+    style M fill:#FFB6C1
+```
+
+**算法要点**：
+
+1. **事件驱动架构**：所有 LLM 响应通过统一的事件类型分发，便于扩展新事件类型
+2. **状态外置**：工具执行状态存储在 Session 中，而非 Processor 内存，支持恢复
+3. **快照自动触发**：finish-step 事件自动触发 Git 快照，无需手动干预
+
+#### 关键接口
+
+| 接口 | 输入 | 输出 | 说明 | 代码位置 |
+|-----|------|------|------|---------|
+| `create()` | sessionID, assistantMessage, model, abort | Processor 实例 | 创建处理器 | `processor.ts:26` |
+| `process()` | StreamInput | Promise<void> | 核心处理方法 | `processor.ts:45` |
+| `abort` | AbortSignal | - | 取消信号 | 构造参数 |
+
+---
+
+### 3.2 Snapshot 组件内部结构
+
+#### 职责定位
+
+Snapshot 基于 Git 实现状态快照，支持 **会话级别的代码状态保存与恢复**。
+
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Clean: 初始化
+    Clean --> Tracking: track() 调用
+
+    Tracking --> Captured: git diff + rev-parse
+    Captured --> Saved: 写入 SQLite
+    Saved --> [*]: 返回 snapshotId
+
+    Saved --> Restoring: restore() 调用
+    Restoring --> Restored: git apply
+    Restored --> Clean: 状态恢复
+
+    Captured --> Error: Git 命令失败
+    Saved --> Error: 数据库写入失败
+    Restoring --> Error: 快照不存在
+```
+
+#### 关键接口
+
+| 接口 | 输入 | 输出 | 说明 | 代码位置 |
+|-----|------|------|------|---------|
+| `track()` | - | Promise<string> | 创建快照 | `snapshot/index.ts:549` |
+| `restore()` | snapshotId: string | Promise<void> | 恢复快照 | `snapshot/index.ts:564` |
+
+---
+
+### 3.3 组件间协作时序
+
+展示完整的一次对话处理流程：
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant Run as RunCommand
+    participant S as Session
+    participant SP as SessionProcessor
+    participant LLM as LLM Service
+    participant T as Tool
+    participant Snap as Snapshot
+    participant DB as Database
+
+    U->>Run: opencode run "fix bug"
+    activate Run
+
+    Run->>S: Session.create()
+    activate S
+    S->>DB: INSERT sessions
+    DB-->>S: sessionId
+    S-->>Run: Session 对象
+    deactivate S
+
+    Run->>SP: SessionProcessor.create()
+    activate SP
+    SP-->>Run: Processor 实例
+
+    Run->>SP: process({messages, tools})
+
+    SP->>LLM: streamText()
+    activate LLM
+    LLM-->>SP: AsyncIterable<StreamEvent>
+
+    loop 流式事件
+        SP->>SP: 读取事件
+
+        alt text-delta
+            SP->>DB: UPDATE messages SET parts
+        else tool-call
+            SP->>T: execute()
+            activate T
+            T-->>SP: ToolResult
+            deactivate T
+            SP->>DB: UPDATE tool state
+        else finish-step
+            SP->>Snap: track()
+            activate Snap
+            Snap->>Snap: git diff
+            Snap->>Snap: git rev-parse HEAD
+            Snap->>DB: INSERT snapshots
+            DB-->>Snap: snapshotId
+            Snap-->>SP: snapshotId
+            deactivate Snap
+        end
+    end
+
+    LLM-->>SP: 流结束
+    deactivate LLM
+
+    SP-->>Run: 处理完成
+    deactivate SP
+
+    Run-->>U: 显示结果
+    deactivate Run
+```
+
+**协作要点**：
+
+1. **RunCommand 与 Session**：命令负责会话生命周期，Session 负责数据持久化
+2. **SessionProcessor 与 LLM**：Processor 消费流，LLM 模块只负责发起请求
+3. **工具执行**：工具在独立上下文中执行，结果通过事件回流
+4. **Snapshot 触发**：每步完成自动触发，与主流程解耦
+
+---
+
+### 3.4 关键数据路径
+
+#### 主路径（正常流程）
+
+```mermaid
+flowchart LR
+    subgraph Input["输入阶段"]
+        I1[用户输入] --> I2[yargs 解析]
+        I2 --> I3[创建 Session]
+    end
+
+    subgraph Process["处理阶段"]
+        P1[LLM.stream] --> P2[事件循环]
+        P2 --> P3[工具执行]
+        P3 --> P4[Snapshot.track]
+    end
+
+    subgraph Output["输出阶段"]
+        O1[UI 更新] --> O2[SQLite 保存]
+        O2 --> O3[Git 快照]
+    end
+
+    I3 --> P1
+    P4 --> O1
+
+    style Process fill:#e1f5e1,stroke:#333
+```
+
+#### 异常路径（错误恢复）
+
+```mermaid
+flowchart TD
+    E[发生错误] --> E1{错误类型}
+
+    E1 -->|网络错误| R1[重试机制]
+    E1 -->|工具失败| R2[返回错误结果]
+    E1 -->|用户取消| R3[清理资源]
+    E1 -->|严重错误| R4[记录并退出]
+
+    R1 --> R1A[指数退避重试]
+    R1A -->|成功| R1B[继续主路径]
+    R1A -->|失败| R4
+
+    R2 --> R2A[updatePart error]
+    R2A --> R2B[LLM 接收错误结果]
+
+    R3 --> R3A[abort.throwIfAborted]
+    R3A --> R3B[提前退出循环]
+
+    R4 --> R4A[Log.error]
+    R4A --> R4B[退出进程]
+
+    R1B --> End[结束]
+    R2B --> End
+    R3B --> End
+
+    style R1 fill:#90EE90
+    style R2 fill:#FFD700
+    style R4 fill:#FF6B6B
+```
+
+---
+
+## 4. 端到端数据流转
+
+### 4.1 正常流程（详细版）
+
+```mermaid
+sequenceDiagram
+    participant CLI as CLI Entry
+    participant Cmd as RunCommand
+    participant S as Session
+    participant SP as SessionProcessor
+    participant LLM as LLM (Vercel AI)
+    participant Tool as Tool.execute
+    participant Snap as Snapshot
+    participant DB as SQLite
+
+    CLI->>Cmd: 执行 run 命令
+    Cmd->>S: create({name, agent})
+    S->>DB: INSERT sessions
+    DB-->>S: sessionId
+    S-->>Cmd: Session 对象
+
+    Cmd->>SP: create({sessionID, assistantMessage, model, abort})
+    SP-->>Cmd: { process }
+
+    Cmd->>SP: process({messages, tools, abort})
+
+    SP->>LLM: streamText({model, messages, tools})
+    LLM-->>SP: ReadableStream
+
+    Note over SP: 事件循环开始
+
+    SP->>SP: event: "start"
+    SP->>DB: SessionStatus.set(busy)
+
+    SP->>SP: event: "text-delta"
+    SP->>DB: updatePartDelta(text)
+
+    SP->>SP: event: "tool-call"
+    SP->>DB: updatePart({type: "tool", state: running})
+    SP->>Tool: execute(args, context)
+    Tool-->>SP: {output, attachments}
+
+    SP->>SP: event: "tool-result"
+    SP->>DB: updatePart({state: completed, output})
+
+    SP->>SP: event: "finish-step"
+    SP->>Snap: track()
+    Snap->>Snap: git diff + rev-parse HEAD
+    Snap->>DB: INSERT snapshots
+    DB-->>Snap: snapshotId
+
+    SP->>SP: event: "finish"
+    SP->>DB: UPDATE messages SET finish, usage
+
+    SP-->>Cmd: Promise.resolve()
+    Cmd-->>CLI: 退出
+```
+
+**数据变换详情**：
+
+| 阶段 | 输入 | 处理 | 输出 | 代码位置 |
+|-----|------|------|------|---------|
+| 接收 | 用户文本 | yargs 解析 | 结构化命令 | `src/index.ts:47` |
+| 会话创建 | 命令参数 | Session.create | Session 对象 | `src/session/session.ts:1` |
+| 流处理 | StreamInput | LLM.stream | AsyncIterable | `src/session/llm.ts:708` |
+| 事件分发 | StreamEvent | switch-case | 副作用执行 | `src/session/processor.ts:272` |
+| 快照创建 | Git 状态 | track() | snapshotId | `src/snapshot/index.ts:549` |
+| 持久化 | 消息数据 | SQLite INSERT/UPDATE | 持久化记录 | `src/storage/schema.ts` |
+
+### 4.2 数据流向图
+
+```mermaid
+flowchart LR
+    subgraph Input["输入阶段"]
+        I1[CLI 参数] --> I2[yargs 解析]
+        I2 --> I3[Session 创建]
+    end
+
+    subgraph Process["处理阶段"]
+        P1[LLM.stream] --> P2[事件循环]
+        P2 --> P3[工具执行]
+        P2 --> P4[UI 更新]
+        P3 --> P5[Snapshot]
+    end
+
+    subgraph Output["输出阶段"]
+        O1[终端显示] --> O2[SQLite 存储]
+        O2 --> O3[Git 快照]
+    end
+
+    I3 --> P1
+    P4 --> O1
+    P5 --> O3
+
+    style Process fill:#f9f,stroke:#333
+```
+
+### 4.3 异常/边界流程
+
+```mermaid
+flowchart TD
+    A[开始处理] --> B{检查 abort}
+    B -->|已取消| C[抛出 AbortError]
+    B -->|继续| D[调用 LLM.stream]
+
+    D --> E{流读取}
+    E -->|正常事件| F[处理事件]
+    E -->|error 事件| G[抛出异常]
+    E -->|流中断| H[网络错误]
+
+    F --> I{事件类型}
+    I -->|tool-call| J[执行工具]
+    J -->|失败| K[ToolResult error]
+    K --> L[updatePart error]
+
+    I -->|其他| M[正常处理]
+
+    G --> N[错误处理]
+    H --> N
+    C --> N
+
+    N --> O{可恢复?}
+    O -->|是| P[重试]
+    O -->|否| Q[返回错误]
+
+    P --> D
+    L --> E
+    M --> E
+    Q --> R[结束]
+
+    style J fill:#87CEEB
+    style K fill:#FFB6C1
+    style Q fill:#FFD700
+```
+
+---
+
+## 5. 关键代码实现
+
+### 5.1 核心数据结构
 
 ```typescript
-// src/index.ts:47
-const cli = yargs(hideBin(process.argv))
-  .parserConfiguration({ "populate--": true })
-  .scriptName("opencode")
-  .wrap(100)
-  .help("help", "show help")
-  .alias("help", "h")
-  .version("version", "show version number", Installation.VERSION)
-  .alias("version", "v")
-  .option("print-logs", {
-    describe: "print logs to stderr",
-    type: "boolean",
-  })
-  .option("log-level", {
-    describe: "log level",
-    type: "string",
-    choices: ["DEBUG", "INFO", "WARN", "ERROR"],
-  })
-  .middleware(async (opts) => {
-    // 全局中间件: 初始化日志、数据库迁移
-    await Log.init({ ... });
-    await JsonMigration.run(Database.Client().$client, ...);
-  })
-  .command(AcpCommand)
-  .command(McpCommand)
-  .command(TuiThreadCommand)
-  .command(RunCommand)
-  // ... 更多命令
-```
-
-### 启动流程
-
-```
-src/index.ts:1
-       │
-       ├─ 注册全局错误处理
-       │   ├─ unhandledRejection
-       │   └─ uncaughtException
-       │
-       ▼
-yargs 解析
-       │
-       ├─ 执行全局中间件
-       │   ├─ Log.init()
-       │   └─ 数据库迁移
-       │
-       ├─ 匹配子命令
-       │   ├─ "run" ──▶ RunCommand
-       │   ├─ "tui" ──▶ TuiThreadCommand
-       │   ├─ "agent" ──▶ AgentCommand
-       │   └─ ...
-       │
-       └─ 无子命令 ──▶ 显示帮助/Logo
-```
-
----
-
-## 4. Agent 循环机制
-
-### 主循环代码位置
-
-```
-opencode/packages/opencode/src/session/processor.ts:26
-opencode/packages/opencode/src/agent/loop.ts
-```
-
-### 流程图（文本形式）
-
-```
-┌─────────────────┐
-│ RunCommand /    │
-│ TuiThreadCommand│
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ Session.create  │
-│ 创建会话        │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ Agent.create    │
-│ 创建 Agent      │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────────────────────────┐
-│       主循环                         │
-│                                     │
-│  ┌───────────────────────────────┐  │
-│  │ 等待用户输入 / 任务            │  │
-│  └───────────────┬───────────────┘  │
-│                  │                  │
-│                  ▼                  │
-│  ┌───────────────────────────────┐  │
-│  │ SessionProcessor.create()     │  │  ──▶ processor.ts:26
-│  │                               │  │
-│  │ 1. 创建 assistantMessage      │  │
-│  │ 2. LLM.stream() 发起流式请求  │  │
-│  │ 3. process() 处理流           │  │  ──▶ processor.ts:45
-│  │                               │  │
-│  └───────────────────────────────┘  │
-│                  │                  │
-│                  ▼                  │
-│  ┌───────────────────────────────┐  │
-│  │ process() 循环                │  │
-│  │                               │  │
-│  │ while (true) {                │  │
-│  │   ┌───────────────────────┐   │  │
-│  │   │ 读取流事件             │   │  │
-│  │   │ switch (value.type) { │   │  │
-│  │   │   case "text-delta":  │   │  │
-│  │   │     显示文本           │   │  │
-│  │   │   case "tool-call":   │   │  │
-│  │   │     执行工具           │   │  │
-│  │   │   case "tool-result": │   │  │
-│  │   │     发送结果到模型     │   │  │
-│  │   │   case "finish-step": │   │  │
-│  │   │     创建 Snapshot      │   │  │
-│  │   │ }                      │   │  │
-│  │   └───────────────────────┘   │  │
-│  │ }                             │  │
-│  │                               │  │
-│  └───────────────────────────────┘  │
-│                  │                  │
-│                  ▼                  │
-│  ┌───────────────────────────────┐  │
-│  │ 保存 Session                  │  │
-│  │ 等待下一轮输入                │  │
-│  └───────────────────────────────┘  │
-│                                     │
-└─────────────────────────────────────┘
-```
-
-### 单次循环的执行步骤
-
-**SessionProcessor.create()** (processor.ts:26):
-
-```typescript
+// opencode/packages/opencode/src/session/processor.ts:26-50
 export function create(input: {
   assistantMessage: MessageV2.Assistant;
   sessionID: string;
@@ -268,811 +604,225 @@ export function create(input: {
   return {
     async process(streamInput: LLM.StreamInput) {
       const stream = await LLM.stream(streamInput);
-
-      for await (const value of stream.fullStream) {
-        input.abort.throwIfAborted();
-
-        switch (value.type) {
-          case "start":
-            SessionStatus.set(input.sessionID, { type: "busy" });
-            break;
-
-          case "text-delta":
-            // 累积文本
-            await Session.updatePartDelta({
-              sessionID: input.sessionID,
-              messageID: input.assistantMessage.id,
-              partID: part.id,
-              field: "text",
-              delta: value.text,
-            });
-            break;
-
-          case "tool-call": {
-            // 创建工具调用部分
-            const part = await Session.updatePart({
-              type: "tool",
-              tool: value.toolName,
-              callID: value.id,
-              state: { status: "running", input: value.input },
-            });
-            toolcalls[value.toolCallId] = part as MessageV2.ToolPart;
-            break;
-          }
-
-          case "tool-result": {
-            // 更新工具结果
-            const match = toolcalls[value.toolCallId];
-            await Session.updatePart({
-              ...match,
-              state: {
-                status: "completed",
-                input: value.input,
-                output: value.output.output,
-              },
-            });
-            delete toolcalls[value.toolCallId];
-            break;
-          }
-
-          case "finish-step":
-            // 创建快照
-            snapshot = await Snapshot.track();
-            break;
-        }
-      }
+      // ... 处理逻辑
     },
   };
 }
 ```
 
-### 循环终止条件
+**字段说明**：
+| 字段 | 类型 | 用途 |
+|-----|------|------|
+| `assistantMessage` | `MessageV2.Assistant` | 当前助手消息对象 |
+| `sessionID` | `string` | 会话唯一标识 |
+| `model` | `Provider.Model` | 使用的 AI 模型 |
+| `abort` | `AbortSignal` | 取消信号 |
+| `toolcalls` | `Record<string, ToolPart>` | 追踪进行中的工具调用 |
+| `snapshot` | `string` | 当前步骤的快照 ID |
 
-- **完成响应** - 模型返回完整响应，无更多工具调用
-- **用户中断** - abort 信号触发
-- **错误发生** - 网络错误、模型错误等
-- **Snapshot 失败** - 无法创建快照（可选）
-
----
-
-## 5. 工具系统
-
-### 工具定义方式
-
-```typescript
-// opencode/packages/opencode/src/tool/tool.ts
-import { z } from "zod";
-
-export interface Tool {
-  name: string;
-  description: string;
-  parameters: z.ZodTypeAny;
-  execute: (args: unknown, context: ToolContext) => Promise<ToolResult>;
-}
-
-export interface ToolResult {
-  output: string;
-  metadata?: Record<string, unknown>;
-  title?: string;
-  attachments?: Attachment[];
-}
-
-export interface ToolContext {
-  sessionID: string;
-  agent: Agent;
-  permission: PermissionManager;
-}
-```
-
-### 工具注册表位置
-
-```
-opencode/packages/opencode/src/tool/registry.ts
-```
+### 5.2 主链路代码
 
 ```typescript
-export class ToolRegistry {
-  private tools: Map<string, Tool> = new Map();
-
-  register(tool: Tool): void {
-    this.tools.set(tool.name, tool);
-  }
-
-  get(name: string): Tool | undefined {
-    return this.tools.get(name);
-  }
-
-  list(): Tool[] {
-    return Array.from(this.tools.values());
-  }
-
-  getToolDefinitions(): ToolDefinition[] {
-    return this.list().map((tool) => ({
-      type: "function" as const,
-      function: {
-        name: tool.name,
-        description: tool.description,
-        parameters: zodToJsonSchema(tool.parameters),
-      },
-    }));
-  }
-}
-
-// 全局注册表实例
-export const registry = new ToolRegistry();
-```
-
-### 工具执行流程
-
-```
-模型返回 tool-call 事件
-       │
-       ▼
-┌─────────────────┐
-│ SessionProcessor│
-│ process()       │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ 创建 ToolPart   │
-│ 状态: pending   │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ 执行工具        │
-│ Tool.execute()  │
-└────────┬────────┘
-         │
-    ┌────┴────┐
-    ▼         ▼
-┌────────┐  ┌─────────────┐
-│ 成功   │  │ 失败        │
-└───┬────┘  └─────────────┘
-    │            │
-    ▼            ▼
-┌─────────────────┐  ┌─────────────────┐
-│ 状态: completed │  │ 状态: error     │
-│ 发送 tool-result│  │ 发送 tool-error │
-└────────┬────────┘  └─────────────────┘
-         │
-         ▼
-┌─────────────────┐
-│ 继续流式响应    │
-│ (模型接收结果)  │
-└─────────────────┘
-```
-
-### 审批机制
-
-```typescript
-// opencode/packages/opencode/src/permission/next.ts
-export namespace PermissionNext {
-  export async function ask(input: {
-    permission: string;
-    patterns: string[];
-    sessionID: string;
-    metadata?: Record<string, unknown>;
-    always?: string[];
-    ruleset: PermissionRuleset;
-  }): Promise<void> {
-    // 检查规则集
-    if (ruleset.isAllowed(input.permission, input.patterns)) {
-      return; // 自动批准
-    }
-
-    // 检查 "always" 列表
-    if (input.always?.includes(input.patterns[0])) {
-      return; // 自动批准
-    }
-
-    // 显示审批请求
-    const response = await promptUser({
-      type: "permission",
-      permission: input.permission,
-      metadata: input.metadata,
-    });
-
-    if (!response.approved) {
-      throw new RejectedError(`Permission denied: ${input.permission}`);
-    }
-  }
-
-  export class RejectedError extends Error {
-    constructor(message: string) {
-      super(message);
-      this.name = "RejectedError";
-    }
-  }
-}
-```
-
----
-
-## 6. 状态管理
-
-### Session 状态存储位置
-
-```
-opencode/packages/opencode/src/session/session.ts
-opencode/packages/opencode/src/storage/db.ts
-```
-
-```typescript
-// session/session.ts
-export interface Session {
-  id: string;
-  name: string;
-  agent: string;
-  createdAt: Date;
-  updatedAt: Date;
-  messages: MessageV2[];
-  metadata?: SessionMetadata;
-}
-
-// storage/db.ts - SQLite 数据库
-export const Database = {
-  Client() {
-    return createClient({
-      url: `file:${Global.Path.data}/opencode.db`,
-    });
-  },
-};
-
-// Drizzle ORM 定义
-export const sessions = sqliteTable("sessions", {
-  id: text("id").primaryKey(),
-  name: text("name").notNull(),
-  agent: text("agent").notNull(),
-  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
-  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
-});
-
-export const messages = sqliteTable("messages", {
-  id: text("id").primaryKey(),
-  sessionId: text("session_id").references(() => sessions.id),
-  role: text("role").notNull(), // user, assistant, system, tool
-  content: text("content"),
-  parts: text("parts", { mode: "json" }), // MessageV2 parts
-  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
-});
-```
-
-### Checkpoint 机制
-
-**Git Snapshot**:
-
-```typescript
-// opencode/packages/opencode/src/snapshot/index.ts
-export namespace Snapshot {
-  export async function track(): Promise<string> {
-    // 获取当前 Git 状态
-    const snapshot = await createSnapshot();
-
-    // 保存到数据库
-    await db.insert(snapshots).values({
-      id: snapshot.id,
-      hash: snapshot.hash,
-      diff: snapshot.diff,
-      createdAt: new Date(),
-    });
-
-    return snapshot.id;
-  }
-
-  export async function restore(snapshotId: string): Promise<void> {
-    const snapshot = await db.query.snapshots.findFirst({
-      where: eq(snapshots.id, snapshotId),
-    });
-
-    if (!snapshot) {
-      throw new Error(`Snapshot not found: ${snapshotId}`);
-    }
-
-    // 应用 Git 补丁
-    await applySnapshot(snapshot);
-  }
-
-  async function createSnapshot() {
-    // 获取 Git diff
-    const diff = await $`git diff`.text();
-
-    // 获取当前 HEAD
-    const hash = await $`git rev-parse HEAD`.text();
-
-    return {
-      id: generateId(),
-      hash: hash.trim(),
-      diff,
-    };
-  }
-}
-```
-
-### 历史记录管理
-
-**MessageV2 结构**:
-
-```typescript
-// opencode/packages/opencode/src/session/message-v2.ts
-export namespace MessageV2 {
-  export interface Base {
-    id: string;
-    sessionID: string;
-    agent?: string;
-    createdAt: Date;
-    updatedAt: Date;
-  }
-
-  export interface User extends Base {
-    role: "user";
-    content: string | ContentPart[];
-  }
-
-  export interface Assistant extends Base {
-    role: "assistant";
-    parts: Part[];
-    finish?: FinishReason;
-    usage?: TokenUsage;
-  }
-
-  export type Part =
-    | TextPart
-    | ReasoningPart
-    | ToolPart
-    | StepStartPart;
-
-  export interface ToolPart {
-    id: string;
-    type: "tool";
-    tool: string;
-    callID: string;
-    state: ToolState;
-    metadata?: Record<string, unknown>;
-  }
-
-  export interface ToolState {
-    status: "pending" | "running" | "completed" | "error";
-    input: Record<string, unknown>;
-    output?: string;
-    error?: string;
-    time?: { start: number; end?: number };
-    attachments?: Attachment[];
-  }
-}
-```
-
-### 状态恢复方式
-
-```typescript
-// 恢复会话
-export async function resumeSession(sessionId: string): Promise<Session> {
-  // 从数据库加载会话
-  const session = await db.query.sessions.findFirst({
-    where: eq(sessions.id, sessionId),
-    with: {
-      messages: true,
-    },
-  });
-
-  if (!session) {
-    throw new Error(`Session not found: ${sessionId}`);
-  }
-
-  // 恢复消息
-  const messages = session.messages.map((m) => ({
-    ...m,
-    parts: m.parts ? JSON.parse(m.parts) : undefined,
-  }));
-
-  return {
-    ...session,
-    messages,
-  };
-}
-```
-
----
-
-## 7. 模型调用方式
-
-### 支持的模型提供商
-
-通过 Vercel AI SDK 支持多种提供商：
-
-- **OpenAI** - GPT-4, GPT-3.5
-- **Anthropic** - Claude 系列
-- **Google** - Gemini 系列
-- **本地模型** - Ollama, LM Studio 等
-- **其他** - 任何兼容 OpenAI API 的提供商
-
-### 模型调用封装位置
-
-```
-opencode/packages/opencode/src/session/llm.ts
-```
-
-```typescript
-import { streamText, generateText } from "ai";
-
-export namespace LLM {
-  export interface StreamInput {
-    model: Provider.Model;
-    messages: CoreMessage[];
-    tools?: ToolDefinition[];
-    abort: AbortSignal;
-  }
-
-  export async function stream(input: StreamInput) {
-    const result = streamText({
-      model: input.model,
-      messages: input.messages,
-      tools: input.tools,
-      abortSignal: input.abort,
-      // 多步推理（工具循环）
-      maxSteps: 10,
-      // 工具执行函数
-      experimental_activeTools: input.tools?.map((t) => t.function.name),
-    });
-
-    return {
-      fullStream: result.fullStream,
-      text: result.text,
-      usage: result.usage,
-    };
-  }
-
-  export async function generate(input: Omit<StreamInput, "abort">) {
-    const result = await generateText({
-      model: input.model,
-      messages: input.messages,
-      tools: input.tools,
-    });
-
-    return {
-      text: result.text,
-      toolCalls: result.toolCalls,
-      usage: result.usage,
-    };
-  }
-}
-```
-
-### 流式响应处理
-
-```typescript
-// processor.ts 中的流处理
-const stream = await LLM.stream(streamInput);
-
+// opencode/packages/opencode/src/session/processor.ts:272-327
 for await (const value of stream.fullStream) {
+  input.abort.throwIfAborted();
+
   switch (value.type) {
     case "start":
       SessionStatus.set(input.sessionID, { type: "busy" });
       break;
 
-    case "reasoning-start":
-      // 创建推理部分
-      const reasoningPart = {
-        id: Identifier.ascending("part"),
-        type: "reasoning" as const,
-        text: "",
-        time: { start: Date.now() },
-      };
-      reasoningMap[value.id] = reasoningPart;
-      await Session.updatePart(reasoningPart);
+    case "text-delta":
+      await Session.updatePartDelta({
+        sessionID: input.sessionID,
+        messageID: input.assistantMessage.id,
+        partID: part.id,
+        field: "text",
+        delta: value.text,
+      });
       break;
 
-    case "reasoning-delta":
-      // 累积推理文本
-      if (value.id in reasoningMap) {
-        const part = reasoningMap[value.id];
-        part.text += value.text;
-        await Session.updatePartDelta({
-          sessionID: part.sessionID,
-          messageID: part.messageID,
-          partID: part.id,
-          field: "text",
-          delta: value.text,
-        });
-      }
-      break;
-
-    case "tool-input-start":
-      // 工具调用开始
+    case "tool-call": {
       const part = await Session.updatePart({
         type: "tool",
         tool: value.toolName,
         callID: value.id,
-        state: { status: "pending", input: {}, raw: "" },
+        state: { status: "running", input: value.input },
       });
-      toolcalls[value.id] = part as MessageV2.ToolPart;
+      toolcalls[value.toolCallId] = part as MessageV2.ToolPart;
       break;
+    }
 
-    case "tool-call":
-      // 执行工具
+    case "tool-result": {
       const match = toolcalls[value.toolCallId];
       await Session.updatePart({
         ...match,
-        state: { status: "running", input: value.input, time: { start: Date.now() } },
-      });
-
-      // Doom loop 检测
-      await checkDoomLoop(toolcalls, value);
-      break;
-
-    case "tool-result":
-      // 工具结果
-      const toolPart = toolcalls[value.toolCallId];
-      await Session.updatePart({
-        ...toolPart,
         state: {
           status: "completed",
           input: value.input,
           output: value.output.output,
-          time: { start: toolPart.state.time.start, end: Date.now() },
         },
       });
       delete toolcalls[value.toolCallId];
       break;
+    }
 
     case "finish-step":
-      // 步骤完成，创建快照
       snapshot = await Snapshot.track();
       break;
-
-    case "error":
-      throw value.error;
   }
 }
 ```
 
-### Token 管理
+**代码要点**：
+1. **事件驱动架构**：通过 switch-case 处理不同类型的流事件，扩展性强
+2. **取消检查**：每次循环检查 abort 信号，支持用户中断
+3. **工具状态追踪**：使用 toolcalls Map 追踪进行中的工具调用
+4. **自动快照**：finish-step 自动触发 Git 快照保存
+
+### 5.3 关键调用链
+
+```text
+RunCommand.execute()          [src/cli/cmd/run.ts:1]
+  -> Session.create()         [src/session/session.ts:1]
+    -> Database.insert()      [src/storage/db.ts:1]
+  -> SessionProcessor.create() [src/session/processor.ts:26]
+    -> process()              [src/session/processor.ts:45]
+      -> LLM.stream()         [src/session/llm.ts:708]
+        - streamText()        [Vercel AI SDK]
+      -> for await (event)    [processor.ts:272]
+        - Session.updatePartDelta()  [session.ts]
+        - Tool.execute()      [src/tool/handlers/]
+        - Snapshot.track()    [src/snapshot/index.ts:549]
+```
+
+---
+
+## 6. 设计意图与 Trade-off
+
+### 6.1 OpenCode 的选择
+
+| 维度 | OpenCode 的选择 | 替代方案 | 取舍分析 |
+|-----|----------------|---------|---------|
+| 流式处理 | Vercel AI SDK 事件流 | 自定义 SSE 解析 | 标准化接口，但依赖第三方库演进 |
+| 状态管理 | Git Snapshot | 内存快照 / 文件备份 | 精确追踪代码变更，但依赖 Git 环境 |
+| 数据存储 | SQLite (libsql) | JSON 文件 / 内存 | 结构化查询，但需要数据库迁移 |
+| 架构模式 | 事件驱动 | 回调函数 / Promise 链 | 解耦组件，但调试复杂度增加 |
+| UI 渲染 | Ink (React TUI) | 原生终端输出 | 组件化开发，但运行时开销 |
+
+### 6.2 为什么这样设计？
+
+**核心问题**：如何在多模型支持下实现流畅的交互体验和可靠的状态管理？
+
+**OpenCode 的解决方案**：
+- **代码依据**：`src/session/processor.ts:272`
+- **设计意图**：通过 Vercel AI SDK 统一多模型接口，使用事件驱动架构解耦流处理与 UI 更新
+- **带来的好处**：
+  - 支持 OpenAI、Anthropic、Google 等多种模型无需修改核心逻辑
+  - 流式响应实时显示，用户体验好
+  - 组件间通过事件解耦，便于测试和扩展
+- **付出的代价**：
+  - 引入外部依赖，版本升级可能带来 breaking changes
+  - 事件驱动调试困难，需要完善的日志系统
+
+### 6.3 与其他项目的对比
+
+```mermaid
+gitGraph
+    commit id: "传统 CLI 工具"
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "Vercel AI SDK + Git Snapshot"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "Checkpoint 文件回滚"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "Rust 沙箱 + CancellationToken"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "递归 Continuation"
+```
+
+| 项目 | 核心差异 | 适用场景 |
+|-----|---------|---------|
+| OpenCode | Vercel AI SDK 流式处理 + Git 快照 | 多模型支持、TypeScript 生态 |
+| Kimi CLI | Checkpoint 文件级回滚、D-Mail 机制 | 需要精确对话回滚的场景 |
+| Codex | Rust 原生沙箱、CancellationToken | 企业级安全要求 |
+| Gemini CLI | 递归 continuation、分层记忆 | 复杂状态管理、UX 优先 |
+
+---
+
+## 7. 边界情况与错误处理
+
+### 7.1 终止条件
+
+| 终止原因 | 触发条件 | 代码位置 |
+|---------|---------|---------|
+| 正常完成 | LLM 返回 finish 事件且无工具调用 | `processor.ts:272` |
+| 用户取消 | AbortSignal 触发 | `processor.ts:273` |
+| 工具失败 | Tool.execute 抛出异常 | `tool/handlers/*.ts` |
+| 网络错误 | LLM.stream 失败 | `llm.ts:708` |
+| 快照失败 | Git 命令执行失败 | `snapshot/index.ts:549` |
+
+### 7.2 超时/资源限制
 
 ```typescript
-// opencode/packages/opencode/src/session/usage.ts
-export function getUsage(input: {
-  model: Provider.Model;
-  usage?: LanguageModelUsage;
-  metadata?: Record<string, unknown>;
-}): TokenUsage {
-  return {
-    promptTokens: input.usage?.promptTokens ?? 0,
-    completionTokens: input.usage?.completionTokens ?? 0,
-    totalTokens: input.usage?.totalTokens ?? 0,
-    // 计算成本
-    cost: calculateCost(input.model, input.usage),
-  };
-}
-
-// 存储使用统计
-export const usage = sqliteTable("usage", {
-  id: text("id").primaryKey(),
-  sessionId: text("session_id").references(() => sessions.id),
-  messageId: text("message_id").references(() => messages.id),
-  promptTokens: integer("prompt_tokens").notNull(),
-  completionTokens: integer("completion_tokens").notNull(),
-  totalTokens: integer("total_tokens").notNull(),
-  cost: real("cost"),
-  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+// opencode/packages/opencode/src/session/llm.ts:714
+const result = streamText({
+  model: input.model,
+  messages: input.messages,
+  tools: input.tools,
+  abortSignal: input.abort,
+  maxSteps: 10,  // 多步推理上限
+  experimental_activeTools: input.tools?.map((t) => t.function.name),
 });
 ```
 
----
+### 7.3 错误恢复策略
 
-## 8. 数据流转图
-
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                           完整数据流                                    │
-└────────────────────────────────────────────────────────────────────────┘
-
-用户输入 (CLI/TUI/Web)
-       │
-       ▼
-┌─────────────────┐
-│ index.ts        │  ──▶  packages/opencode/src/index.ts
-│ yargs 解析      │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ RunCommand /    │
-│ TuiThreadCmd    │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────────────────────────┐
-│ Session.create()                    │
-│                                     │
-│ 1. 创建 Session 记录                │
-│    ┌─────────────┐                  │
-│    │ SQLite      │                  │
-│    │ sessions    │                  │
-│    │ table       │                  │
-│    └─────────────┘                  │
-│                                     │
-│ 2. 加载 Agent 配置                  │
-│    ┌─────────────┐                  │
-│    │ Agent       │                  │
-│    │ config      │                  │
-│    └─────────────┘                  │
-│                                     │
-└─────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────┐
-│ SessionProcessor.create()           │  ──▶  processor.ts:26
-│                                     │
-│ const processor = {                 │
-│   async process(streamInput) {      │
-│     const stream = await            │
-│       LLM.stream(streamInput)       │
-│            │                        │
-│            ▼                        │
-│       ┌─────────────┐               │
-│       │ Vercel AI   │               │
-│       │ SDK         │               │
-│       │ streamText  │               │
-│       └──────┬──────┘               │
-│              │                      │
-│              ▼                      │
-│       流式响应                      │
-│              │                      │
-│              ▼                      │
-│       ┌─────────────┐               │
-│       │ for await   │               │
-│       │ (value of   │               │
-│       │  stream)    │               │
-│       └──────┬──────┘               │
-│              │                      │
-│         ┌────┴────┐                 │
-│         ▼         ▼                 │
-│    ┌────────┐  ┌──────────┐         │
-│    │文本    │  │ Tool Call│         │
-│    │delta   │  │          │         │
-│    └───┬────┘  └────┬─────┘         │
-│        │            │               │
-│        ▼            ▼               │
-│    ┌────────┐  ┌──────────┐         │
-│    │Session │  │ Tool     │         │
-│    │update  │  │ execute  │         │
-│    │Part    │  │          │         │
-│    │Delta   │  │          │         │
-│    └────────┘  └──────────┘         │
-│                                     │
-│    ┌─────────────┐                  │
-│    │ finish-step │                  │
-│    │ 触发        │                  │
-│    │ Snapshot    │                  │
-│    │ .track()    │                  │
-│    └─────────────┘                  │
-│         │                           │
-│         ▼                           │
-│    ┌─────────────┐                  │
-│    │ Git 快照    │                  │
-│    │ 保存状态    │                  │
-│    └─────────────┘                  │
-│                                     │
-│   }                                 │
-│ }                                   │
-│                                     │
-└─────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────┐
-│ 保存到数据库    │
-│ messages table  │
-└─────────────────┘
-```
-
-### 关键数据结构定义
-
-```typescript
-// Session 类型
-interface Session {
-  id: string;
-  name: string;
-  agent: string;
-  createdAt: Date;
-  updatedAt: Date;
-  messages: MessageV2[];
-}
-
-// MessageV2 类型
-namespace MessageV2 {
-  interface Assistant {
-    id: string;
-    sessionID: string;
-    role: "assistant";
-    parts: Part[];
-    finish?: "stop" | "length" | "tool-calls" | "error";
-    usage?: TokenUsage;
-  }
-
-  type Part = TextPart | ReasoningPart | ToolPart | StepStartPart;
-
-  interface ToolPart {
-    id: string;
-    type: "tool";
-    tool: string;
-    callID: string;
-    state: {
-      status: "pending" | "running" | "completed" | "error";
-      input: Record<string, unknown>;
-      output?: string;
-      error?: string;
-      time?: { start: number; end?: number };
-    };
-  }
-}
-
-// 流事件类型 (Vercel AI SDK)
-type StreamEvent =
-  | { type: "start" }
-  | { type: "text-delta"; text: string }
-  | { type: "reasoning-start"; id: string }
-  | { type: "reasoning-delta"; id: string; text: string }
-  | { type: "tool-input-start"; id: string; toolName: string }
-  | { type: "tool-call"; toolCallId: string; toolName: string; input: unknown }
-  | { type: "tool-result"; toolCallId: string; output: ToolResult }
-  | { type: "finish-step"; finishReason: string; usage: LanguageModelUsage }
-  | { type: "error"; error: Error };
-```
+| 错误类型 | 处理策略 | 代码位置 |
+|---------|---------|---------|
+| 网络超时 | 指数退避重试 | `llm.ts` (SDK 内部) |
+| 工具失败 | 返回错误结果给 LLM | `processor.ts:303` |
+| 用户拒绝 | 抛出 RejectedError | `permission/next.ts:478` |
+| 数据库错误 | 抛出并记录日志 | `storage/db.ts` |
 
 ---
 
-## 9. 源码索引
+## 8. 关键代码索引
 
-### 核心文件
-
-| 组件 | 文件路径 | 行号 | 说明 |
-|------|----------|------|------|
-| CLI 入口 | `src/index.ts` | 1 | yargs 配置 |
-| SessionProcessor | `src/session/processor.ts` | 26 | 会话处理器 |
-| process() | `src/session/processor.ts` | 45 | 流处理循环 |
-| Session | `src/session/session.ts` | - | 会话管理 |
-| MessageV2 | `src/session/message-v2.ts` | - | 消息类型 |
-| LLM | `src/session/llm.ts` | - | 模型调用 |
-| Agent | `src/agent/agent.ts` | - | Agent 定义 |
-| ToolRegistry | `src/tool/registry.ts` | - | 工具注册 |
-| Snapshot | `src/snapshot/index.ts` | - | Git 快照 |
-| Database | `src/storage/db.ts` | - | SQLite 数据库 |
-
-### 命令实现
-
-| 命令 | 文件路径 | 说明 |
-|------|----------|------|
-| Run | `src/cli/cmd/run.ts` | 运行任务 |
-| TUI | `src/cli/cmd/tui/thread.ts` | TUI 模式 |
-| Agent | `src/cli/cmd/agent.ts` | Agent 管理 |
-| MCP | `src/cli/cmd/mcp.ts` | MCP 命令 |
-
-### 配置类
-
-| 配置 | 文件路径 | 说明 |
-|------|----------|------|
-| Config | `src/config/config.ts` | 全局配置 |
-| AgentConfig | `src/config/agent.ts` | Agent 配置 |
-| Provider | `src/provider/provider.ts` | 模型提供商配置 |
-
-### 数据库表
-
-| 表 | 文件路径 | 说明 |
-|------|----------|------|
-| sessions | `src/storage/schema.ts` | 会话表 |
-| messages | `src/storage/schema.ts` | 消息表 |
-| snapshots | `src/storage/schema.ts` | 快照表 |
-| usage | `src/storage/schema.ts` | 使用统计表 |
+| 功能 | 文件 | 行号 | 说明 |
+|-----|------|------|------|
+| CLI 入口 | `src/index.ts` | 1 | yargs 配置、全局初始化 |
+| Run 命令 | `src/cli/cmd/run.ts` | 1 | 单次任务执行入口 |
+| TUI 命令 | `src/cli/cmd/tui/thread.ts` | 1 | 交互式终端界面 |
+| SessionProcessor | `src/session/processor.ts` | 26 | 流处理核心 |
+| process 方法 | `src/session/processor.ts` | 45 | 事件循环实现 |
+| LLM 封装 | `src/session/llm.ts` | 708 | Vercel AI SDK 封装 |
+| Session 管理 | `src/session/session.ts` | 1 | 会话 CRUD |
+| MessageV2 | `src/session/message-v2.ts` | 1 | 消息类型定义 |
+| Tool 定义 | `src/tool/tool.ts` | 1 | 工具接口定义 |
+| ToolRegistry | `src/tool/registry.ts` | 1 | 工具注册表 |
+| Snapshot | `src/snapshot/index.ts` | 549 | Git 快照实现 |
+| 权限系统 | `src/permission/next.ts` | 452 | 审批机制 |
+| 数据库 | `src/storage/db.ts` | 1 | SQLite 连接 |
+| Schema | `src/storage/schema.ts` | 1 | Drizzle ORM 定义 |
+| 事件总线 | `src/bus.ts` | 1 | 组件间通信 |
 
 ---
 
-## 总结
+## 9. 延伸阅读
 
-opencode 是一个现代化的 TypeScript/Bun CLI Agent：
+- 前置知识：[Vercel AI SDK 文档](https://sdk.vercel.ai/docs)
+- 相关机制：[04-opencode-agent-loop.md](./04-opencode-agent-loop.md)
+- 相关机制：[06-opencode-mcp-integration.md](./06-opencode-mcp-integration.md)
+- 深度分析：[questions/opencode-snapshot-mechanism.md](./questions/opencode-snapshot-mechanism.md)
 
-1. **多模型支持** - 通过 Vercel AI SDK 支持多种模型提供商
-2. **Git 快照** - 创新的状态管理方式，基于 Git 实现
-3. **SQLite 存储** - 本地数据库存储会话和消息
-4. **TUI/Web 双模** - 支持终端界面和 Web 界面
-5. **类型安全** - 完整的 TypeScript 类型支持
+---
+
+*✅ Verified: 基于 opencode/packages/opencode/src 源码分析*
+*基于版本：2026-02-08 | 最后更新：2026-02-24*
