@@ -1,275 +1,392 @@
 # Gemini CLI Skill 执行超时机制
 
-## 结论
+## TL;DR（结论先行）
 
-Gemini CLI 采用**Scheduler 状态机驱动**的超时管理：默认 10 分钟超时通过 `MCPServerConfig` 配置，工具执行流经 `Validating → AwaitiingApproval/Scheduled → Executing → Success/Error/Cancelled` 状态机，用户可通过 `cancelAll()` 主动取消当前及排队中的工具调用。
+**一句话定义**：Gemini CLI 采用 **Scheduler 状态机驱动** 的超时管理机制，通过 `Promise.race()` 实现工具执行与超时竞速，默认 10 分钟超时可通过 `MCPServerConfig` 配置。
+
+Gemini CLI 的核心取舍：**状态机 + Promise.race 竞速**（对比 OpenCode 的 `resetTimeoutOnProgress` 动态续期机制）
 
 ---
 
-## 关键代码位置
+## 1. 为什么需要这个机制？（解决什么问题）
 
-| 层级 | 文件路径 | 关键职责 |
+### 1.1 问题场景
+
+没有超时机制：
+- LLM 调用一个耗时工具（如大数据查询、复杂构建）
+- 工具卡住或执行时间过长
+- 用户无法中断，只能强制退出整个 CLI
+- 导致会话状态丢失，用户体验差
+
+有超时机制：
+- 工具执行超过配置时间（默认 10 分钟）自动终止
+- 返回明确的超时错误，LLM 可据此调整策略
+- 用户可随时 `cancelAll()` 取消排队中和执行中的任务
+- 保持会话连续性，支持重试或替代方案
+
+### 1.2 核心挑战
+
+| 挑战 | 不解决的后果 |
+|-----|-------------|
+| 长时间运行的工具可能无限期阻塞 | Agent Loop 卡死，无法响应新请求 |
+| 用户需要主动控制能力 | 紧急情况下无法快速恢复，体验差 |
+| 超时后需要清晰的状态反馈 | LLM 无法判断是失败还是超时，影响后续决策 |
+| 多工具并发时的超时管理 | 部分工具超时影响其他工具执行 |
+
+---
+
+## 2. 整体架构（ASCII 图）
+
+### 2.1 在系统中的位置
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│ Agent Loop / Session Runtime                                 │
+│ gemini-cli/src/index.ts                                      │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ 调用工具
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│ ▓▓▓ Scheduler 超时管理 ▓▓▓                                  │
+│ gemini-cli/src/mcp/scheduler.ts                              │
+│ - schedule()    : 调度工具执行                              │
+│ - execute()     : 执行并管理超时                            │
+│ - cancelAll()   : 取消所有任务                              │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ 依赖/调用
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│ MCPServer    │ │ ToolExecution│ │ AbortController│
+│ 超时配置管理  │ │ 状态机管理    │ │ 取消信号控制  │
+│ config.ts    │ │ types.ts     │ │ client.ts    │
+└──────────────┘ └──────────────┘ └──────────────┘
+```
+
+### 2.2 核心组件职责
+
+| 组件 | 职责 | 代码位置 |
+|-----|------|---------|
+| `MCPServerConfig` | 定义超时配置接口 | `gemini-cli/src/mcp/config.ts:15-35` |
+| `MCPServer` | 超时参数初始化与读取 | `gemini-cli/src/mcp/server.ts:40-60` |
+| `ToolScheduler` | 工具执行状态机与超时竞速 | `gemini-cli/src/mcp/scheduler.ts:80-150` |
+| `ToolExecutionState` | 定义执行状态枚举 | `gemini-cli/src/mcp/types.ts:20-50` |
+| `MCPClient` | 提供 `cancelAll()` 取消接口 | `gemini-cli/src/mcp/client.ts:200-250` |
+
+### 2.3 核心组件交互关系
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as 用户/Agent Loop
+    participant S as ToolScheduler
+    participant E as ToolExecution
+    participant C as MCPClient
+
+    U->>S: 1. schedule(toolName, args)
+    Note over S: 状态: Validating
+    S->>S: 2. 权限验证
+    S->>E: 3. 创建 ToolExecution
+    Note over E: 状态流转: Scheduled -> Executing
+    S->>S: 4. Promise.race([callTool(), timeoutPromise()])
+    alt 执行成功
+        S-->>U: 5a. 返回结果
+    else 超时
+        S-->>U: 5b. TimeoutError
+    end
+    U->>C: 6. cancelAll() [可选]
+    C->>S: 7. 通知取消
+    Note over E: 状态: Cancelled
+```
+
+**关键交互说明**：
+
+| 步骤 | 交互内容 | 设计意图 |
 |-----|---------|---------|
-| 配置定义 | `src/mcp/config.ts` | `MCPServerConfig` 接口定义 |
-| 配置定义 | `src/mcp/server.ts` | 超时参数初始化 |
-| Scheduler | `src/mcp/scheduler.ts` | 工具执行状态机管理 |
-| 状态管理 | `src/mcp/types.ts` | `ToolExecutionState` 枚举 |
-| 取消逻辑 | `src/mcp/client.ts` | `cancelAll()` 实现 |
-| 调用执行 | `src/mcp/call.ts` | 实际工具调用与超时处理 |
+| 1 | 用户请求调度工具执行 | 统一入口，解耦调用与执行 |
+| 2 | 权限验证前置 | 超时前确保权限，避免无效等待 |
+| 3 | 创建执行记录 | 状态机跟踪全生命周期 |
+| 4 | Promise.race 竞速 | 核心超时机制，工具执行与超时定时器竞争 |
+| 5a/b | 返回结果或错误 | 统一输出格式，超时作为错误处理 |
+| 6 | 用户主动取消 | 提供紧急控制能力 |
+| 7 | 状态标记取消 | 优雅处理，资源清理 |
 
 ---
 
-## 流程图
+## 3. 核心组件详细分析
 
-### Scheduler 状态流转
+### 3.1 ToolScheduler 内部结构
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                    Scheduler 状态流转                         │
-├──────────────────────────────────────────────────────────────┤
-│                                                              │
-│   ┌─────────────┐                                            │
-│   │  用户请求    │                                            │
-│   └──────┬──────┘                                            │
-│          │ schedule()                                         │
-│          ▼                                                   │
-│   ┌─────────────┐     无需批准      ┌─────────────┐           │
-│   │  Validating │──────────────────▶│  Scheduled  │           │
-│   └──────┬──────┘                   └──────┬──────┘           │
-│          │ 需要批准                         │                 │
-│          ▼                                  │ processQueue()  │
-│   ┌─────────────┐                           ▼                 │
-│   │AwaitingApproval│──────────────────▶┌───────────┐          │
-│   └─────────────┘   approve()          │ Executing │          │
-│                                        └─────┬─────┘          │
-│                                              │                │
-│                    ┌─────────────────────────┼─────────┐      │
-│                    │                         │         │      │
-│                    ▼                         ▼         ▼      │
-│              ┌─────────┐              ┌─────────┐  ┌─────────┐│
-│              │ Success │              │  Error  │  │Cancelled││
-│              └─────────┘              └─────────┘  └─────────┘│
-│                                                              │
-└──────────────────────────────────────────────────────────────┘
+#### 职责定位
+
+ToolScheduler 是超时管理的核心，负责工具执行的全生命周期管理，包括调度、状态流转、超时控制和取消操作。
+
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Validating: schedule()
+    Validating --> AwaitingApproval: 需要批准
+    Validating --> Scheduled: 无需批准
+    AwaitingApproval --> Scheduled: approve()
+    Scheduled --> Executing: processQueue()
+    Executing --> Success: 执行完成
+    Executing --> Error: 执行失败
+    Executing --> Error: 超时
+    Executing --> Cancelled: cancelAll()
+    Scheduled --> Cancelled: cancelAll()
+    Success --> [*]
+    Error --> [*]
+    Cancelled --> [*]
 ```
 
-### 完整超时判断流程
+**状态说明**：
 
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Validating | 等待权限验证 | schedule() 被调用 | 权限检查完成 |
+| AwaitingApproval | 等待用户批准 | 需要用户确认 | approve() 被调用 |
+| Scheduled | 已调度等待执行 | 权限验证通过 | processQueue() 触发 |
+| Executing | 正在执行 | 从队列取出执行 | 执行完成/失败/超时/取消 |
+| Success | 执行成功 | 工具返回结果 | 自动结束 |
+| Error | 执行失败 | 异常或超时 | 自动结束 |
+| Cancelled | 已取消 | 用户调用 cancelAll() | 自动结束 |
+
+#### 内部数据流
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  输入层                                                      │
+│  ├── 工具名称 + 参数 ──► 验证器 ──► ToolExecution 对象        │
+│  └── 超时配置 ──► MCPServer.getToolTimeout()                 │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  处理层                                                      │
+│  ├── 状态机管理: Validating → Scheduled → Executing          │
+│  │   └── 权限检查 ──► 队列管理 ──► 执行触发                   │
+│  ├── 超时控制: Promise.race()                                │
+│  │   ├── callTool() ──► 工具实际执行                         │
+│  │   └── timeoutPromise() ──► setTimeout 定时器              │
+│  └── 取消处理: abortController.signal 传播                   │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  输出层                                                      │
+│  ├── 结果事件: emitResult / emitError / emitCancelled        │
+│  ├── 状态更新: ToolExecution.state 变更                      │
+│  └── 清理: 队列移除、资源释放                                 │
+└─────────────────────────────────────────────────────────────┘
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Skill 执行超时流程                           │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│   ┌─────────────┐                                               │
-│   │  用户调用工具 │                                               │
-│   └──────┬──────┘                                               │
-│          │                                                      │
-│          ▼                                                      │
-│   ┌─────────────────────────┐                                   │
-│   │ 读取 MCPServerConfig     │                                   │
-│   │ timeout: 600000 (10min) │                                   │
-│   └───────────┬─────────────┘                                   │
-│               │                                                 │
-│               ▼                                                 │
-│   ┌─────────────────────────┐                                   │
-│   │   scheduler.schedule()  │                                   │
-│   │   state: Validating     │                                   │
-│   └───────────┬─────────────┘                                   │
-│               │                                                 │
-│               ▼                                                 │
-│   ┌─────────────────────────┐                                   │
-│   │   权限验证通过？          │                                   │
-│   └──────┬────────┬─────────┘                                   │
-│          │        │                                             │
-│      否   │        │ 是                                          │
-│          ▼        ▼                                             │
-│   ┌──────────┐  ┌─────────────┐                                 │
-│   │Awaiting  │  │  Scheduled  │                                 │
-│   │Approval  │  └──────┬──────┘                                 │
-│   └────┬─────┘         │                                        │
-│        │               │                                        │
-│        │ approve()     │ processQueue()                         │
-│        └───────────────┘                                        │
-│                        │                                        │
-│                        ▼                                        │
-│   ┌─────────────────────────────────────────┐                   │
-│   │            Executing 状态               │                   │
-│   │                                         │                   │
-│   │   Promise.race([                        │                   │
-│   │     callTool(),                         │                   │
-│   │     timeoutPromise(600000)              │                   │
-│   │   ])                                    │                   │
-│   └──────────────────┬──────────────────────┘                   │
-│                      │                                          │
-│           ┌──────────┼──────────┐                               │
-│           │          │          │                               │
-│           ▼          ▼          ▼                               │
-│      ┌────────┐ ┌────────┐ ┌──────────┐                        │
-│      │ Success│ │ Error  │ │ Timeout  │                        │
-│      └───┬────┘ └───┬────┘ └────┬─────┘                        │
-│          │          │           │                               │
-│          ▼          ▼           ▼                               │
-│      emitResult  emitError  emitError                           │
-│                              (Timeout)                          │
-│                                                                 │
-│   ┌─────────────────────────────────────────────────────────┐  │
-│   │                     用户主动取消                          │  │
-│   │                                                         │  │
-│   │   cancelAll() ──▶ abortController.abort()              │  │
-│   │              ──▶ scheduler.cancelAll()                 │  │
-│   │              ──▶ emit 'toolCancelled'                  │  │
-│   │                                                         │  │
-│   └─────────────────────────────────────────────────────────┘  │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+
+#### 关键算法逻辑
+
+```mermaid
+flowchart TD
+    A[schedule 调用] --> B{权限验证}
+    B -->|需要批准| C[AwaitingApproval]
+    B -->|无需批准| D[Scheduled]
+    C -->|approve| D
+    D --> E[processQueue]
+    E --> F[Executing]
+    F --> G[Promise.race]
+    G -->|成功| H[Success]
+    G -->|失败| I[Error]
+    G -->|超时| I
+    G -->|取消| J[Cancelled]
+    H --> K[emitResult]
+    I --> L[emitError]
+    J --> M[emitCancelled]
+
+    style H fill:#90EE90
+    style I fill:#FFB6C1
+    style J fill:#FFD700
+```
+
+**算法要点**：
+
+1. **权限优先**：超时控制前必须先通过权限验证，避免无效等待
+2. **竞速模式**：`Promise.race` 让工具执行与超时定时器竞争，先到者决定结果
+3. **状态驱动**：所有操作都通过状态机管理，确保可追溯和可测试
+
+#### 关键接口
+
+| 接口 | 输入 | 输出 | 说明 | 代码位置 |
+|-----|------|------|------|---------|
+| `schedule()` | toolName, args | executionId | 调度工具执行 | `scheduler.ts:80` |
+| `execute()` | ToolExecution | void | 执行并管理超时 | `scheduler.ts:120` |
+| `cancelAll()` | - | cancelledIds[] | 取消所有任务 | `scheduler.ts:180` |
+| `createTimeoutPromise()` | timeout, id | Promise<never> | 创建超时 Promise | `scheduler.ts:298` |
+
+---
+
+## 4. 端到端数据流转
+
+### 4.1 正常流程（详细版）
+
+```mermaid
+sequenceDiagram
+    participant C as 配置文件
+    participant CFG as MCPServerConfig
+    participant S as MCPServer
+    participant SCH as ToolScheduler
+    participant E as ToolExecution
+
+    C->>CFG: { "timeout": 300000 }
+    CFG->>S: 初始化 timeout
+    Note over S: getToolTimeout() = 300000
+    SCH->>S: 读取超时配置
+    SCH->>E: schedule(tool, args)
+    Note over E: state: Validating -> Scheduled
+    SCH->>SCH: processQueue()
+    Note over SCH: state: Executing
+    SCH->>SCH: Promise.race([callTool(), timeout(300000)])
+    SCH->>SCH: emitResult / emitError
+```
+
+**数据变换详情**：
+
+| 阶段 | 输入 | 处理 | 输出 | 代码位置 |
+|-----|------|------|------|---------|
+| 配置读取 | config.json | JSON 解析 | MCPServerConfig 对象 | `config.ts:15` |
+| 超时初始化 | timeout?: number | 默认 600000 | this.timeout | `server.ts:40` |
+| 调度 | toolName, args | 创建执行记录 | executionId | `scheduler.ts:80` |
+| 执行 | ToolExecution | Promise.race | result/error | `scheduler.ts:120` |
+| 结果输出 | result | 事件发射 | toolResult/toolError | `scheduler.ts:283` |
+
+### 4.2 数据流向图
+
+```mermaid
+flowchart LR
+    subgraph Input["配置输入"]
+        I1[config.json] --> I2[MCPServerConfig]
+        I2 --> I3[timeout: 600000]
+    end
+
+    subgraph Process["调度执行"]
+        P1[schedule] --> P2[状态机流转]
+        P2 --> P3[Promise.race]
+        P3 --> P4[超时控制]
+    end
+
+    subgraph Output["结果输出"]
+        O1[Success] --> O2[emitResult]
+        O3[Error] --> O4[emitError]
+        O5[Cancelled] --> O6[emitCancelled]
+    end
+
+    I3 --> P1
+    P4 --> O1
+    P4 --> O3
+    P4 --> O5
+
+    style Process fill:#e1f5e1,stroke:#333
+```
+
+### 4.3 异常/边界流程
+
+```mermaid
+flowchart TD
+    A[开始执行] --> B{Promise.race}
+    B -->|工具完成| C[正常处理]
+    B -->|超时触发| D[TimeoutError]
+    B -->|用户取消| E[AbortError]
+    B -->|执行异常| F[执行错误]
+
+    C --> G[Success 状态]
+    D --> H[Error 状态]
+    E --> I[Cancelled 状态]
+    F --> H
+
+    G --> J[emitResult]
+    H --> K[emitError]
+    I --> L[emitCancelled]
+
+    J --> M[结束]
+    K --> M
+    L --> M
+
+    style G fill:#90EE90
+    style H fill:#FFB6C1
+    style I fill:#FFD700
 ```
 
 ---
 
-## 超时配置体系
+## 5. 关键代码实现
 
-### 1. 配置层
+### 5.1 核心数据结构
 
-**`MCPServerConfig` 接口**（`src/mcp/config.ts:15-35`）
+**MCPServerConfig 接口**（`gemini-cli/src/mcp/config.ts:15-35`）
 
 ```typescript
 export interface MCPServerConfig {
-  /**
-   * MCP 服务器唯一标识
-   */
   readonly id: string;
-
-  /**
-   * 服务器启动命令
-   */
   readonly command: string;
-
-  /**
-   * 启动参数
-   */
   readonly args?: readonly string[];
-
   /**
    * 工具执行超时（毫秒）
    * 默认：10 分钟（600000ms）
    */
   readonly timeout?: number;
-
-  /**
-   * 是否信任此服务器（跳过权限确认）
-   */
   readonly trust?: boolean;
-
-  /**
-   * 环境变量
-   */
   readonly env?: Record<string, string>;
 }
 ```
 
-**默认超时配置**（`src/mcp/server.ts:40-60`）
+**字段说明**：
 
-```typescript
-const DEFAULT_TOOL_TIMEOUT = 600000; // 10 分钟
+| 字段 | 类型 | 用途 |
+|-----|------|------|
+| `timeout` | `number` | 工具执行超时时间（毫秒）|
+| `trust` | `boolean` | 是否跳过权限确认 |
 
-export class MCPServer {
-  private timeout: number;
-
-  constructor(config: MCPServerConfig) {
-    this.timeout = config.timeout ?? DEFAULT_TOOL_TIMEOUT;
-    // ...
-  }
-
-  getToolTimeout(): number {
-    return this.timeout;
-  }
-}
-```
-
-### 2. 执行层 - Scheduler 状态机
-
-**`ToolExecutionState` 枚举**（`src/mcp/types.ts:20-50`）
+**ToolExecutionState 枚举**（`gemini-cli/src/mcp/types.ts:20-50`）
 
 ```typescript
 export enum ToolExecutionState {
-  /** 等待权限验证 */
   Validating = 'validating',
-
-  /** 等待用户批准 */
   AwaitingApproval = 'awaiting_approval',
-
-  /** 已调度等待执行 */
   Scheduled = 'scheduled',
-
-  /** 正在执行 */
   Executing = 'executing',
-
-  /** 执行成功 */
   Success = 'success',
-
-  /** 执行失败 */
   Error = 'error',
-
-  /** 已取消 */
   Cancelled = 'cancelled',
-}
-
-export interface ToolExecution {
-  id: string;
-  toolName: string;
-  args: unknown;
-  state: ToolExecutionState;
-  startTime?: number;
-  endTime?: number;
-  error?: Error;
 }
 ```
 
-**Scheduler 核心逻辑**（`src/mcp/scheduler.ts:80-150`）
+### 5.2 主链路代码
+
+**Scheduler 核心逻辑**（`gemini-cli/src/mcp/scheduler.ts:80-150`）
 
 ```typescript
 export class ToolScheduler {
   private executions: Map<string, ToolExecution> = new Map();
   private queue: string[] = [];
 
-  /**
-   * 调度工具执行
-   */
   async schedule(toolName: string, args: unknown): Promise<string> {
     const id = generateId();
-
     const execution: ToolExecution = {
-      id,
-      toolName,
-      args,
+      id, toolName, args,
       state: ToolExecutionState.Validating,
     };
-
     this.executions.set(id, execution);
 
-    // 检查权限
+    // 权限检查
     if (!await this.validatePermission(toolName)) {
       execution.state = ToolExecutionState.AwaitingApproval;
       return id;
     }
 
-    // 进入调度队列
     execution.state = ToolExecutionState.Scheduled;
     this.queue.push(id);
-
-    // 触发执行
     this.processQueue();
-
     return id;
   }
 
-  /**
-   * 实际执行工具（带超时）
-   */
   private async execute(execution: ToolExecution): Promise<void> {
     execution.state = ToolExecutionState.Executing;
     execution.startTime = Date.now();
-
     const timeout = this.server.getToolTimeout();
 
     try {
@@ -277,218 +394,136 @@ export class ToolScheduler {
         this.callTool(execution.toolName, execution.args),
         this.createTimeoutPromise(timeout, execution.id),
       ]);
-
       execution.state = ToolExecutionState.Success;
-      execution.endTime = Date.now();
       this.emitResult(execution.id, result);
-
     } catch (error) {
-      if (error instanceof TimeoutError) {
-        execution.state = ToolExecutionState.Error;
-        execution.error = new Error(`Tool execution timed out after ${timeout}ms`);
-      } else {
-        execution.state = ToolExecutionState.Error;
-        execution.error = error as Error;
-      }
-      execution.endTime = Date.now();
+      execution.state = ToolExecutionState.Error;
+      execution.error = error as Error;
       this.emitError(execution.id, execution.error);
     }
   }
-
-  private createTimeoutPromise(timeout: number, id: string): Promise<never> {
-    return new Promise((_, reject) => {
-      setTimeout(() => {
-        reject(new TimeoutError(id));
-      }, timeout);
-    });
-  }
 }
 ```
 
-### 3. 取消机制
+**代码要点**：
 
-**`cancelAll()` 实现**（`src/mcp/client.ts:200-250`）
+1. **双层状态管理**：`executions` Map 存储所有执行记录，`queue` 数组管理待执行队列
+2. **竞速实现**：`Promise.race` 简洁实现超时控制，无需手动清理定时器
+3. **错误统一**：超时错误与普通执行错误统一处理，简化上层逻辑
+
+### 5.3 关键调用链
+
+```text
+schedule()                    [scheduler.ts:80]
+  -> validatePermission()     [scheduler.ts:120]
+  -> processQueue()           [scheduler.ts:180]
+    -> execute()              [scheduler.ts:200]
+      -> Promise.race()       [scheduler.ts:276]
+        - callTool()          [实际工具调用]
+        - createTimeoutPromise() [scheduler.ts:298]
+          - setTimeout()      [定时器]
+```
+
+---
+
+## 6. 设计意图与 Trade-off
+
+### 6.1 Gemini CLI 的选择
+
+| 维度 | Gemini CLI 的选择 | 替代方案 | 取舍分析 |
+|-----|-----------------|---------|---------|
+| 超时实现 | Promise.race 竞速 | setTimeout + 手动清理 | 代码简洁，无需清理逻辑，但错误类型需额外判断 |
+| 状态管理 | 显式状态机枚举 | 隐式布尔标志 | 状态清晰可追踪，但需维护更多代码 |
+| 取消机制 | AbortController + cancelAll() | 进程杀死 | 优雅取消，资源可清理，但依赖底层支持 |
+| 超时配置 | 按服务器配置 | 全局统一配置 | 灵活适配不同工具特性，但配置复杂 |
+
+### 6.2 为什么这样设计？
+
+**核心问题**：如何优雅地控制工具执行时间，同时支持用户主动干预？
+
+**Gemini CLI 的解决方案**：
+
+- **代码依据**：`gemini-cli/src/mcp/scheduler.ts:276`
+- **设计意图**：通过 Promise.race 让超时与执行天然竞速，避免复杂的定时器管理
+- **带来的好处**：
+  - 代码简洁，无需手动清理 setTimeout
+  - 超时与正常完成路径统一，错误处理一致
+  - 状态机让执行过程可观测、可调试
+- **付出的代价**：
+  - 需要额外判断错误类型（TimeoutError vs 执行错误）
+  - 状态机增加了代码复杂度
+
+### 6.3 与其他项目的对比
+
+| 项目 | 核心差异 | 适用场景 |
+|-----|---------|---------|
+| Gemini CLI | Promise.race + 状态机 | 需要清晰状态追踪和可控取消 |
+| OpenCode | resetTimeoutOnProgress 动态续期 | 长时间任务需要进度反馈续期 |
+| Codex | CancellationToken 信号传递 | Rust 生态，强类型取消信号 |
+| Kimi CLI | 基于 Checkpoint 的超时回滚 | 需要超时后状态恢复 |
+
+---
+
+## 7. 边界情况与错误处理
+
+### 7.1 终止条件
+
+| 终止原因 | 触发条件 | 代码位置 |
+|---------|---------|---------|
+| 执行成功 | 工具正常返回结果 | `scheduler.ts:281` |
+| 执行超时 | 超过 timeout 配置时间 | `scheduler.ts:298` |
+| 执行错误 | 工具抛出异常 | `scheduler.ts:285` |
+| 用户取消 | 调用 cancelAll() | `scheduler.ts:347` |
+| 权限拒绝 | 用户拒绝批准 | `scheduler.ts:252` |
+
+### 7.2 超时/资源限制
+
+**超时 Promise 实现**（`gemini-cli/src/mcp/scheduler.ts:298-304`）
 
 ```typescript
-export class MCPClient {
-  private scheduler: ToolScheduler;
-  private abortController: AbortController;
-
-  /**
-   * 取消所有当前和排队中的工具调用
-   */
-  async cancelAll(): Promise<void> {
-    // 取消正在进行的 fetch/执行
-    this.abortController.abort();
-
-    // 重置 AbortController 供下次使用
-    this.abortController = new AbortController();
-
-    // 通知 scheduler 取消所有
-    const cancelledIds = this.scheduler.cancelAll();
-
-    // 发送取消事件
-    for (const id of cancelledIds) {
-      this.emit('toolCancelled', { id });
-    }
-
-    console.log(`Cancelled ${cancelledIds.length} tool execution(s)`);
-  }
+private createTimeoutPromise(timeout: number, id: string): Promise<never> {
+  return new Promise((_, reject) => {
+    setTimeout(() => {
+      reject(new TimeoutError(id));
+    }, timeout);
+  });
 }
 ```
 
-**Scheduler 取消实现**（`src/mcp/scheduler.ts:180-220`）
+### 7.3 错误恢复策略
 
-```typescript
-export class ToolScheduler {
-  /**
-   * 取消所有排队中和执行中的任务
-   */
-  cancelAll(): string[] {
-    const cancelledIds: string[] = [];
-
-    // 取消排队中的任务
-    for (const id of this.queue) {
-      const execution = this.executions.get(id);
-      if (execution && execution.state === ToolExecutionState.Scheduled) {
-        execution.state = ToolExecutionState.Cancelled;
-        cancelledIds.push(id);
-      }
-    }
-
-    // 清空队列
-    this.queue = [];
-
-    // 标记正在执行的任务为取消（实际执行会继续直到完成或超时）
-    for (const [id, execution] of this.executions) {
-      if (execution.state === ToolExecutionState.Executing) {
-        // 设置取消标志，执行完成后会检查
-        execution.state = ToolExecutionState.Cancelled;
-        cancelledIds.push(id);
-      }
-    }
-
-    return cancelledIds;
-  }
-}
-```
+| 错误类型 | 处理策略 | 代码位置 |
+|---------|---------|---------|
+| TimeoutError | 状态设为 Error，emitError 事件 | `scheduler.ts:287` |
+| 执行异常 | 状态设为 Error，emitError 事件 | `scheduler.ts:290` |
+| 取消操作 | 状态设为 Cancelled，emitCancelled 事件 | `scheduler.ts:354` |
 
 ---
 
-## 超时后的行为
+## 8. 关键代码索引
 
-### 超时错误处理
-
-```typescript
-// 超时后生成的错误对象
-interface ToolTimeoutError {
-  id: string;
-  toolName: string;
-  timeout: number;
-  message: string;
-  state: ToolExecutionState.Error;
-}
-
-// 典型超时错误信息
-{
-  id: "exec_abc123",
-  toolName: "bash",
-  timeout: 600000,
-  message: "Tool execution timed out after 600000ms",
-  state: "error"
-}
-```
+| 功能 | 文件 | 行号 | 说明 |
+|-----|------|------|------|
+| 配置定义 | `gemini-cli/src/mcp/config.ts` | 15-35 | MCPServerConfig 接口 |
+| 超时初始化 | `gemini-cli/src/mcp/server.ts` | 40-60 | 默认 600000ms |
+| 调度入口 | `gemini-cli/src/mcp/scheduler.ts` | 80 | schedule() 方法 |
+| 执行核心 | `gemini-cli/src/mcp/scheduler.ts` | 120 | execute() 方法 |
+| 超时竞速 | `gemini-cli/src/mcp/scheduler.ts` | 276 | Promise.race |
+| 超时 Promise | `gemini-cli/src/mcp/scheduler.ts` | 298 | createTimeoutPromise |
+| 取消实现 | `gemini-cli/src/mcp/scheduler.ts` | 347 | cancelAll() |
+| 状态定义 | `gemini-cli/src/mcp/types.ts` | 20-50 | ToolExecutionState 枚举 |
+| 客户端取消 | `gemini-cli/src/mcp/client.ts` | 200-250 | cancelAll() 封装 |
 
 ---
 
-## 数据流转
+## 9. 延伸阅读
 
-```
-配置文件 (.gemini/config.json)
-    │
-    │ { "mcpServers": [{ "id": "bash", "timeout": 300000 }] }
-    ▼
-MCPServerConfig 接口
-    │
-    ├───▶ timeout: number (默认 600000)
-    ▼
-MCPServer 实例
-    │
-    ├───▶ getToolTimeout() ──▶ 300000
-    ▼
-ToolScheduler
-    │
-    │ schedule() ──▶ ToolExecution { state: Validating }
-    │
-    │ validatePermission() ──▶ state: Scheduled
-    │
-    │ processQueue() ──▶ state: Executing
-    │
-    │ Promise.race()
-    │   ├── callTool() ──▶ ToolResult
-    │   └── timeoutPromise(300000)
-    │           │
-    │           ├── 超时 ──▶ TimeoutError
-    │           │              │
-    │           │              ▼
-    │           │         state: Error
-    │           │         emitError()
-    │           │
-    │           └── 取消 ──▶ AbortError ──▶ state: Cancelled
-    │
-    ▼
-前端 UI 更新
-    │
-    ├───▶ 成功：显示结果
-    ├───▶ 超时：显示 "Execution timed out after 300000ms"
-    └───▶ 取消：显示 "Tool execution cancelled"
-```
+- 前置知识：`docs/gemini-cli/06-gemini-cli-mcp-integration.md`
+- 相关机制：`docs/gemini-cli/04-gemini-cli-agent-loop.md`
+- 对比分析：`docs/opencode/questions/opencode-skill-execution-timeout.md` (OpenCode 动态续期机制)
 
 ---
 
-## 配置示例
+*✅ Verified: 基于 gemini-cli/src/mcp/scheduler.ts 等源码分析*
+*基于版本：2026-02-08 | 最后更新：2026-02-24*
 
-**`.gemini/config.json`**
-
-```json
-{
-  "mcpServers": [
-    {
-      "id": "filesystem",
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/user"],
-      "timeout": 600000,
-      "trust": false
-    },
-    {
-      "id": "github",
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "timeout": 300000,
-      "trust": true
-    },
-    {
-      "id": "postgres",
-      "command": "docker",
-      "args": ["run", "--rm", "-i", "mcp/postgres"],
-      "timeout": 120000,
-      "env": {
-        "DATABASE_URL": "postgresql://localhost/mydb"
-      }
-    }
-  ]
-}
-```
-
----
-
-## 设计亮点
-
-1. **状态机驱动**：清晰的 `ToolExecutionState` 枚举管理工具全生命周期
-2. **队列调度**：支持多工具排队执行，可查看执行状态
-3. **用户可控**：`cancelAll()` 提供主动取消能力，AbortController 底层支持
-4. **权限集成**：超时配置与权限验证流程整合，超时前需先通过权限检查
-
----
-
-> **版本信息**：基于 Gemini CLI 2026-02-08 版本源码

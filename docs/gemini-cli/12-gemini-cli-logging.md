@@ -1,199 +1,263 @@
 # Gemini CLI 日志记录机制
 
-## 引子：当你的 Agent 既要在服务端跑，又要在终端跑...
+## TL;DR（结论先行）
 
-想象一下这个场景：你的团队正在开发一个 AI Agent 产品。白天，开发者在本地终端调试；晚上，同样的代码部署到服务端处理用户请求。
+一句话定义：Gemini CLI 采用**双模式日志设计**，A2A Server 使用 `winston` 生产级日志库，Core 包使用自定义 `DebugLogger`，配合 ESLint 强制规范和调试抽屉 UI，实现开发与生产环境的差异化日志策略。
 
-这两个场景对日志的需求完全不同：
-
-**本地开发时**：
-- 需要实时看到详细的执行流程
-- 希望日志能集成到调试 UI 中
-- 文件输出是可选的（方便分享 bug 报告）
-
-**服务端运行时**：
-- 需要结构化的日志便于分析
-- 不需要控制台颜色代码
-- 可能需要与日志收集系统（如 ELK）集成
-
-Gemini CLI 的解决方案是**双模式设计**：同一套代码，根据运行环境自动切换日志策略。
-
-```typescript
-// A2A Server 模式：结构化、生产级
-[INFO] 2026-02-21 03:30:15.123 PM -- Server started on port 3000
-
-// Core 模式：开发友好、UI 集成
-[LOG] 执行工具: read_file
-[DEBUG] 用户输入已解析
-```
-
-本章深入解析 Gemini CLI 如何巧妙平衡开发与生产的不同需求。
+Gemini CLI 的核心取舍：**环境区分（服务端结构化 vs 客户端开发友好）**（对比 Codex 的企业级追踪、Kimi CLI 的库友好设计、OpenCode 的零依赖方案、SWE-agent 的标准库极简方案）
 
 ---
 
-## 结论先行
+## 1. 为什么需要这个机制？（解决什么问题）
 
-Gemini CLI 采用双模式设计：A2A Server 使用 `winston` 生产级日志库，Core 包使用自定义 `DebugLogger`，配合 ESLint 强制规范和调试抽屉 UI，实现开发与生产环境的差异化日志策略。
+### 1.1 问题场景
+
+当你的 Agent 既要在服务端跑，又要在终端跑时，日志需求完全不同：
+
+**没有双模式设计的问题**：
+```
+本地开发时：
+  -> 服务端日志格式太冗长，难以阅读
+  -> 缺乏实时调试 UI 集成
+  -> 无法快速定位问题
+
+服务端运行时：
+  -> 开发日志太零散，无法分析
+  -> 缺少结构化格式，无法接入 ELK
+  -> 颜色代码污染日志文件
+```
+
+**有双模式设计**：
+```
+A2A Server 模式（生产环境）：
+  -> [INFO] 2026-02-21 03:30:15.123 PM -- Server started
+  -> 结构化、可分析、无颜色代码
+
+Core 模式（开发调试）：
+  -> [LOG] 执行工具: read_file
+  -> [DEBUG] 用户输入已解析
+  -> 实时、详细、UI 集成
+```
+
+### 1.2 核心挑战
+
+| 挑战 | 不解决的后果 |
+|-----|-------------|
+| 环境差异 | 同一套代码无法满足不同场景的日志需求 |
+| 开发体验 | 缺乏实时调试能力，开发效率低下 |
+| 生产可观测性 | 无法接入企业日志分析系统 |
+| 代码规范 | 团队成员随意使用 `console.log`，难以维护 |
+| UI 集成 | 日志无法实时展示在调试界面 |
 
 ---
 
-## 技术类比：服务端 vs 客户端的日志哲学
+## 2. 整体架构（ASCII 图）
 
-Gemini CLI 的日志设计体现了**环境区分**的思想：
+### 2.1 在系统中的位置
 
-| 场景 | 工具类比 | 设计哲学 |
-|------|---------|---------|
-| A2A Server 用 `winston` | 生产环境的 `rsyslog` | 稳定、结构化、可分析 |
-| Core 用 `DebugLogger` | 开发时的 `strace` | 详细、实时、与工具集成 |
-
-### Winston vs console.log 的性能差异
-
-| 特性 | `console.log` | `winston` | `DebugLogger` |
-|------|---------------|-----------|---------------|
-| 异步写入 | ❌ | ✅ | ✅（可选） |
-| 结构化输出 | ❌ | ✅ | ⚠️（基础） |
-| 传输控制 | ❌ | ✅ | ❌ |
-| 性能开销 | 低 | 中 | 低 |
-| 内存缓冲 | ❌ | ✅ | ❌ |
-
-为什么生产环境不能用 `console.log`？
-1. **同步阻塞**：`console.log` 是同步的，高并发时会阻塞事件循环
-2. **无缓冲**：每条日志都直接写入，I/O 效率低
-3. **无级别控制**：无法通过配置动态调整日志详细程度
-
-### DebugLogger 与 DevTools 的集成
-
-`DebugLogger` 不是简单的日志库，而是连接代码与 UI 的桥梁：
-
-```
-代码中的日志
-     │
-     ▼
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│ DebugLogger │───▶│console.log  │───▶│ConsolePatcher│
-└─────────────┘    └─────────────┘    └──────┬──────┘
-                                             │
-                              ┌──────────────┼──────────────┐
-                              ▼              ▼              ▼
-                         ┌────────┐    ┌────────┐    ┌────────┐
-                         │ 终端   │    │ 文件   │    │ Debug  │
-                         │ 输出   │    │ (可选) │    │ Drawer │
-                         └────────┘    └────────┘    └────────┘
-```
-
----
-
-## 架构图
-
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
-│                      A2A Server                              │
-│                   (服务端/生产环境)                           │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │                  Winston Logger                        │  │
-│  │  ┌─────────────────────────────────────────────────┐  │  │
-│  │  │  Format: [LEVEL] YYYY-MM-DD HH:mm:ss.SSS A -- msg│  │  │
-│  │  │  Transport: Console                               │  │  │
-│  │  │  Level: info                                      │  │  │
-│  │  └─────────────────────────────────────────────────┘  │  │
-│  └───────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              │ 同一进程内
-                              ▼
+│ Application Code                                             │
+│ packages/a2a-server/src/server.ts                            │
+│ packages/core/src/...                                        │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ 调用
+                        ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                      Core Package                            │
-│                   (客户端/开发调试)                           │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │                  DebugLogger                           │  │
-│  │  ┌─────────────────────────────────────────────────┐  │  │
-│  │  │  • console.log → ConsolePatcher → UI 调试抽屉    │  │  │
-│  │  │  • 可选文件输出 (GEMINI_DEBUG_LOG_FILE)          │  │  │
-│  │  │  • ISO 8601 时间戳                               │  │  │
-│  │  └─────────────────────────────────────────────────┘  │  │
-│  └───────────────────────────────────────────────────────┘  │
+│ ▓▓▓ Logging System ▓▓▓                                      │
+│ packages/                                                   │
+│ - a2a-server/src/utils/logger.ts  : Winston 生产级日志      │
+│ - core/src/utils/debugLogger.ts   : DebugLogger 调试日志    │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ 依赖/调用
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│ Console      │ │ File         │ │ Debug Drawer │
+│ 输出         │ │ (可选)       │ │ (UI组件)     │
+└──────────────┘ └──────────────┘ └──────────────┘
+```
+
+### 2.2 核心组件职责
+
+| 组件 | 职责 | 代码位置 |
+|-----|------|---------|
+| `Winston Logger` | A2A Server 结构化日志 | `packages/a2a-server/src/utils/logger.ts:1-28` |
+| `DebugLogger` | Core 包调试日志 | `packages/core/src/utils/debugLogger.ts:1-69` |
+| `ConsolePatcher` | 拦截 console 输出到 UI | ⚠️ Inferred: UI 层实现 |
+| `ESLint no-console` | 强制规范，禁止直接使用 console | `packages/core/.eslintrc.js` |
+
+### 2.3 核心组件交互关系
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Application
+    participant Mode as 运行模式判断
+    participant Win as Winston Logger
+    participant Debug as DebugLogger
+    participant File as 文件输出
+    participant UI as Debug Drawer
+
+    App->>Mode: 启动应用
+    Mode->>Mode: 检测运行环境
+
+    alt A2A Server 模式
+        Mode->>Win: 初始化 winston
+        App->>Win: logger.info()
+        Win->>Win: 格式化时间戳
+        Win->>Console: 结构化输出
+    else Core 模式
+        Mode->>Debug: 初始化 DebugLogger
+        App->>Debug: debugLogger.log()
+        Debug->>File: 可选文件写入
+        Debug->>Console: console.log()
+        Console->>UI: ConsolePatcher 拦截
+        UI->>UI: 实时展示
+    end
+```
+
+**关键交互说明**：
+
+| 步骤 | 交互内容 | 设计意图 |
+|-----|---------|---------|
+| 1 | 应用启动时判断运行模式 | 根据环境自动选择日志策略 |
+| 2-3 | A2A Server 使用 Winston | 生产级结构化日志 |
+| 4-7 | Core 使用 DebugLogger | 开发友好，支持 UI 集成 |
+| 6 | ConsolePatcher 拦截 | 将日志路由到调试抽屉 |
+
+---
+
+## 3. 核心组件详细分析
+
+### 3.1 Winston Logger 内部结构
+
+#### 职责定位
+
+A2A Server 的生产级日志组件，提供结构化、可配置的日志输出。
+
+#### 内部数据流
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  输入层                                                      │
+│  ├── 日志级别 (info/warn/error)                              │
+│  ├── 消息内容                                                │
+│  └── 元数据对象                                              │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  处理层                                                      │
+│  ├── timestamp: 格式化为 YYYY-MM-DD HH:mm:ss.SSS A          │
+│  ├── printf: 自定义输出格式                                  │
+│  └── 元数据序列化为 JSON                                     │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  输出层                                                      │
+│  └── Console Transport                                       │
+│      [LEVEL] timestamp -- message\n{JSON metadata}           │
 └─────────────────────────────────────────────────────────────┘
 ```
 
----
+#### 关键算法逻辑
 
-## 双模式设计背景
+```mermaid
+flowchart TD
+    A[日志事件] --> B{是否有元数据}
+    B -->|有| C[序列化为 JSON]
+    B -->|无| D[仅输出消息]
+    C --> E[格式化输出]
+    D --> E
+    E --> F[[LEVEL] timestamp -- message]
+    F --> G[Console 输出]
 
-| 模式 | 使用场景 | 日志库 | 输出目标 |
-|------|----------|--------|----------|
-| A2A Server | 服务端部署 | winston | Console |
-| Core | 客户端开发 | DebugLogger | Console + 可选文件 + UI |
-
-设计考量：
-- **A2A Server**: 需要结构化、可配置的日志，便于服务端问题排查
-- **Core**: 需要轻量级、与 UI 集成的调试日志，提升开发体验
-
----
-
-## Winston 配置详解
-
-**✅ Verified**: `gemini-cli/packages/a2a-server/src/utils/logger.ts`
-
-```typescript
-import winston from 'winston';
-
-const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.combine(
-    // 1. 时间戳格式化
-    winston.format.timestamp({
-      format: 'YYYY-MM-DD HH:mm:ss.SSS A',  // 12小时制带AM/PM
-    }),
-    // 2. 自定义输出格式
-    winston.format.printf((info) => {
-      const { level, timestamp, message, ...rest } = info;
-      return (
-        `[${level.toUpperCase()}] ${timestamp} -- ${message}` +
-        `${Object.keys(rest).length > 0 ? `\n${JSON.stringify(rest, null, 2)}` : ''}`
-      );
-    }),
-  ),
-  transports: [new winston.transports.Console()],
-});
-
-export { logger };
+    style E fill:#90EE90
 ```
 
-### 输出示例
+**算法要点**：
 
-```
-[INFO] 2026-02-21 03:30:15.123 PM -- Server started on port 3000
-[ERROR] 2026-02-21 03:31:22.456 PM -- Failed to process request
-{
-  "error": "Timeout",
-  "duration": 30000
-}
-```
+1. **时间戳格式化**：12小时制带 AM/PM，便于阅读
+2. **元数据序列化**：有额外字段时自动附加 JSON
+3. **单一 Transport**：生产环境仅需 Console 输出
+
+#### 关键接口
+
+| 接口 | 输入 | 输出 | 说明 | 代码位置 |
+|-----|------|------|------|---------|
+| `logger.info()` | message, meta | 格式化日志 | 信息级别日志 | `logger.ts:141` |
+| `logger.error()` | message, meta | 格式化日志 | 错误级别日志 | `logger.ts:141` |
+| `winston.createLogger()` | config | Logger 实例 | 初始化 | `logger.ts:140` |
 
 ---
 
-## DebugLogger 实现
+### 3.2 DebugLogger 内部结构
 
-**✅ Verified**: `gemini-cli/packages/core/src/utils/debugLogger.ts`
+#### 职责定位
 
-### 设计原则
+Core 包的调试日志组件，连接代码与 UI 调试抽屉。
 
-```typescript
-/**
- * WHY USE THIS?
- * - It makes the INTENT of the log clear (it's for developers, not users).
- * - It provides a single point of control for debug logging behavior.
- * - We can lint against direct `console.*` usage to enforce this pattern.
- *
- * HOW IT WORKS:
- * This is a thin wrapper around the native `console` object. The `ConsolePatcher`
- * will intercept these calls and route them to the debug drawer UI.
- */
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle: 初始化
+    Idle --> FileEnabled: GEMINI_DEBUG_LOG_FILE 设置
+    Idle --> ConsoleOnly: 无环境变量
+    FileEnabled --> Writing: 收到日志
+    ConsoleOnly --> Writing: 收到日志
+    Writing --> FileEnabled: 写入文件+控制台
+    Writing --> ConsoleOnly: 仅控制台
+    Writing --> [*]: 应用关闭
 ```
 
-### 完整实现
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Idle | 初始化完成 | `new DebugLogger()` | 收到日志调用 |
+| FileEnabled | 文件输出启用 | `GEMINI_DEBUG_LOG_FILE` 已设置 | 应用关闭 |
+| ConsoleOnly | 仅控制台输出 | 无环境变量 | 应用关闭 |
+| Writing | 写入中 | 调用 log/warn/error/debug | 写入完成 |
+
+#### 内部数据流
+
+```mermaid
+flowchart LR
+    subgraph Input["输入阶段"]
+        I1[log/warn/error/debug] --> I2[参数处理]
+    end
+
+    subgraph Process["处理阶段"]
+        P1[格式化消息] --> P2[生成时间戳]
+        P3[检查文件流] --> P4[写入文件]
+    end
+
+    subgraph Output["输出阶段"]
+        O1[console.log] --> O2[ConsolePatcher]
+        O2 --> O3[Debug Drawer]
+    end
+
+    I2 --> P1
+    P2 --> P3
+    P4 --> O1
+
+    style Process fill:#e1f5e1,stroke:#333
+```
+
+**数据变换详情**：
+
+| 阶段 | 输入 | 处理 | 输出 | 代码位置 |
+|-----|------|------|------|---------|
+| 接收 | `...args: unknown[]` | util.format 格式化 | string 消息 | `debugLogger.ts:216` |
+| 时间戳 | - | `new Date().toISOString()` | ISO 8601 时间戳 | `debugLogger.ts:217` |
+| 文件写入 | 格式化日志条目 | `logStream.write()` | 文件追加 | `debugLogger.ts:219` |
+| 控制台 | 原始参数 | `console.log()` | UI 展示 | `debugLogger.ts:225` |
+
+#### 关键算法逻辑
 
 ```typescript
+// packages/core/src/utils/debugLogger.ts:197-245
 class DebugLogger {
   private logStream: fs.WriteStream | undefined;
 
@@ -224,6 +288,270 @@ class DebugLogger {
     this.writeToFile('LOG', args);
     console.log(...args);  // 被 ConsolePatcher 拦截到 UI
   }
+}
+```
+
+**算法要点**：
+
+1. **环境驱动**：`GEMINI_DEBUG_LOG_FILE` 控制是否启用文件输出
+2. **追加模式**：`flags: 'a'` 确保日志不会覆盖
+3. **错误隔离**：文件写入错误不影响控制台输出
+4. **双路输出**：同时写入文件和 Console（供 UI 拦截）
+
+---
+
+### 3.3 双模式切换逻辑
+
+```mermaid
+stateDiagram-v2
+    [*] --> Detect: 应用启动
+    Detect --> A2AServer: 检测到服务端环境
+    Detect --> CoreMode: 检测到客户端环境
+
+    A2AServer --> InitWinston: 初始化 Winston
+    CoreMode --> InitDebug: 初始化 DebugLogger
+
+    InitWinston --> Running: 使用 winston 记录日志
+    InitDebug --> Running: 使用 DebugLogger 记录日志
+
+    Running --> [*]: 应用关闭
+
+    note right of A2AServer
+        结构化、生产级
+        [INFO] 2026-02-21 03:30:15.123 PM -- msg
+    end note
+
+    note right of CoreMode
+        开发友好、UI 集成
+        [LOG] 执行工具: read_file
+    end note
+```
+
+**切换条件**：
+
+| 模式 | 触发条件 | 日志库 | 输出目标 |
+|-----|---------|--------|----------|
+| A2A Server | `process.env.NODE_ENV === 'production'` 或显式配置 | winston | Console |
+| Core | 默认/开发环境 | DebugLogger | Console + 可选文件 + UI |
+
+---
+
+### 3.4 组件间协作时序
+
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant Debug as DebugLogger
+    participant File as 文件系统
+    participant Console as console
+    participant Patcher as ConsolePatcher
+    participant Drawer as Debug Drawer
+
+    App->>Debug: debugLogger.log("执行工具", toolName)
+    activate Debug
+
+    Debug->>Debug: writeToFile("LOG", args)
+    Debug->>File: 写入日志文件（可选）
+
+    Debug->>Console: console.log(...args)
+    activate Console
+
+    Console->>Patcher: 拦截调用
+    activate Patcher
+
+    Patcher->>Patcher: 调用原始 console.log
+    Patcher->>Drawer: emit('log', entry)
+    activate Drawer
+
+    Drawer->>Drawer: 实时渲染日志
+    deactivate Drawer
+
+    deactivate Patcher
+    deactivate Console
+    deactivate Debug
+```
+
+**协作要点**：
+
+1. **DebugLogger 与文件系统**：可选的文件输出，异步写入
+2. **console.log 与 ConsolePatcher**：拦截并路由到 UI
+3. **ConsolePatcher 与 Debug Drawer**：事件驱动更新
+
+---
+
+## 4. 端到端数据流转
+
+### 4.1 正常流程（详细版）
+
+```mermaid
+sequenceDiagram
+    participant User as 用户/代码
+    participant Logger as DebugLogger
+    participant File as 日志文件
+    participant Console as console
+    participant UI as Debug Drawer UI
+
+    User->>Logger: debugLogger.log("消息", data)
+
+    Logger->>Logger: util.format(...args)
+    Note right of Logger: 格式化参数为字符串
+
+    Logger->>Logger: new Date().toISOString()
+    Note right of Logger: 生成 ISO 时间戳
+
+    alt 文件输出启用
+        Logger->>File: write(logEntry)
+        Note right of File: [2026-02-21T...] [LOG] 消息 data
+    end
+
+    Logger->>Console: console.log("消息", data)
+
+    Console->>UI: ConsolePatcher 拦截
+    UI->>UI: 实时展示日志
+    UI->>User: 可视化反馈
+```
+
+**数据变换详情**：
+
+| 阶段 | 输入 | 处理 | 输出 | 代码位置 |
+|-----|------|------|------|---------|
+| 接收 | `...args: unknown[]` | 参数展开 | 参数数组 | `debugLogger.ts:223` |
+| 格式化 | 参数数组 | `util.format()` | 格式化字符串 | `debugLogger.ts:216` |
+| 时间戳 | - | `toISOString()` | ISO 8601 时间 | `debugLogger.ts:217` |
+| 文件条目 | 时间戳 + 级别 + 消息 | 字符串拼接 | `[timestamp] [LEVEL] message\n` | `debugLogger.ts:218` |
+| 控制台 | 原始参数 | `console.log()` | 终端输出 | `debugLogger.ts:225` |
+| UI 展示 | 日志事件 | ConsolePatcher | Debug Drawer 渲染 | ⚠️ Inferred |
+
+### 4.2 数据流向图
+
+```mermaid
+flowchart LR
+    subgraph Source["日志源"]
+        S1[Agent Loop]
+        S2[Tool System]
+        S3[用户代码]
+    end
+
+    subgraph Logger["日志层"]
+        L1[DebugLogger]
+        L2[Winston]
+    end
+
+    subgraph Output["输出层"]
+        O1[Console]
+        O2[文件]
+        O3[Debug Drawer]
+    end
+
+    S1 --> L1
+    S2 --> L1
+    S3 --> L1
+    S3 --> L2
+
+    L1 --> O1
+    L1 --> O2
+    L1 --> O3
+    L2 --> O1
+
+    style Logger fill:#f9f,stroke:#333
+```
+
+### 4.3 异常/边界流程
+
+```mermaid
+flowchart TD
+    A[日志调用] --> B{文件流状态}
+
+    B -->|正常| C[写入文件]
+    B -->|错误| D[捕获错误]
+    B -->|未启用| E[跳过文件]
+
+    D --> F[console.error 报告]
+    F --> G[继续控制台输出]
+
+    C --> H{console 拦截}
+    E --> H
+    G --> H
+
+    H -->|成功| I[UI 展示]
+    H -->|失败| J[仅终端输出]
+
+    I --> K[结束]
+    J --> K
+
+    style D fill:#FFD700
+    style J fill:#FFD700
+```
+
+---
+
+## 5. 关键代码实现
+
+### 5.1 核心数据结构
+
+```typescript
+// packages/core/src/utils/debugLogger.ts:197-201
+class DebugLogger {
+  private logStream: fs.WriteStream | undefined;
+
+  constructor() {
+    this.logStream = process.env['GEMINI_DEBUG_LOG_FILE']
+      ? fs.createWriteStream(process.env['GEMINI_DEBUG_LOG_FILE'], { flags: 'a' })
+      : undefined;
+  }
+}
+```
+
+**字段说明**：
+
+| 字段 | 类型 | 用途 |
+|-----|------|------|
+| `logStream` | `fs.WriteStream \| undefined` | 文件写入流，可选 |
+
+### 5.2 主链路代码
+
+**Winston 配置（A2A Server）**：
+
+```typescript
+// packages/a2a-server/src/utils/logger.ts:138-159
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    // 1. 时间戳格式化
+    winston.format.timestamp({
+      format: 'YYYY-MM-DD HH:mm:ss.SSS A',  // 12小时制带AM/PM
+    }),
+    // 2. 自定义输出格式
+    winston.format.printf((info) => {
+      const { level, timestamp, message, ...rest } = info;
+      return (
+        `[${level.toUpperCase()}] ${timestamp} -- ${message}` +
+        `${Object.keys(rest).length > 0 ? `\n${JSON.stringify(rest, null, 2)}` : ''}`
+      );
+    }),
+  ),
+  transports: [new winston.transports.Console()],
+});
+```
+
+**DebugLogger 实现（Core）**：
+
+```typescript
+// packages/core/src/utils/debugLogger.ts:214-242
+class DebugLogger {
+  private writeToFile(level: string, args: unknown[]) {
+    if (this.logStream) {
+      const message = util.format(...args);
+      const timestamp = new Date().toISOString();
+      const logEntry = `[${timestamp}] [${level}] ${message}\n`;
+      this.logStream.write(logEntry);
+    }
+  }
+
+  log(...args: unknown[]): void {
+    this.writeToFile('LOG', args);
+    console.log(...args);  // 被 ConsolePatcher 拦截到 UI
+  }
 
   warn(...args: unknown[]): void {
     this.writeToFile('WARN', args);
@@ -240,18 +568,19 @@ class DebugLogger {
     console.debug(...args);
   }
 }
-
-export const debugLogger = new DebugLogger();
 ```
 
----
+**代码要点**：
 
-## ESLint 强制规范
+1. **双路输出设计**：文件写入 + 控制台输出，互不阻塞
+2. **环境驱动**：`GEMINI_DEBUG_LOG_FILE` 控制文件输出
+3. **错误隔离**：文件写入错误通过 `on('error')` 捕获，不影响主流程
+4. **UI 集成**：通过 `console.log` 被 ConsolePatcher 拦截
 
-### 禁止直接使用 console.*
+### 5.3 ESLint 强制规范
 
 ```javascript
-// .eslintrc.js 或 eslint.config.js
+// .eslintrc.js
 {
   rules: {
     'no-console': ['error', { allow: ['error'] }],  // 禁止直接使用
@@ -259,20 +588,7 @@ export const debugLogger = new DebugLogger();
 }
 ```
 
-### 推荐用法
-
-```typescript
-// ❌ 不推荐 - 会被 ESLint 拦截
-console.log('Debug info');
-
-// ✅ 推荐 - 使用 DebugLogger
-import { debugLogger } from '../utils/debugLogger';
-debugLogger.log('Debug info');
-```
-
-### ESLint 规则的技术实现
-
-ESLint 的 `no-console` 规则如何工作？
+**ESLint 规则的技术实现**：
 
 ```javascript
 // ESLint 会检查 AST 中的 CallExpression
@@ -289,242 +605,165 @@ debugLogger.log('test');
 // object 是 debugLogger，不是 console
 ```
 
-### autofix 的支持
+### 5.4 关键调用链
 
-可以配置 ESLint 自动修复（将 `console.log` 替换为 `debugLogger.log`）：
-
-```javascript
-// eslint.config.js
-module.exports = {
-  rules: {
-    'no-console': ['error', { allow: ['error'] }],
-  },
-  // 添加自定义处理器或插件来实现 autofix
-};
+```text
+debugLogger.log()          [packages/core/src/utils/debugLogger.ts:223]
+  -> writeToFile()         [packages/core/src/utils/debugLogger.ts:214]
+    -> util.format()       [Node.js 内置]
+    -> new Date().toISOString()
+    -> logStream.write()   [fs.WriteStream]
+  -> console.log()         [全局 console]
+    -> ConsolePatcher.emitToDrawer()  [⚠️ Inferred: UI 层]
+      -> DebugDrawer.render()         [⚠️ Inferred: UI 组件]
 ```
 
 ---
 
-## 调试抽屉 UI 展示机制
+## 6. 设计意图与 Trade-off
 
-### 数据流
+### 6.1 Gemini CLI 的选择
 
+| 维度 | Gemini CLI 的选择 | 替代方案 | 取舍分析 |
+|-----|------------------|---------|---------|
+| 日志框架 | winston + DebugLogger 双模式 | 单一框架 | 环境适配好，但维护两套代码 |
+| 输出目标 | Console + 可选文件 | 多目标同时 | 简单灵活，但缺少 SQLite/OTel |
+| 开发规范 | ESLint 强制 | 文档约定 | 强制执行，但需配置规则 |
+| UI 集成 | ConsolePatcher 拦截 | 直接 API 调用 | 透明集成，但增加复杂度 |
+| 时间格式 | 12小时制 AM/PM | 24小时制 ISO | 易读性好，但解析稍复杂 |
+
+### 6.2 为什么这样设计？
+
+**核心问题**：如何平衡服务端生产需求与客户端开发体验？
+
+**Gemini CLI 的解决方案**：
+- 代码依据：`packages/a2a-server/src/utils/logger.ts:138` 和 `packages/core/src/utils/debugLogger.ts:197`
+- 设计意图：环境区分，一套代码适配两种场景
+- 带来的好处：
+  - 服务端：结构化、可分析
+  - 客户端：实时、UI 集成
+  - 强制规范：ESLint 确保一致性
+- 付出的代价：
+  - 两套日志代码需维护
+  - 切换逻辑需正确配置
+
+### 6.3 与其他项目的对比
+
+```mermaid
+flowchart TD
+    subgraph Gemini["Gemini CLI"]
+        G1[Winston<br/>生产级]
+        G2[DebugLogger<br/>开发友好]
+    end
+
+    subgraph Codex["Codex"]
+        C1[tracing<br/>企业级追踪]
+        C2[SQLite<br/>结构化存储]
+        C3[OpenTelemetry<br/>分布式追踪]
+    end
+
+    subgraph Kimi["Kimi CLI"]
+        K1[loguru<br/>库友好]
+        K2[StderrRedirector<br/>子进程捕获]
+    end
+
+    subgraph OpenCode["OpenCode"]
+        O1[自定义<br/>零依赖]
+        O2[Key=value<br/>结构化]
+    end
+
+    subgraph SWE["SWE-agent"]
+        S1[logging<br/>标准库]
+        S2[Rich<br/>彩色输出]
+    end
 ```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│   DebugLogger   │────▶│   console.log    │────▶│ ConsolePatcher  │
-│                 │     │                  │     │                 │
-│  debugLogger.log│     │  标准输出         │     │  拦截并路由      │
-└─────────────────┘     └──────────────────┘     └────────┬────────┘
-                                                          │
-                                                          ▼
-                                               ┌─────────────────┐
-                                               │    Debug Drawer │
-                                               │    (UI组件)      │
-                                               │                 │
-                                               │  • 实时日志展示  │
-                                               │  • 按级别过滤   │
-                                               │  • 搜索功能     │
-                                               └─────────────────┘
-```
 
-### ConsolePatcher 核心逻辑
+| 项目 | 日志框架 | 输出目标 | 开发/生产适配 | 特殊功能 |
+|-----|---------|---------|--------------|---------|
+| **Gemini CLI** | winston + DebugLogger | Console + 可选文件 | 双模式自动切换 | Debug Drawer UI |
+| **Codex** | Rust tracing | 文件 + SQLite + OTel | 多层 subscriber | Span 追踪、90天清理 |
+| **Kimi CLI** | loguru | 文件 + stderr | CLI 文件日志 / Web stderr | StderrRedirector |
+| **OpenCode** | 自定义 Bun-native | 文件 + Console | 统一处理 | 零依赖、Timing 工具 |
+| **SWE-agent** | Python logging + rich | Console + 动态文件 | 统一处理 | Emoji 前缀、TRACE 级别 |
+
+**详细对比**：
+
+| 维度 | Gemini CLI | Codex | Kimi CLI | OpenCode | SWE-agent |
+|-----|------------|-------|----------|----------|-----------|
+| **日志框架** | winston + 自定义 | tracing-subscriber | loguru | Bun-native 自定义 | stdlib logging |
+| **输出目标** | Console, 可选文件 | 文件, SQLite, OTel | 文件, stderr | 文件, Console | Console, 动态文件 |
+| **结构化日志** | 可选 JSON | 原生 JSON + SQLite | 支持 | Key=value | 不支持 |
+| **开发/生产适配** | 双模式切换 | 多层输出 | CLI/Web 区分 | 统一 | 统一 |
+| **日志轮转** | 无 | 90天自动清理 | 可配置 | 保留10个 | 无 |
+| **UI 集成** | Debug Drawer | - | - | - | - |
+| **依赖数量** | 1 (winston) | 多 (tracing 生态) | 1 (loguru) | 0 | 1 (rich) |
+| **适用场景** | 中大型项目 | 企业级 | 中小型 | 高性能 Bun | 简单稳定 |
+
+**选型建议**：
+
+| 场景 | 推荐方案 |
+|-----|---------|
+| 需要 UI 调试抽屉 | Gemini CLI |
+| 企业级可观测性 | Codex |
+| 库友好设计 | Kimi CLI |
+| Bun 零依赖 | OpenCode |
+| 简单稳定 | SWE-agent |
+
+---
+
+## 7. 边界情况与错误处理
+
+### 7.1 终止条件
+
+| 终止原因 | 触发条件 | 代码位置 |
+|---------|---------|---------|
+| 文件写入失败 | 磁盘满/权限不足 | `debugLogger.ts:209-211` |
+| 文件流错误 | 文件被删除/移动 | `debugLogger.ts:209` |
+| 环境变量未设置 | 无 `GEMINI_DEBUG_LOG_FILE` | `debugLogger.ts:202-206` |
+
+### 7.2 资源限制
 
 ```typescript
-// 伪代码示意（基于常见实现模式）
-class ConsolePatcher {
-  private originalLog: typeof console.log;
-  private logBuffer: LogEntry[] = [];
+// 文件写入无显式限制，依赖系统资源
+// 日志文件可能无限增长（无自动轮转）
 
-  patch() {
-    this.originalLog = console.log;
-    console.log = (...args: any[]) => {
-      // 1. 调用原始方法（保持终端输出）
-      this.originalLog.apply(console, args);
-
-      // 2. 发送到调试抽屉
-      this.emitToDrawer({
-        level: 'log',
-        message: args.join(' '),
-        timestamp: Date.now(),
-      });
-    };
-  }
-
-  private emitToDrawer(entry: LogEntry) {
-    eventEmitter.emit('log', entry);
-  }
-}
+// 建议外部管理：
+// 1. 使用 logrotate 等工具
+// 2. 定期清理旧日志
+// 3. 监控磁盘空间
 ```
 
-### 与 DevTools 集成
+### 7.3 错误恢复策略
 
-Gemini CLI 的调试抽屉 UI 支持：
-- **实时日志展示**：通过 `ConsolePatcher` 拦截并展示
-- **按级别过滤**：根据日志级别筛选显示
-- **搜索功能**：关键字搜索历史日志
-- **导出功能**：将日志导出为文件
-
-快捷键：
-- `Ctrl+D`：打开/关闭调试抽屉
-- `Ctrl+F`：搜索日志
+| 错误类型 | 处理策略 | 代码位置 |
+|---------|---------|---------|
+| 文件写入失败 | 捕获错误，继续控制台输出 | `debugLogger.ts:209-211` |
+| 文件流未初始化 | 跳过文件写入，仅控制台 | `debugLogger.ts:215` |
+| ConsolePatcher 失败 | 降级为仅终端输出 | ⚠️ Inferred |
 
 ---
 
-## 配置方式
+## 8. 关键代码索引
 
-### 环境变量
-
-```bash
-# 启用文件日志输出
-export GEMINI_DEBUG_LOG_FILE="/tmp/gemini-debug.log"
-
-# 运行 Gemini CLI
-gemini-cli
-```
-
-### 文件输出格式
-
-```
-[2026-02-21T15:30:15.123Z] [LOG] Debug message
-[2026-02-21T15:31:22.456Z] [ERROR] Error occurred
-```
+| 功能 | 文件 | 行号 | 说明 |
+|-----|------|------|------|
+| Winston 配置 | `packages/a2a-server/src/utils/logger.ts` | 1-28 | A2A Server 日志配置 |
+| DebugLogger 类 | `packages/core/src/utils/debugLogger.ts` | 1-69 | 调试日志实现 |
+| 文件写入 | `packages/core/src/utils/debugLogger.ts` | 214-221 | writeToFile 方法 |
+| 日志级别方法 | `packages/core/src/utils/debugLogger.ts` | 223-242 | log/warn/error/debug |
+| ESLint 配置 | `packages/core/.eslintrc.js` | - | no-console 规则 |
 
 ---
 
-## 快速上手：Gemini CLI 日志实战
+## 9. 延伸阅读
 
-### 1. 启用文件调试日志
-
-```bash
-# 设置环境变量
-export GEMINI_DEBUG_LOG_FILE="/tmp/gemini-debug.log"
-
-# 运行 CLI
-npx @google/gemini-cli
-
-# 实时查看日志（另一个终端）
-tail -f /tmp/gemini-debug.log
-```
-
-### 2. 使用 jq 解析结构化日志
-
-```bash
-# 如果日志包含 JSON，用 jq 格式化
-tail -f /tmp/gemini-debug.log | while read line; do
-  echo "$line" | jq -R '. as $line | try fromjson catch $line'
-done
-```
-
-### 3. 开发模式与生产模式切换
-
-```typescript
-// 检测运行环境
-const isProduction = process.env.NODE_ENV === 'production';
-
-if (isProduction) {
-  // 使用 Winston（A2A Server 模式）
-  const logger = winston.createLogger({...});
-} else {
-  // 使用 DebugLogger（开发模式）
-  debugLogger.log('Development mode');
-}
-```
-
-### 4. 在代码中正确使用 DebugLogger
-
-```typescript
-// ❌ 错误：会被 ESLint 拦截
-console.log('Processing request:', requestId);
-
-// ✅ 正确：使用 DebugLogger
-import { debugLogger } from '../utils/debugLogger';
-debugLogger.log('Processing request:', requestId);
-
-// ✅ 也可以输出结构化数据
-debugLogger.debug({
-  event: 'tool_execution',
-  tool: 'read_file',
-  args: { path: '/tmp/test.txt' },
-  timestamp: Date.now()
-});
-```
-
-### 5. 与 VS Code 集成
-
-在 `.vscode/settings.json` 中配置 ESLint：
-
-```json
-{
-  "eslint.rules.customizations": [
-    { "rule": "no-console", "severity": "error" }
-  ],
-  "editor.codeActionsOnSave": {
-    "source.fixAll.eslint": "explicit"
-  }
-}
-```
-
-### 6. 常见问题排查
-
-**Q: 日志文件没有生成？**
-```bash
-# 检查环境变量是否设置
-echo $GEMINI_DEBUG_LOG_FILE
-
-# 检查目录权限
-ls -la $(dirname $GEMINI_DEBUG_LOG_FILE)
-
-# 确保有写权限
-touch $GEMINI_DEBUG_LOG_FILE
-```
-
-**Q: 调试抽屉没有显示日志？**
-- 确保使用的是 `DebugLogger`，不是直接 `console.log`
-- 检查 `ConsolePatcher` 是否已初始化
-- 按 `Ctrl+D` 确认抽屉已打开
-
-**Q: 如何过滤特定级别的日志？**
-```bash
-# 在文件中只查看错误
-grep "ERROR" /tmp/gemini-debug.log
-
-# 或查看多个级别
-grep -E "(ERROR|WARN)" /tmp/gemini-debug.log
-```
-
-**Q: Winston 和 DebugLogger 如何选择？**
-
-| 场景 | 推荐 | 原因 |
-|------|------|------|
-| 服务端代码 | Winston | 结构化、可配置 |
-| 客户端代码 | DebugLogger | UI 集成、开发友好 |
-| 共享库代码 | DebugLogger | 统一调试体验 |
+- 前置知识：`02-gemini-cli-cli-entry.md`、`03-gemini-cli-session-runtime.md`
+- 相关机制：`04-gemini-cli-agent-loop.md`、`05-gemini-cli-tools-system.md`
+- 跨项目对比：`docs/comm/12-comm-logging.md`
+- 技术文档：[Winston 文档](https://github.com/winstonjs/winston)、[ESLint no-console](https://eslint.org/docs/latest/rules/no-console)
 
 ---
 
-## 证据索引
-
-| 组件 | 文件路径 | 行号 | 关键职责 |
-|------|----------|------|----------|
-| Winston | `gemini-cli/packages/a2a-server/src/utils/logger.ts` | 1-28 | A2A Server 日志配置 |
-| DebugLogger | `gemini-cli/packages/core/src/utils/debugLogger.ts` | 1-69 | 调试日志实现 |
-| ESLint | `gemini-cli/packages/core/.eslintrc.js` | - | 代码规范配置 |
-
----
-
-## 边界与不确定性
-
-- **⚠️ Inferred**: `ConsolePatcher` 的具体实现位于 UI 组件层，本分析未获取源码
-- **⚠️ Inferred**: 调试抽屉的具体 UI 组件名称可能为 `DebugDrawer` 或类似名称
-- **❓ Pending**: ESLint 规则的具体配置文件位置未确认，可能在根目录或各包目录
-- **✅ Verified**: `GEMINI_DEBUG_LOG_FILE` 环境变量和文件输出逻辑已确认
-
----
-
-## 设计亮点
-
-1. **双模式设计**: 区分服务端与客户端的不同日志需求
-2. **意图明确**: DebugLogger 明确标识开发者日志 vs 用户日志
-3. **工具强制**: ESLint 规则确保团队一致使用 DebugLogger
-4. **UI 集成**: 调试日志实时展示在调试抽屉，提升开发体验
-5. **可选持久化**: 通过环境变量控制文件输出，灵活适应不同场景
+*✅ Verified: 基于 gemini-cli/packages/{a2a-server,core}/src/utils/{logger,debugLogger}.ts 源码分析*
+*⚠️ Inferred: ConsolePatcher 和 Debug Drawer 的具体实现位于 UI 组件层，本分析未获取源码*
+*基于版本：2026-02-08 | 最后更新：2026-02-24*
