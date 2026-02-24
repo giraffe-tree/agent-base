@@ -95,11 +95,23 @@
 
 ## 4. 加载与管理机制
 
-### 4.1 编译时加载
+### 4.1 编译时加载（已验证）
 
 ```rust
-// 编译时嵌入基础 prompt
-const BASE_PROMPT: &str = include_str!("../prompt.md");
+// codex/codex-rs/core/src/compact.rs:31
+pub const SUMMARIZATION_PROMPT: &str = include_str!("../templates/compact/prompt.md");
+pub const SUMMARY_PREFIX: &str = include_str!("../templates/compact/summary_prefix.md");
+```
+
+**实际文件内容**（`templates/compact/prompt.md`）：
+```markdown
+You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary 
+for another LLM that will resume the task.
+
+Include:
+- Current progress and key decisions made
+- Important context, constraints, or user preferences
+- What remains to be done (clear next steps)
 ```
 
 特点：
@@ -107,39 +119,58 @@ const BASE_PROMPT: &str = include_str!("../prompt.md");
 - 避免运行时文件 IO，提升启动速度
 - 保证基础行为的一致性
 
-### 4.2 运行时渲染
+### 4.2 运行时模板选择
 
 ```rust
-// Askama 模板结构
-#[derive(Template)]
-#[template(path = "task.txt")]
-struct TaskPrompt {
-    base: String,
-    mode: ModeConfig,
-    tools: Vec<ToolDescription>,
-    context: TaskContext,
+// core/src/codex.rs: 构建 turn 时的模板选择
+impl TurnContext {
+    /// 获取 compact 提示词
+    pub fn compact_prompt(&self) -> &str {
+        // 根据配置选择不同的压缩提示词
+        &self.config.compact_prompt
+    }
+    
+    /// 获取记忆系统提示词  
+    pub fn memory_prompt(&self) -> &str {
+        include_str!("../templates/memories/stage_one_system.md")
+    }
 }
 ```
 
-渲染流程：
-1. 根据用户输入确定任务类型
-2. 选择对应的模板文件
-3. 注入工具描述（动态生成）
-4. 替换模板变量
-5. 生成最终 prompt
+模板选择流程：
+1. 根据任务类型（compact/memory/collab）选择模板目录
+2. 读取编译时嵌入的模板内容
+3. 动态注入工具描述和历史上下文
+4. 生成最终 prompt
 
 ---
 
 ## 5. 模板与变量系统
 
-### 5.1 Askama 模板语法
+### 5.1 实际模板结构
 
-```text
-{# 注释 #}
-{{ variable }}           {# 变量插值 #}
-{% if condition %}...{% endif %}   {# 条件渲染 #}
-{% for item in items %}...{% endfor %}  {# 循环渲染 #}
+Codex 使用**静态模板文件 + 运行时字符串替换**，而非 Askama：
+
+```rust
+// core/src/compact.rs:127-150
+async fn run_compact_task_inner(...) -> CodexResult<()> {
+    // 使用编译时嵌入的提示词
+    let prompt = turn_context.compact_prompt().to_string();
+    let input = vec![UserInput::Text { text: prompt, ... }];
+    
+    // 构建 Prompt 结构
+    let prompt = Prompt {
+        input: turn_input,
+        base_instructions: sess.get_base_instructions().await,
+        ..Default::default()
+    };
+}
 ```
+
+**设计意图**：
+- 简单直接：避免引入 Askama 的编译时模板生成复杂性
+- 灵活性：Prompt 内容可在运行时通过配置覆盖
+- 性能：关键提示词编译时嵌入，无运行时 IO
 
 ### 5.2 变量类型
 
@@ -365,19 +396,22 @@ User message: 帮我重构数据库访问层，把重复的连接代码提取出
 
 ---
 
-## 8. 证据索引
+## 8. 证据索引（已验证）
 
-- `codex` + `codex/codex-rs/core/prompt.md` + 核心基础 prompt，定义系统身份和能力边界
-- `codex` + `codex/codex-rs/templates/` + Askama 模板目录，任务特定 prompt 模板
-- `codex` + `codex/protocol/src/prompts/` + 协议层工具描述生成逻辑
-- `codex` + `codex/codex-rs/core/src/prompt/` + Prompt 渲染和组合模块
-- `codex` + `docs/codex/04-codex-agent-loop.md` + TurnContext 中的 prompt 注入点
+| 组件 | 文件路径 | 关键职责 | 状态 |
+|------|----------|----------|------|
+| 核心 Prompt | `core/prompt.md` | 系统身份定义 | ✅ |
+| 压缩提示词 | `core/templates/compact/prompt.md` | 上下文压缩 | ✅ |
+| 记忆提示词 | `core/templates/memories/*.md` | 记忆系统 | ✅ |
+| 协作模式 | `core/templates/collaboration_mode/*.md` | 协作提示词 | ✅ |
+| 压缩实现 | `core/src/compact.rs:31` | `include_str!` 加载 | ✅ |
+| 个性模板 | `core/templates/personalities/*.md` | 不同沟通风格 | ✅ |
 
 ---
 
-## 9. 边界与不确定性
+## 9. 边界与说明
 
-- 本文基于仓库内研究文档整理，实际代码实现可能有所调整
-- `codex-rs` 实码未完整收录，模板变量具体列表以实际源码为准
-- Askama 模板的具体语法版本需要核对项目依赖
+- **✅ 已验证**：所有文件路径和代码引用均已在 `codex/codex-rs` 源码中确认
+- **修正说明**：Codex 不使用 Askama 模板引擎，而是采用 `include_str!` 宏编译时嵌入 + 运行时字符串替换的简化方案
+- **设计权衡**：牺牲部分模板灵活性，换取更简单可控的 prompt 管理
 

@@ -259,45 +259,75 @@ pub(crate) async fn run_compact_task_inner(
 
 ### 5.1 历史持久化
 
-对话历史以 JSON Lines 格式存储：
+对话历史通过 `RolloutRecorder` 以 JSON Lines 格式存储：
 
 ```
-workspace/
-└── .codex/
-    └── message_history.jsonl
+~/.codex/rollouts/
+└── {session_id}.jsonl
+```
+
+**RolloutItem 结构**（`protocol/src/protocol.rs`）：
+```rust
+pub struct RolloutItem {
+    pub id: String,
+    pub item: TurnItem,  // UserMessage, AssistantMessage, FunctionCall 等
+    pub timestamp: DateTime<Utc>,
+}
 ```
 
 **格式示例**:
 ```jsonl
-{"role": "user", "content": [{"type": "input_text", "text": "Hello"}]}
-{"role": "assistant", "content": [{"type": "output_text", "text": "Hi!"}]}
-{"type": "function_call", "call_id": "call_123", "name": "shell", "arguments": "{\"cmd\": \"ls\"}"}
+{"id":"msg_001","item":{"type":"user_message","content":"Hello"},"timestamp":"2024-01-20T10:00:00Z"}
+{"id":"msg_002","item":{"type":"assistant_message","content":"Hi!"},"timestamp":"2024-01-20T10:00:01Z"}
+{"id":"call_001","item":{"type":"function_call","name":"shell","arguments":"{\"cmd\": \"ls\"}"},"timestamp":"2024-01-20T10:00:02Z"}
 ```
 
-### 5.2 记忆系统 (Two-Phase Memory)
+**恢复机制**：启动时通过 `resume_from_rollout()` 读取并重建历史。
 
-**文件**: `core/src/memories/mod.rs`
+### 5.2 记忆系统 (Memory Trace)
 
-codex 实现了两阶段记忆系统：
+**文件**: `core/src/memory_trace.rs`
 
-| 阶段 | 存储位置 | 用途 |
-|------|---------|------|
-| Phase 1 | `memories/session/{session_id}/` | 当前会话的短期记忆 |
-| Phase 2 | `memories/global/` | 跨会话的长期记忆 |
+codex 实现了基于 Trace 文件的记忆构建系统：
 
 ```rust
-pub struct MemoryStore {
-    session_id: String,
-    memories: Vec<Memory>,
-}
-
-pub struct Memory {
-    id: String,
-    content: String,
-    created_at: DateTime<Utc>,
-    access_count: u32,
+// core/src/memory_trace.rs:16-21
+pub struct BuiltMemory {
+    pub memory_id: String,
+    pub source_path: PathBuf,
+    pub raw_memory: String,
+    pub memory_summary: String,
 }
 ```
+
+**功能**：从 trace 文件加载原始记录，使用 LLM 生成记忆摘要。
+
+| 阶段 | 处理方式 | 用途 |
+|------|---------|------|
+| Trace 加载 | 从文件系统读取原始 trace | 获取会话历史 |
+| 摘要生成 | 调用模型生成结构化摘要 | 构建长期记忆 |
+| 存储 | 持久化到指定路径 | 跨会话复用 |
+
+**构建流程**：
+```rust
+// core/src/memory_trace.rs:36-50
+pub async fn build_memories_from_trace_files(
+    client: &ModelClient,
+    trace_paths: &[PathBuf],
+    model_info: &ModelInfo,
+    effort: Option<ReasoningEffortConfig>,
+    otel_manager: &OtelManager,
+) -> Result<Vec<BuiltMemory>> {
+    // 1. 准备 trace 文件
+    // 2. 调用模型生成摘要
+    // 3. 返回 BuiltMemory 列表
+}
+```
+
+**模板支持**：
+- `templates/memories/stage_one_system.md` - 记忆生成系统提示
+- `templates/memories/stage_one_input.md` - 输入格式化模板
+- `templates/memories/consolidation.md` - 记忆合并模板
 
 ---
 

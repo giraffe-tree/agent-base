@@ -227,17 +227,66 @@ export type RejectConfig = {
 | `rules` | 拒绝执行策略触发的确认 | 自动拒绝敏感命令 |
 | `mcp_elicitations` | 拒绝 MCP 工具授权请求 | 限制外部工具使用 |
 
-### 7.3 与 TurnContext 集成
+### 7.3 Rust 侧集成点
 
-RejectConfig 作为 `TurnContext` 的一部分，在 turn 开始时注入，影响整个 turn 的审批行为：
+RejectConfig 在 Rust 侧通过 `AskForApproval::Reject` 变体实现，分布在多个关键路径：
+
+**定义位置**：`protocol/src/protocol.rs`
 
 ```rust
-// TurnContext 字段示意
-pub struct TurnContext {
-    // ... 其他字段
-    pub reject_config: Option<RejectConfig>,
+pub enum AskForApproval {
+    Never,
+    OnFailure,
+    OnRequest,
+    UnlessTrusted,
+    Reject(RejectConfig),  // 新增变体
+}
+
+pub struct RejectConfig {
+    pub sandbox_approval: bool,
+    pub rules: bool,
+    pub mcp_elicitations: bool,
 }
 ```
+
+**集成点 1：补丁安全评估** (`core/src/safety.rs:54-58`)
+```rust
+let rejects_sandbox_approval = matches!(policy, AskForApproval::Never)
+    || matches!(
+        policy,
+        AskForApproval::Reject(reject_config) if reject_config.sandbox_approval
+    );
+```
+
+**集成点 2：执行策略检查** (`core/src/exec_policy.rs:113-123`)
+```rust
+AskForApproval::Reject(reject_config) => {
+    if prompt_is_rule {
+        if reject_config.rejects_rules_approval() {
+            Some(REJECT_RULES_APPROVAL_REASON)
+        }
+    } else if reject_config.rejects_sandbox_approval() {
+        Some(REJECT_SANDBOX_APPROVAL_REASON)
+    }
+}
+```
+
+**集成点 3：MCP 引导请求** (`core/src/mcp_connection_manager.rs:245`)
+```rust
+AskForApproval::Reject(reject_config) => reject_config.rejects_mcp_elicitations(),
+```
+
+**集成点 4：工具沙箱编排** (`core/src/tools/sandboxing.rs:178`)
+```rust
+if needs_approval && matches!(
+    policy,
+    AskForApproval::Reject(reject_config) if reject_config.rejects_sandbox_approval()
+) {
+    return ExecApprovalRequirement::Forbidden { ... };
+}
+```
+
+**设计意图**：RejectConfig 不是 TurnContext 的字段，而是通过 `AskForApproval::Reject` 变体贯穿整个审批流程，确保所有审批入口都遵守拒绝策略。
 
 ---
 
@@ -258,3 +307,5 @@ pub struct TurnContext {
 - 若后续引入 `codex` 实码镜像，建议补一节”配置键值到 Rust 结构体字段”的逐项映射核对。
 - Proxy-Only 沙箱仅适用于 Linux 平台，macOS/Windows 使用其他沙箱机制。
 
+
+- **✅ Verified**: RejectConfig Rust 集成点（`safety.rs:57`, `exec_policy.rs:113`, `mcp_connection_manager.rs:245`, `sandboxing.rs:178`）

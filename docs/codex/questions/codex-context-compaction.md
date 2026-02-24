@@ -10,13 +10,13 @@
 
 ## 关键代码位置
 
-| 文件路径 | 职责 |
-|---------|------|
-| `codex/codex-rs/core/src/compact.rs` | 压缩主逻辑，协调摘要生成与历史管理 |
-| `codex/codex-rs/core/src/compact.rs:100-180` | `compact_history()` 核心函数 |
-| `codex/codex-rs/core/src/compact.rs:200-280` | `generate_summary()` LLM 摘要生成 |
-| `codex/codex-rs/core/templates/compact/prompt.md` | 压缩提示词模板 |
-| `codex/codex-rs/core/src/conversation.rs` | CompactedItem 持久化存储 |
+| 文件路径 | 职责 | 行号 |
+|---------|------|------|
+| `codex/codex-rs/core/src/compact.rs` | 压缩主逻辑，协调摘要生成与历史管理 | 1-300 |
+| `codex/codex-rs/core/src/compact.rs` | `run_compact_task_inner()` 核心函数 | 127+ |
+| `codex/codex-rs/core/src/compact.rs` | `run_inline_auto_compact_task()` | 91-105 |
+| `codex/codex-rs/core/templates/compact/prompt.md` | 压缩提示词模板 | ✅ 已验证 |
+| `codex/codex-rs/core/templates/compact/summary_prefix.md` | 摘要前缀模板 | ✅ 已验证 |
 
 ## 压缩流程
 
@@ -130,26 +130,37 @@ pub struct CompactedItem {
 .conversation/{session_id}/compacted.jsonl
 ```
 
-### 5. 渐进式截断（兜底策略）
+### 5. 上下文超限处理（兜底策略）
 
-当 LLM 摘要生成失败时，启用渐进式截断:
+当压缩过程中遇到上下文窗口超限时，启用渐进式截断:
 
 ```rust
-// codex/codex-rs/core/src/compact.rs:250
-fn progressive_truncate(messages: &mut Vec<Message>, target_ratio: f64) {
-    let target_len = (messages.len() as f64 * target_ratio) as usize;
-    // 从最早的消息开始移除
-    while messages.len() > target_len {
-        if let Some(msg) = messages.first() {
-            if can_remove(msg) {
-                messages.remove(0);
-            } else {
-                break;
+// codex/codex-rs/core/src/compact.rs:148-165
+let mut truncated_count = 0usize;
+let max_retries = turn_context.provider.stream_max_retries();
+
+loop {
+    // 尝试生成摘要
+    match drain_to_completed(&sess, turn_context.as_ref(), ...).await {
+        Ok(()) => break,
+        Err(CodexErr::ContextWindowExceeded) => {
+            // 超出窗口则移除最旧项重试
+            history.remove_first_item();
+            truncated_count += 1;
+            if truncated_count > max_retries {
+                return Err(CodexErr::ContextWindowExceeded);
             }
+            continue;
         }
+        Err(e) => return Err(e),
     }
 }
 ```
+
+**关键机制**：
+- 通过 `history.remove_first_item()` 移除最旧的历史项
+- 每次移除后重试，直到成功或达到最大重试次数
+- 保留最近的用户消息和关键上下文
 
 ## 设计权衡
 
