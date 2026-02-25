@@ -1,4 +1,4 @@
-# kimi-cli 架构概述
+# kimi-cli 概述
 
 ## TL;DR（结论先行）
 
@@ -680,7 +680,7 @@ async def _agent_loop(self) -> TurnOutcome:
 ```text
 Shell.run()               [src/kimi_cli/ui/shell/__init__.py:51]
   -> run_soul_command()   [src/kimi_cli/ui/shell/__init__.py:214]
-    -> run_soul()         [src/kimi_cli/soul/__init__.py:*]
+    -> run_soul()         [src/kimi_cli/soul/__init__.py:121]
       -> KimiSoul.run()   [src/kimi_cli/soul/kimisoul.py:182]
         -> _turn()        [src/kimi_cli/soul/kimisoul.py:210]
           -> _checkpoint() [src/kimi_cli/soul/kimisoul.py:175]
@@ -803,10 +803,10 @@ gitGraph
 
 | 配置项 | 默认值 | 说明 | 代码位置 |
 |-------|-------|------|---------|
-| max_steps_per_turn | 100 | 每回合最大步数 | `config.py:*` |
-| max_retries_per_step | 3 | 每步最大重试次数 | `config.py:*` |
-| reserved_context_size | 4096 | 预留上下文空间 | `config.py:*` |
-| mcp.client.tool_call_timeout_ms | 60000 | MCP 工具调用超时 | `config.py:*` |
+| max_steps_per_turn | 100 | 每回合最大步数 | `config.py:71` |
+| max_retries_per_step | 3 | 每步最大重试次数 | `config.py:77` |
+| reserved_context_size | 4096 | 预留上下文空间 | `config.py:81` |
+| mcp.client.tool_call_timeout_ms | 60000 | MCP 工具调用超时 | `config.py:132` |
 
 ### 7.3 错误恢复策略
 

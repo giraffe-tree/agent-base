@@ -2,13 +2,13 @@
 
 ## TL;DR（结论先行）
 
-Qwen Code 是基于 Google Gemini CLI 架构构建的开源 AI 编程助手，采用 TypeScript/React/Ink 技术栈，通过 Monorepo 结构实现 cli/core 分层，提供企业级的 Session 管理、工具调度和 MCP 集成能力。
+一句话定义：Qwen Code 是基于 Google Gemini CLI 架构构建的开源 AI 编程助手，采用 TypeScript/React/Ink 技术栈，通过 Monorepo 结构实现 cli/core 分层，提供企业级的 Session 管理、工具调度和 MCP 集成能力。
 
 Qwen Code 的核心取舍：**继承 Gemini CLI 的成熟架构 + 开源社区驱动**（对比其他项目的独立架构如 Kimi CLI 的 Python 实现、Codex 的 Rust 实现）
 
 ---
 
-## 1. 为什么需要这个机制？（解决什么问题）
+## 1. 为什么需要这个架构？（解决什么问题）
 
 ### 1.1 问题场景
 
@@ -32,16 +32,23 @@ AI 编程助手需要解决的核心问题：
 | MCP 生态集成 | 无法扩展外部工具能力，功能受限 |
 | 交互式 UI 体验 | 纯文本交互体验差，用户难以跟踪进度 |
 
+### 1.3 技术栈
+
+- **语言**: TypeScript (Node.js)
+- **UI 框架**: React + Ink（终端渲染）
+- **包管理**: npm + Monorepo (npm workspaces)
+- **核心依赖**: @google/genai, @modelcontextprotocol/sdk
+
 ---
 
 ## 2. 整体架构（ASCII 图）
 
-### 2.1 在系统中的位置
+### 2.1 分层架构图
 
 ```text
 ┌─────────────────────────────────────────────────────────────────┐
 │                        CLI Layer                                │
-│  qwen-code/packages/cli/index.ts:1                              │
+│  qwen-code/packages/cli/index.ts:14                             │
 │  ├─ 全局异常处理 (FatalError)                                     │
 │  ├─ main() 入口                                                 │
 │  └─ 子命令分发 (interactive/non-interactive)                    │
@@ -79,19 +86,19 @@ AI 编程助手需要解决的核心问题：
 ┌─────────────────────────────────────────────────────────────────┐
 │                      Tools Layer                                │
 │  qwen-code/packages/core/src/tools/                             │
-│  ├─ tool-registry.ts     # 工具注册与发现                        │
-│  ├─ mcp-client-manager.ts # MCP 客户端管理                       │
-│  ├─ coreToolScheduler.ts  # 工具调度执行                         │
-│  └─ handlers/            # 内置工具实现                          │
+│  ├─ tool-registry.ts:174     # 工具注册与发现                    │
+│  ├─ mcp-client-manager.ts:29 # MCP 客户端管理                    │
+│  ├─ coreToolScheduler.ts     # 工具调度执行                      │
+│  └─ handlers/                # 内置工具实现                      │
 └─────────────────────────────────────────────────────────────────┘
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                     Services Layer                              │
 │  qwen-code/packages/core/src/services/                          │
-│  ├─ sessionService.ts    # JSONL 会话持久化                      │
-│  ├─ chatCompressionService.ts # 上下文压缩                       │
-│  └─ chatRecordingService.ts   # 聊天记录记录                     │
+│  ├─ sessionService.ts:128    # JSONL 会话持久化                  │
+│  ├─ chatCompressionService.ts:78 # 上下文压缩                    │
+│  └─ loopDetectionService.ts:78   # 循环检测                      │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -99,31 +106,19 @@ AI 编程助手需要解决的核心问题：
 
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
-| `CLI 入口` | 全局异常处理、主函数入口 | `packages/cli/index.ts:14` |
-| `主程序` | 配置加载、UI 渲染、模式分发 | `packages/cli/src/gemini.tsx:209` |
-| `初始化器` | 认证、主题、i18n 初始化 | `packages/cli/src/core/initializer.ts:33` |
-| `GeminiClient` | Agent Loop 主控、递归续跑 | `packages/core/src/core/client.ts:78` |
-| `Turn` | 单轮流式处理、事件解析 | `packages/core/src/core/turn.ts:221` |
-| `GeminiChat` | API 调用、流式响应处理 | `packages/core/src/core/geminiChat.ts` |
-| `ToolRegistry` | 工具注册、发现、冲突处理 | `packages/core/src/tools/tool-registry.ts:174` |
-| `McpClientManager` | MCP 客户端生命周期管理 | `packages/core/src/tools/mcp-client-manager.ts:29` |
-| `SessionService` | 会话列表、恢复、删除 | `packages/core/src/services/sessionService.ts:128` |
-| `ChatCompressionService` | 历史压缩、token 管理 | `packages/core/src/services/chatCompressionService.ts:78` |
-
-### 2.3 核心组件职责
-
-| 组件 | 职责 | 代码位置 |
-|-----|------|---------|
 | `CLI Entry` | 全局异常处理、主函数入口 | `packages/cli/index.ts:14` |
 | `GeminiApp` | 配置加载、UI 渲染、模式分发 | `packages/cli/src/gemini.tsx:209` |
+| `Initializer` | 认证、主题、i18n 初始化 | `packages/cli/src/core/initializer.ts:33` |
 | `GeminiClient` | Agent Loop 主控、递归续跑 | `packages/core/src/core/client.ts:78` |
 | `Turn` | 单轮流式处理、事件解析 | `packages/core/src/core/turn.ts:221` |
+| `GeminiChat` | API 调用、流式响应处理 | `packages/core/src/core/geminiChat.ts:40` |
 | `ToolRegistry` | 工具注册、发现、冲突处理 | `packages/core/src/tools/tool-registry.ts:174` |
 | `McpClientManager` | MCP 客户端生命周期管理 | `packages/core/src/tools/mcp-client-manager.ts:29` |
 | `SessionService` | 会话列表、恢复、删除 | `packages/core/src/services/sessionService.ts:128` |
 | `ChatCompressionService` | 历史压缩、token 管理 | `packages/core/src/services/chatCompressionService.ts:78` |
+| `LoopDetectionService` | 循环检测、防止无限循环 | `packages/core/src/services/loopDetectionService.ts:78` |
 
-### 2.4 核心组件交互关系
+### 2.3 组件交互时序
 
 ```mermaid
 sequenceDiagram
@@ -177,256 +172,153 @@ sequenceDiagram
 
 ---
 
-## 3. 核心组件详细分析
+## 3. 核心机制概览
 
-### 3.1 GeminiClient 内部结构
+### 3.1 Agent Loop（递归续跑机制）
 
-#### 职责定位
+Qwen Code 采用**递归续跑**而非 while 循环来实现 Agent Loop：
 
-GeminiClient 是 Qwen Code 的核心控制器，负责管理整个 Agent 生命周期，包括消息发送、Turn 协调、递归续跑和循环检测。
+```typescript
+// packages/core/src/core/client.ts:403-572
+async *sendMessageStream(
+  request: PartListUnion,
+  signal: AbortSignal,
+  prompt_id: string,
+  options?: { isContinuation: boolean },
+  turns: number = MAX_TURNS,  // MAX_TURNS = 100
+): AsyncGenerator<ServerGeminiStreamEvent, Turn> {
+  // 1. 检查循环检测
+  if (!options?.isContinuation) {
+    this.loopDetector.reset(prompt_id);
+  }
 
-#### 状态机图
+  // 2. 检查最大回合数限制
+  this.sessionTurnCount++;
+  if (this.sessionTurnCount > this.config.getMaxSessionTurns()) {
+    yield { type: GeminiEventType.MaxSessionTurns };
+    return turn;
+  }
 
-```mermaid
-stateDiagram-v2
-    [*] --> Idle: 初始化
-    Idle --> Processing: sendMessageStream()
-    Processing --> WaitingForTurn: 创建 Turn
-    WaitingForTurn --> Streaming: Turn.run()
-    Streaming --> ToolExecuting: 收到工具调用
-    ToolExecuting --> Streaming: 工具结果返回
-    Streaming --> TurnCompleted: 单轮结束
-    TurnCompleted --> Processing: 需要续跑
-    TurnCompleted --> Idle: 任务完成
-    Processing --> Error: 发生错误
-    Error --> Idle: 错误处理
+  // 3. 尝试压缩上下文
+  const compressed = await this.tryCompressChat(prompt_id, false);
+
+  // 4. 创建并执行 Turn
+  const turn = new Turn(this.getChat(), prompt_id);
+  const resultStream = turn.run(model, requestToSent, signal);
+
+  // 5. 处理 Turn 结果流
+  for await (const event of resultStream) {
+    // 检查循环检测
+    if (this.loopDetector.addAndCheck(event)) {
+      yield { type: GeminiEventType.LoopDetected };
+      return turn;
+    }
+    yield event;
+  }
+
+  // 6. 检查是否需要续跑（递归调用）
+  if (!turn.pendingToolCalls.length && !signal.aborted) {
+    const nextSpeakerCheck = await checkNextSpeaker(...);
+    if (nextSpeakerCheck?.next_speaker === 'model') {
+      const nextRequest = [{ text: 'Please continue.' }];
+      yield* this.sendMessageStream(
+        nextRequest, signal, prompt_id, options, boundedTurns - 1
+      );
+    }
+  }
+  return turn;
+}
 ```
 
-**状态说明**：
+代码依据：`packages/core/src/core/client.ts:403`
 
-| 状态 | 说明 | 进入条件 | 退出条件 |
-|-----|------|---------|---------|
-| Idle | 空闲等待 | 初始化完成或任务结束 | 收到新消息 |
-| Processing | 处理中 | 开始处理用户消息 | Turn 创建或出错 |
-| WaitingForTurn | 等待 Turn | Turn 实例创建中 | Turn 开始运行 |
-| Streaming | 流式接收 | Turn 开始运行 | 单轮结束或工具调用 |
-| ToolExecuting | 执行工具 | 收到工具调用请求 | 工具执行完成 |
-| TurnCompleted | Turn 完成 | 单轮对话结束 | 判断是否需要续跑 |
-| Error | 错误状态 | 处理过程中出错 | 错误恢复或终止 |
+### 3.2 Turn 单轮处理
 
-#### 关键算法：递归续跑机制
+Turn 类封装单轮对话的完整生命周期：
 
-```mermaid
-flowchart TD
-    A[sendMessageStream 开始] --> B{检查循环检测}
-    B -->|检测到循环| C[抛出 LoopDetectedError]
-    B -->|正常| D[创建 Turn 实例]
+```typescript
+// packages/core/src/core/turn.ts:221-390
+export class Turn {
+  readonly pendingToolCalls: ToolCallRequestInfo[] = [];
 
-    D --> E[执行 Turn.run]
-    E --> F{Turn 结果}
+  async *run(
+    model: string,
+    req: PartListUnion,
+    signal: AbortSignal,
+  ): AsyncGenerator<ServerGeminiStreamEvent> {
+    const responseStream = await this.chat.sendMessageStream(model, {...}, this.prompt_id);
 
-    F -->|正常完成| G{需要续跑?}
-    F -->|出错| H[错误处理]
+    for await (const streamEvent of responseStream) {
+      const resp = streamEvent.value as GenerateContentResponse;
 
-    G -->|是| I{递归深度 < 上限?}
-    G -->|否| J[返回结果]
+      // 处理思考内容
+      const thoughtText = getThoughtText(resp);
+      if (thoughtText) {
+        yield { type: GeminiEventType.Thought, value: parseThought(thoughtText) };
+      }
 
-    I -->|是| K[递归调用 sendMessageStream]
-    I -->|否| L[抛出 MaxDepthError]
+      // 处理文本内容
+      const text = getResponseText(resp);
+      if (text) {
+        yield { type: GeminiEventType.Content, value: text };
+      }
 
-    K --> M[合并结果]
-    M --> J
+      // 处理函数调用
+      const functionCalls = resp.functionCalls ?? [];
+      for (const fnCall of functionCalls) {
+        yield this.handlePendingFunctionCall(fnCall);
+      }
 
-    H --> N{可恢复?}
-    N -->|是| E
-    N -->|否| O[抛出错误]
-
-    style C fill:#FF6B6B
-    style L fill:#FF6B6B
-    style O fill:#FF6B6B
-    style J fill:#90EE90
+      // 检查完成原因
+      const finishReason = resp.candidates?.[0]?.finishReason;
+      if (finishReason) {
+        yield { type: GeminiEventType.Finished, value: { reason: finishReason, ... } };
+      }
+    }
+  }
+}
 ```
 
-**算法要点**：
+代码依据：`packages/core/src/core/turn.ts:233`
 
-1. **循环检测**：在每次续跑前检查是否陷入循环（如重复执行相同工具）
-2. **递归深度限制**：防止无限递归，默认有最大深度限制
-3. **结果合并**：续跑时将多轮结果合并为连贯的回复
+### 3.3 循环检测机制
 
-#### 关键接口
+LoopDetectionService 提供三层循环检测：
 
-| 接口 | 输入 | 输出 | 说明 | 代码位置 |
-|-----|------|------|------|---------|
-| `sendMessageStream()` | 用户消息、配置 | 流式响应 | Agent Loop 入口 | `packages/core/src/core/client.ts:403` |
-| `processTurn()` | Turn 配置 | Turn 结果 | 单轮处理 | `packages/core/src/core/client.ts:221` |
-| `shouldContinue()` | Turn 结果 | boolean | 判断是否续跑 | `packages/core/src/core/client.ts:285` |
+```typescript
+// packages/core/src/services/loopDetectionService.ts:78-491
+export class LoopDetectionService {
+  // 1. 工具调用循环检测（相同工具重复调用）
+  private toolCallRepetitionCount: number = 0;
+  private readonly TOOL_CALL_LOOP_THRESHOLD = 5;
 
-### 3.2 Turn 内部结构
+  // 2. 内容循环检测（重复文本片段）
+  private streamContentHistory = '';
+  private readonly CONTENT_LOOP_THRESHOLD = 10;
+  private readonly CONTENT_CHUNK_SIZE = 50;
 
-#### 职责定位
+  // 3. LLM 辅助循环检测（高阶语义分析）
+  private turnsInCurrentPrompt = 0;
+  private readonly LLM_CHECK_AFTER_TURNS = 30;
 
-Turn 封装了单轮对话的完整生命周期，负责与 LLM API 的流式通信、事件解析和工具调用管理。
-
-#### 内部数据流
-
-```text
-┌─────────────────────────────────────────────────────────────┐
-│  输入层                                                      │
-│  ├── 用户消息 ──► 历史记录加载 ──► 完整上下文                 │
-│  └── 工具定义 ──► ToolRegistry 获取 ──► 可用工具列表          │
-└──────────────────────────┬──────────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  处理层                                                      │
-│  ├── 流式响应处理器                                          │
-│  │   ├── 事件解析器: 解析 Content/ToolCall/Thought           │
-│  │   ├── 内容处理器: 实时输出文本                            │
-│  │   └── 工具调度器: 管理工具调用队列                        │
-│  ├── 工具执行器                                              │
-│  │   └── 并发执行 ──► 结果收集 ──► 格式化返回                │
-│  └── 状态管理器                                              │
-│      └── 跟踪当前 Turn 的执行状态                            │
-└──────────────────────────┬──────────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  输出层                                                      │
-│  ├── 响应内容格式化                                          │
-│  ├── 工具结果注入上下文                                      │
-│  └── 事件通知（完成/错误）                                   │
-└─────────────────────────────────────────────────────────────┘
+  addAndCheck(event: ServerGeminiStreamEvent): boolean {
+    switch (event.type) {
+      case GeminiEventType.ToolCallRequest:
+        return this.checkToolCallLoop(event.value);
+      case GeminiEventType.Content:
+        return this.checkContentLoop(event.value);
+    }
+  }
+}
 ```
 
-#### 关键接口
-
-| 接口 | 输入 | 输出 | 说明 | 代码位置 |
-|-----|------|------|------|---------|
-| `run()` | 配置、回调 | Promise<void> | 执行单轮对话 | `packages/core/src/core/turn.ts:233` |
-| `handleToolCalls()` | 工具调用列表 | 执行结果 | 调度和执行工具 | `packages/core/src/core/turn.ts:456` |
-| `parseEvent()` | 原始事件 | 结构化数据 | 解析流式事件 | `packages/core/src/core/turn.ts:312` |
-
-### 3.3 组件间协作时序
-
-展示完整的一次用户请求处理流程：
-
-```mermaid
-sequenceDiagram
-    participant U as 用户
-    participant App as GeminiApp
-    participant Client as GeminiClient
-    participant Turn as Turn
-    participant Tools as ToolRegistry
-    participant LLM as Gemini API
-
-    U->>App: 输入: "读取 package.json"
-    App->>Client: sendMessageStream(message)
-    activate Client
-
-    Client->>Client: 检查循环检测
-    Note right of Client: LoopDetectionService
-
-    Client->>Turn: new Turn(config)
-    Client->>Turn: run()
-    activate Turn
-
-    Turn->>Tools: 获取可用工具定义
-    Tools-->>Turn: 工具列表
-
-    Turn->>LLM: 发送请求（含工具定义）
-    activate LLM
-
-    LLM-->>Turn: 流式返回: "我来帮你读取..."
-    Turn-->>App: 实时显示文本
-    App-->>U: 显示: "我来帮你读取..."
-
-    LLM-->>Turn: 工具调用: read_file
-    Turn->>Tools: 执行 read_file
-    activate Tools
-    Tools-->>Turn: 返回文件内容
-    deactivate Tools
-
-    Turn->>LLM: 发送工具结果
-    LLM-->>Turn: 流式返回分析结果
-    Turn-->>App: 实时显示
-    deactivate LLM
-
-    Turn-->>Client: Turn 完成
-    deactivate Turn
-
-    Client->>Client: shouldContinue?
-    Note right of Client: 判断是否需要续跑
-
-    Client-->>App: 返回最终结果
-    deactivate Client
-
-    App-->>U: 显示完整响应
-```
-
-**协作要点**：
-
-1. **GeminiApp 与 GeminiClient**：通过回调函数实现流式输出，解耦 UI 与核心逻辑
-2. **GeminiClient 与 Turn**：Client 管理多轮，Turn 管理单轮，职责清晰
-3. **Turn 与 ToolRegistry**：Turn 负责调度时机，ToolRegistry 负责具体执行
-4. **流式处理**：所有响应都是流式的，提供实时反馈
-
-### 3.4 关键数据路径
-
-#### 主路径（正常流程）
-
-```mermaid
-flowchart LR
-    subgraph Input["输入阶段"]
-        I1[用户消息] --> I2[加载历史]
-        I2 --> I3[组装上下文]
-    end
-
-    subgraph Process["处理阶段"]
-        P1[创建 Turn] --> P2[调用 LLM]
-        P2 --> P3[流式解析]
-        P3 --> P4[工具执行]
-        P4 --> P5[结果返回]
-    end
-
-    subgraph Output["输出阶段"]
-        O1[格式化响应] --> O2[更新历史]
-        O2 --> O3[持久化存储]
-    end
-
-    I3 --> P1
-    P5 --> O1
-
-    style Process fill:#e1f5e1,stroke:#333
-```
-
-#### 异常路径（错误恢复）
-
-```mermaid
-flowchart TD
-    E[发生错误] --> E1{错误类型}
-    E1 -->|API 错误| R1[重试机制]
-    E1 -->|工具执行错误| R2[返回错误信息给 LLM]
-    E1 -->|循环检测| R3[终止并提示用户]
-
-    R1 --> R1A[指数退避重试]
-    R1A -->|成功| R1B[继续主路径]
-    R1A -->|失败| R2
-
-    R2 --> R2A[LLM 根据错误调整]
-    R3 --> R3A[提示用户介入]
-
-    R1B --> End[结束]
-    R2A --> End
-    R3A --> End
-
-    style R1 fill:#90EE90
-    style R2 fill:#FFD700
-    style R3 fill:#FF6B6B
-```
+代码依据：`packages/core/src/services/loopDetectionService.ts:78`
 
 ---
 
 ## 4. 端到端数据流转
 
-### 4.1 正常流程（详细版）
+### 4.1 数据流转图
 
 ```mermaid
 sequenceDiagram
@@ -468,6 +360,25 @@ sequenceDiagram
     App->>Session: 保存会话
 ```
 
+### 4.2 关键数据结构
+
+**Turn 事件类型定义**：
+
+```typescript
+// packages/core/src/core/turn.ts:52-67
+export enum GeminiEventType {
+  Content = 'content',                    // 文本内容
+  ToolCallRequest = 'tool_call_request',  // 工具调用请求
+  ToolCallResponse = 'tool_call_response', // 工具调用响应
+  Thought = 'thought',                    // 思考内容
+  ChatCompressed = 'chat_compressed',     // 上下文压缩
+  MaxSessionTurns = 'max_session_turns',  // 达到最大回合数
+  SessionTokenLimitExceeded = 'session_token_limit_exceeded', // Token 超限
+  Finished = 'finished',                  // 单轮完成
+  LoopDetected = 'loop_detected',         // 检测到循环
+}
+```
+
 **数据变换详情**：
 
 | 阶段 | 输入 | 处理 | 输出 | 代码位置 |
@@ -476,36 +387,7 @@ sequenceDiagram
 | 加载 | 会话 ID | 读取 JSONL | 消息历史数组 | `packages/core/src/services/sessionService.ts:128` |
 | 处理 | 消息 + 历史 | LLM 推理 | 流式事件 | `packages/core/src/core/turn.ts:233` |
 | 执行 | 工具调用 | 调度执行 | 执行结果 | `packages/core/src/tools/tool-registry.ts:174` |
-| 保存 | 新消息 | 追加 JSONL | 持久化存储 | `packages/core/src/services/sessionService.ts:200` |
-
-### 4.2 Monorepo 结构
-
-```text
-qwen-code/
-├── packages/
-│   ├── cli/              # CLI 入口与交互层
-│   │   ├── index.ts      # 程序入口
-│   │   ├── src/gemini.tsx    # React UI 主程序
-│   │   ├── src/core/initializer.ts   # 初始化流程
-│   │   ├── src/ui/       # Ink 组件
-│   │   └── src/commands/ # 子命令实现
-│   │
-│   └── core/             # 核心逻辑层
-│       ├── src/core/     # Agent 核心
-│       │   ├── client.ts     # GeminiClient
-│       │   ├── turn.ts       # Turn 管理
-│       │   └── geminiChat.ts # API 封装
-│       ├── src/tools/    # 工具系统
-│       │   ├── tool-registry.ts      # 工具注册表
-│       │   ├── mcp-client-manager.ts # MCP 管理
-│       │   └── *.ts      # 内置工具
-│       └── src/services/ # 服务层
-│           ├── sessionService.ts     # Session 管理
-│           └── chatCompressionService.ts # 上下文压缩
-│
-├── docs/                 # 文档站点
-└── integration-tests/    # 集成测试
-```
+| 保存 | 新消息 | 追加 JSONL | 持久化存储 | `packages/core/src/services/sessionService.ts:437` |
 
 ---
 
@@ -514,26 +396,28 @@ qwen-code/
 ### 5.1 核心数据结构
 
 ```typescript
-// packages/core/src/core/client.ts:78-120
-interface GeminiClientConfig {
-  apiKey: string;
-  model: string;
-  maxIterations: number;      // 最大递归深度
-  loopDetectionThreshold: number;  // 循环检测阈值
-  enableCompression: boolean; // 是否启用上下文压缩
+// packages/core/src/core/client.ts:78-95
+export class GeminiClient {
+  private chat?: GeminiChat;
+  private sessionTurnCount = 0;
+  private readonly loopDetector: LoopDetectionService;
+  private readonly MAX_TURNS = 100;
+
+  constructor(private readonly config: Config) {
+    this.loopDetector = new LoopDetectionService(config);
+  }
 }
 
-interface TurnConfig {
-  messages: Message[];
-  tools: ToolDefinition[];
-  onTextUpdate: (text: string) => void;
-  onToolCall: (call: ToolCall) => void;
-}
+// packages/core/src/core/turn.ts:221-232
+export class Turn {
+  readonly pendingToolCalls: ToolCallRequestInfo[] = [];
+  private debugResponses: GenerateContentResponse[] = [];
+  finishReason: FinishReason | undefined = undefined;
 
-interface TurnResult {
-  response: string;
-  toolCalls: ToolCall[];
-  shouldContinue: boolean;    // 是否需要续跑
+  constructor(
+    private readonly chat: GeminiChat,
+    private readonly prompt_id: string,
+  ) {}
 }
 ```
 
@@ -541,66 +425,104 @@ interface TurnResult {
 
 | 字段 | 类型 | 用途 |
 |-----|------|------|
-| `maxIterations` | `number` | 防止无限递归的安全限制 |
-| `loopDetectionThreshold` | `number` | 检测重复工具调用的阈值 |
-| `shouldContinue` | `boolean` | 指示是否需要递归续跑 |
+| `MAX_TURNS` | `number` | 防止无限递归的安全限制（默认 100） |
+| `sessionTurnCount` | `number` | 当前会话已执行的回合数 |
+| `loopDetector` | `LoopDetectionService` | 循环检测服务实例 |
+| `pendingToolCalls` | `ToolCallRequestInfo[]` | 待处理的工具调用队列 |
+| `finishReason` | `FinishReason` | LLM 响应的完成原因 |
 
 ### 5.2 主链路代码
 
 ```typescript
-// packages/core/src/core/client.ts:403-450
-async sendMessageStream(
-  message: string,
-  callbacks: StreamCallbacks
-): Promise<void> {
-  // 1. 检查循环检测
-  if (this.loopDetectionService.detectLoop()) {
-    throw new LoopDetectedError('检测到循环执行');
+// packages/core/src/core/client.ts:403-572
+async *sendMessageStream(
+  request: PartListUnion,
+  signal: AbortSignal,
+  prompt_id: string,
+  options?: { isContinuation: boolean },
+  turns: number = MAX_TURNS,
+): AsyncGenerator<ServerGeminiStreamEvent, Turn> {
+  // 1. 重置循环检测器（非续跑时）
+  if (!options?.isContinuation) {
+    this.loopDetector.reset(prompt_id);
+    this.lastPromptId = prompt_id;
+    this.stripThoughtsFromHistory();
   }
 
-  // 2. 创建 Turn 配置
-  const turnConfig: TurnConfig = {
-    messages: [...this.history, { role: 'user', content: message }],
-    tools: this.toolRegistry.getAllTools(),
-    onTextUpdate: callbacks.onTextUpdate,
-    onToolCall: callbacks.onToolCall,
-  };
-
-  // 3. 执行 Turn
-  const turn = new Turn(turnConfig);
-  const result = await turn.run();
-
-  // 4. 更新历史
-  this.history.push(...result.newMessages);
-
-  // 5. 检查是否需要续跑
-  if (result.shouldContinue && this.iterationCount < this.config.maxIterations) {
-    this.iterationCount++;
-    // 递归续跑
-    await this.sendMessageStream('', callbacks);
+  // 2. 检查最大回合数
+  this.sessionTurnCount++;
+  if (this.config.getMaxSessionTurns() > 0 &&
+      this.sessionTurnCount > this.config.getMaxSessionTurns()) {
+    yield { type: GeminiEventType.MaxSessionTurns };
+    return new Turn(this.getChat(), prompt_id);
   }
+
+  // 3. 尝试压缩上下文
+  const compressed = await this.tryCompressChat(prompt_id, false);
+  if (compressed.compressionStatus === CompressionStatus.COMPRESSED) {
+    yield { type: GeminiEventType.ChatCompressed, value: compressed };
+  }
+
+  // 4. 检查 Token 限制
+  const sessionTokenLimit = this.config.getSessionTokenLimit();
+  if (sessionTokenLimit > 0) {
+    const tokenCount = uiTelemetryService.getLastPromptTokenCount();
+    if (tokenCount > sessionTokenLimit) {
+      yield { type: GeminiEventType.SessionTokenLimitExceeded, ... };
+      return new Turn(this.getChat(), prompt_id);
+    }
+  }
+
+  // 5. 执行 Turn
+  const turn = new Turn(this.getChat(), prompt_id);
+  const resultStream = turn.run(this.config.getModel(), requestToSent, signal);
+
+  for await (const event of resultStream) {
+    // 6. 实时循环检测
+    if (!this.config.getSkipLoopDetection()) {
+      if (this.loopDetector.addAndCheck(event)) {
+        yield { type: GeminiEventType.LoopDetected };
+        return turn;
+      }
+    }
+    yield event;
+    if (event.type === GeminiEventType.Error) return turn;
+  }
+
+  // 7. 检查是否需要续跑
+  if (!turn.pendingToolCalls.length && signal && !signal.aborted) {
+    const nextSpeakerCheck = await checkNextSpeaker(...);
+    if (nextSpeakerCheck?.next_speaker === 'model') {
+      yield* this.sendMessageStream(
+        [{ text: 'Please continue.' }], signal, prompt_id, options, turns - 1
+      );
+    }
+  }
+  return turn;
 }
 ```
 
 **代码要点**：
 
-1. **循环检测前置**：在执行前检查是否陷入循环，避免无效调用
-2. **历史管理**：维护对话历史，支持上下文理解
-3. **递归续跑**：通过 `shouldContinue` 和 `maxIterations` 控制续跑逻辑
-4. **回调驱动**：使用回调函数实现流式输出，不阻塞主线程
+1. **递归续跑**：通过 `yield*` 递归调用实现续跑，而非 while 循环
+2. **循环检测前置**：在每次事件处理时检查循环，避免无效调用
+3. **上下文压缩**：自动压缩历史记录以控制 Token 使用量
+4. **多层级保护**：MAX_TURNS + MaxSessionTurns + LoopDetection 三重保护
 
 ### 5.3 关键调用链
 
 ```text
 main()                          [packages/cli/index.ts:14]
-  -> initializeApp()            [packages/cli/src/core/initializer.ts:33]
-    -> render GeminiApp         [packages/cli/src/gemini.tsx:209]
-      -> sendMessageStream()    [packages/core/src/core/client.ts:403]
-        -> processTurn()        [packages/core/src/core/client.ts:221]
-          -> Turn.run()         [packages/core/src/core/turn.ts:233]
-            - 创建流式请求
-            - 解析事件流
-            - 调度工具执行
+  -> main()                     [packages/cli/src/gemini.tsx:209]
+    -> initializeApp()          [packages/cli/src/core/initializer.ts:33]
+    -> startInteractiveUI()     [packages/cli/src/gemini.tsx:139]
+      -> AppContainer           [packages/cli/src/ui/AppContainer.tsx]
+        -> sendMessageStream()  [packages/core/src/core/client.ts:403]
+          -> turn.run()         [packages/core/src/core/turn.ts:233]
+            -> sendMessageStream [packages/core/src/core/geminiChat.ts:180]
+              - 创建流式请求
+              - 解析事件流
+              - 调度工具执行
 ```
 
 ---
@@ -617,6 +539,7 @@ main()                          [packages/cli/index.ts:14]
 | **UI 框架** | React + Ink | 原生终端（Codex） | 组件化开发，但增加运行时依赖 |
 | **语言** | TypeScript | Rust（Codex） | 开发效率高，但性能和安全沙箱较弱 |
 | **工具调度** | 集中式调度器 | 分布式执行 | 易于管理，但可能成为性能瓶颈 |
+| **循环检测** | 三层检测（工具+内容+LLM） | 简单规则检测 | 检测更全面，但增加计算开销 |
 
 ### 6.2 为什么这样设计？
 
@@ -677,7 +600,7 @@ flowchart LR
 | **OpenCode** | resetTimeoutOnProgress，长任务优化 | 需要执行长时间任务的场景 |
 | **SWE-agent** | forward_with_handling()，学术导向 | 学术研究、自动化软件工程 |
 
-### 6.4 技术栈对比
+**技术栈对比**：
 
 | 项目 | 语言 | UI 框架 | Agent Loop | 持久化 | 沙箱 |
 |-----|------|---------|-----------|--------|------|
@@ -696,32 +619,38 @@ flowchart LR
 
 | 终止原因 | 触发条件 | 代码位置 |
 |---------|---------|---------|
-| 用户中断 | Ctrl+C 信号 | `packages/cli/index.ts:25` |
-| 最大递归深度 | iterationCount >= maxIterations | `packages/core/src/core/client.ts:445` |
-| 循环检测 | 重复执行相同工具序列 | `packages/core/src/services/loopDetectionService.ts:45` |
-| API 错误 | 网络中断或 API 限流 | `packages/core/src/core/geminiChat.ts:156` |
-| 工具执行失败 | 工具返回错误 | `packages/core/src/core/turn.ts:478` |
+| 用户中断 | Ctrl+C 信号 | `packages/cli/index.ts:14` |
+| 最大递归深度 | iterationCount >= MAX_TURNS (100) | `packages/core/src/core/client.ts:429` |
+| 最大会话回合 | sessionTurnCount > maxSessionTurns | `packages/core/src/core/client.ts:421` |
+| 循环检测 | 重复执行相同工具序列 | `packages/core/src/services/loopDetectionService.ts:183` |
+| Token 超限 | tokenCount > sessionTokenLimit | `packages/core/src/core/client.ts:445` |
+| API 错误 | 网络中断或 API 限流 | `packages/core/src/core/turn.ts:327` |
 
 ### 7.2 超时/资源限制
 
 ```typescript
-// packages/core/src/core/client.ts:78-85
-const DEFAULT_CONFIG = {
-  maxIterations: 10,        // 最大递归深度
-  requestTimeout: 120000,   // 请求超时 120s
-  toolTimeout: 60000,       // 工具执行超时 60s
-  maxTokens: 8192,          // 最大输出 token
-};
+// packages/core/src/core/client.ts:76
+const MAX_TURNS = 100;
+
+// packages/core/src/services/loopDetectionService.ts:30-33
+const TOOL_CALL_LOOP_THRESHOLD = 5;
+const CONTENT_LOOP_THRESHOLD = 10;
+const MAX_HISTORY_LENGTH = 1000;
+
+// packages/core/src/services/chatCompressionService.ts:22-28
+const COMPRESSION_TOKEN_THRESHOLD = 0.7;  // 70% 上下文窗口时触发压缩
+const COMPRESSION_PRESERVE_THRESHOLD = 0.3; // 保留最近 30% 历史
 ```
 
 ### 7.3 错误恢复策略
 
 | 错误类型 | 处理策略 | 代码位置 |
 |---------|---------|---------|
-| 网络超时 | 指数退避重试 3 次 | `packages/core/src/core/geminiChat.ts:200` |
-| API 限流 | 等待后重试 | `packages/core/src/core/geminiChat.ts:215` |
-| 工具执行错误 | 返回错误信息给 LLM | `packages/core/src/core/turn.ts:478` |
-| 循环检测触发 | 终止并提示用户 | `packages/core/src/core/client.ts:410` |
+| 网络超时 | 指数退避重试 | `packages/core/src/utils/retry.ts` |
+| API 限流 | 60s 固定延迟重试（10 次） | `packages/core/src/core/geminiChat.ts:72` |
+| 无效内容 | 2 次尝试（1 初始 + 1 重试） | `packages/core/src/core/geminiChat.ts:62` |
+| 工具执行错误 | 返回错误信息给 LLM | `packages/core/src/core/turn.ts:357` |
+| 循环检测触发 | 终止并提示用户 | `packages/core/src/core/client.ts:492` |
 
 ---
 
@@ -729,8 +658,8 @@ const DEFAULT_CONFIG = {
 
 ### 8.1 核心文件
 
-| 组件 | 文件 | 行号 | 说明 |
-|-----|------|------|------|
+| 组件 | 文件路径 | 行号 | 说明 |
+|-----|----------|------|------|
 | CLI 入口 | `packages/cli/index.ts` | 14 | 主入口，异常处理 |
 | 主程序 | `packages/cli/src/gemini.tsx` | 209 | main() 函数 |
 | 初始化 | `packages/cli/src/core/initializer.ts` | 33 | 应用初始化 |
@@ -738,21 +667,29 @@ const DEFAULT_CONFIG = {
 | sendMessageStream | `packages/core/src/core/client.ts` | 403 | Agent Loop 入口 |
 | Turn | `packages/core/src/core/turn.ts` | 221 | Turn 管理 |
 | Turn.run | `packages/core/src/core/turn.ts` | 233 | 单轮执行 |
-| GeminiChat | `packages/core/src/core/geminiChat.ts` | 1 | API 封装 |
+| GeminiChat | `packages/core/src/core/geminiChat.ts` | 40 | API 封装 |
 
 ### 8.2 工具系统
 
-| 组件 | 文件 | 说明 |
-|-----|------|------|
-| ToolRegistry | `packages/core/src/tools/tool-registry.ts` | 工具注册表 |
-| McpClientManager | `packages/core/src/tools/mcp-client-manager.ts` | MCP 管理器 |
-| McpClient | `packages/core/src/tools/mcp-client.ts` | MCP 客户端 |
-| CoreToolScheduler | `packages/core/src/core/coreToolScheduler.ts` | 工具调度 |
+| 组件 | 文件路径 | 行号 | 说明 |
+|-----|----------|------|------|
+| ToolRegistry | `packages/core/src/tools/tool-registry.ts` | 174 | 工具注册表 |
+| McpClientManager | `packages/core/src/tools/mcp-client-manager.ts` | 29 | MCP 管理器 |
+| McpClient | `packages/core/src/tools/mcp-client.ts` | 1 | MCP 客户端 |
+| CoreToolScheduler | `packages/core/src/core/coreToolScheduler.ts` | 1 | 工具调度 |
 
-### 8.3 内置工具
+### 8.3 服务层
 
-| 工具 | 文件 | 说明 |
-|-----|------|------|
+| 组件 | 文件路径 | 行号 | 说明 |
+|-----|----------|------|------|
+| SessionService | `packages/core/src/services/sessionService.ts` | 128 | 会话管理 |
+| ChatCompressionService | `packages/core/src/services/chatCompressionService.ts` | 78 | 上下文压缩 |
+| LoopDetectionService | `packages/core/src/services/loopDetectionService.ts` | 78 | 循环检测 |
+
+### 8.4 内置工具
+
+| 工具 | 文件路径 | 说明 |
+|-----|----------|------|
 | read-file | `packages/core/src/tools/read-file.ts` | 文件读取 |
 | write-file | `packages/core/src/tools/write-file.ts` | 文件写入 |
 | edit | `packages/core/src/tools/edit.ts` | 文件编辑 |
@@ -763,14 +700,6 @@ const DEFAULT_CONFIG = {
 | web-fetch | `packages/core/src/tools/web-fetch.ts` | 网页获取 |
 | memory | `packages/core/src/tools/memoryTool.ts` | 记忆存储 |
 | todoWrite | `packages/core/src/tools/todoWrite.ts` | 待办事项 |
-
-### 8.4 服务层
-
-| 组件 | 文件 | 说明 |
-|-----|------|------|
-| SessionService | `packages/core/src/services/sessionService.ts` | 会话管理 |
-| ChatCompressionService | `packages/core/src/services/chatCompressionService.ts` | 上下文压缩 |
-| LoopDetectionService | `packages/core/src/services/loopDetectionService.ts` | 循环检测 |
 
 ---
 
@@ -783,5 +712,5 @@ const DEFAULT_CONFIG = {
 
 ---
 
-*⚠️ Inferred: 本文档基于 Gemini CLI 架构分析，qwen-code 具体实现细节以实际源码为准。*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*✅ Verified: 基于 qwen-code/packages/core/src/core/client.ts:403、qwen-code/packages/core/src/core/turn.ts:233、qwen-code/packages/core/src/services/loopDetectionService.ts:78 等源码分析*
+*基于版本：2026-02-08 | 最后更新：2026-02-25*
