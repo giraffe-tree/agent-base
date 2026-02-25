@@ -2,6 +2,7 @@
   - [项目介绍](/README.md)
 
 - **跨项目对比**
+  - [概览](docs/comm/01-comm-overview.md)
   - [CLI 入口](docs/comm/02-comm-cli-entry.md)
   - [Session 运行时](docs/comm/03-comm-session-runtime.md)
   - [Agent Loop 共性](docs/comm/04-comm-agent-loop.md)
@@ -15,8 +16,11 @@
   - [Plan and Execute 模式](docs/comm/comm-plan-and-execute.md)
   - [ACP 是什么？（入门指南）](docs/comm/comm-what-is-acp.md)
   - [未来突破：第一性原理分析](docs/comm/comm-future-breakthrough-first-principles.md)
+  - [技术点文档规范](docs/comm/comm-technical-point-template.md)
+  - [技术点审阅指南](docs/comm/comm-technical-point-reviewer.md)
   - **Questions**
     - [工具调用错误处理](docs/comm/questions/comm-tool-error-handling.md)
+    - [Skill 执行超时](docs/comm/questions/comm-skill-execution-timeout.md)
 
 - **Codex CLI (Rust)**
   - [概览](docs/codex/01-codex-overview.md)
@@ -38,6 +42,8 @@
     - [防止 Tool 无限循环](docs/codex/questions/codex-infinite-loop-prevention.md)
     - [上下文压缩机制](docs/codex/questions/codex-context-compaction.md)
     - [Plan and Execute 模式](docs/codex/questions/codex-plan-and-execute.md)
+    - [Skill 执行超时](docs/codex/questions/codex-skill-execution-timeout.md)
+    - [Subagent 实现](docs/codex/questions/codex-subagent-implementation.md)
 
 - **Gemini CLI**
   - [概览](docs/gemini-cli/01-gemini-cli-overview.md)
@@ -60,6 +66,9 @@
     - [防止 Tool 无限循环](docs/gemini-cli/questions/gemini-cli-infinite-loop-prevention.md)
     - [上下文压缩机制](docs/gemini-cli/questions/gemini-cli-context-compaction.md)
     - [Plan and Execute 模式](docs/gemini-cli/questions/gemini-cli-plan-and-execute.md)
+    - [Skill 执行超时](docs/gemini-cli/questions/gemini-cli-skill-execution-timeout.md)
+    - [Subagent 实现](docs/gemini-cli/questions/gemini-cli-subagent-implementation.md)
+    - [为什么保留 reasoning](docs/gemini-cli/questions/gemini-cli-why-keep-reasoning.md)
 
 - **OpenCode**
   - [概览](docs/opencode/01-opencode-overview.md)
@@ -83,6 +92,9 @@
     - [防止 Tool 无限循环](docs/opencode/questions/opencode-infinite-loop-prevention.md)
     - [上下文压缩机制](docs/opencode/questions/opencode-context-compaction.md)
     - [Plan and Execute 模式](docs/opencode/questions/opencode-plan-and-execute.md)
+    - [Skill 执行超时](docs/opencode/questions/opencode-skill-execution-timeout.md)
+    - [Subagent 实现](docs/opencode/questions/opencode-subagent-implementation.md)
+    - [为什么保留 reasoning](docs/opencode/questions/opencode-why-keep-reasoning.md)
 
 - **Kimi CLI**
   - [新手开发者入门](docs/kimi-cli/00-kimi-cli-onboarding.md)
@@ -109,10 +121,14 @@
     - [上下文压缩机制](docs/kimi-cli/questions/kimi-cli-context-compaction.md)
     - [Plan and Execute 模式](docs/kimi-cli/questions/kimi-cli-plan-and-execute.md)
     - [Flow 架构设计](docs/kimi-cli/questions/kimi-cli-flow-architecture.md)
+    - [Skill 执行超时](docs/kimi-cli/questions/kimi-cli-skill-execution-timeout.md)
+    - [Subagent 实现](docs/kimi-cli/questions/kimi-cli-subagent-implementation.md)
+    - [为什么保留 reasoning](docs/kimi-cli/questions/kimi-cli-why-keep-reasoning.md)
 
 - **SWE-agent**
   - [概览](docs/swe-agent/01-swe-agent-overview.md)
   - [CLI 入口](docs/swe-agent/02-swe-agent-cli-entry.md)
+  - [Session 运行时](docs/swe-agent/03-swe-agent-session-runtime.md)
   - [Session 管理](docs/swe-agent/02-swe-agent-session-management.md)
   - [Agent Loop](docs/swe-agent/04-swe-agent-agent-loop.md)
   - [Tools 系统](docs/swe-agent/05-swe-agent-tools-system.md)
@@ -124,11 +140,16 @@
   - [日志记录机制](docs/swe-agent/12-swe-agent-logging.md)
   - **Questions**
     - [并发 Tool 调用](docs/swe-agent/questions/swe-agent-tool-call-concurrency.md)
+    - [Checkpoint 实现](docs/swe-agent/questions/swe-agent-checkpoint-implementation.md)
+    - [Checkpoint 无文件回滚权衡](docs/swe-agent/questions/swe-agent-checkpoint-no-file-rollback-tradeoffs.md)
     - [用户编辑冲突回退](docs/swe-agent/questions/swe-agent-revert-user-edit-conflict.md)
     - [工具调用错误处理](docs/swe-agent/questions/swe-agent-tool-error-handling.md)
     - [防止 Tool 无限循环](docs/swe-agent/questions/swe-agent-infinite-loop-prevention.md)
     - [上下文压缩机制](docs/swe-agent/questions/swe-agent-context-compaction.md)
     - [Plan and Execute 模式](docs/swe-agent/questions/swe-agent-plan-and-execute.md)
+    - [Skill 执行超时](docs/swe-agent/questions/swe-agent-skill-execution-timeout.md)
+    - [Subagent 实现](docs/swe-agent/questions/swe-agent-subagent-implementation.md)
+    - [为什么保留 reasoning](docs/swe-agent/questions/swe-agent-why-keep-reasoning.md)
 
 - **Qwen Code**
   - [概览](docs/qwen-code/01-qwen-code-overview.md)
@@ -147,3 +168,14 @@
     - [工具调用错误处理](docs/qwen-code/questions/qwen-code-tool-error-handling.md)
     - [上下文压缩机制](docs/qwen-code/questions/qwen-code-context-compaction.md)
     - [循环检测机制](docs/qwen-code/questions/qwen-code-loop-detection.md)
+    - [Subagent 实现](docs/qwen-code/questions/qwen-code-subagent-implementation.md)
+
+- **Claude Code**
+  - **Questions**
+    - [消息上下文保留](docs/claude/questions/claude-message-context-retention.md)
+
+- **Cursor**
+  - [概览](docs/cursor/01-cursor-README.md)
+  - **Questions**
+    - [Checkpoint 官方描述与状态映射](docs/cursor/questions/cursor-checkpoint-official-description-and-state-vscdb-mapping.md)
+    - [状态 VSCDB Checkpoint 分析](docs/cursor/questions/cursor-state-vscdb-checkpoint-analysis.md)
