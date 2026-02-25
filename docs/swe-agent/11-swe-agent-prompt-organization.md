@@ -44,10 +44,10 @@ SWE-agent 采用**配置驱动 + Jinja2 模板引擎**的 prompt 组织方式，
                         ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ ▓▓▓ Prompt Organization ▓▓▓                                 │
-│ sweagent/agent/prompts.py                                    │
+│ sweagent/agent/agents.py                                     │
 │ - TemplateConfig: 模板配置模型                              │
-│ - render_template(): Jinja2 渲染                            │
-│ - build_full_prompt(): 多模板组合                           │
+│ - system_template: 系统身份定义                             │
+│ - instance_template: 问题实例描述                           │
 └───────────────────────┬─────────────────────────────────────┘
                         │ 依赖/调用
         ┌───────────────┼───────────────┐
@@ -62,10 +62,11 @@ SWE-agent 采用**配置驱动 + Jinja2 模板引擎**的 prompt 组织方式，
 
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
-| `TemplateConfig` | 定义模板配置模型 | `sweagent/agent/models.py` |
-| `render_template()` | Jinja2 模板渲染 | `sweagent/agent/prompts.py` |
-| `build_full_prompt()` | 组合多模板生成完整 prompt | `sweagent/agent/agents.py` |
-| YAML 配置 | 存储模板定义和变量 | `config/*.yaml` |
+| `TemplateConfig` | 模板配置模型 | `SWE-agent/sweagent/agent/agents.py:60` |
+| `system_template` | 系统身份定义 | `SWE-agent/sweagent/agent/agents.py:65` |
+| `instance_template` | 问题实例描述 | `SWE-agent/sweagent/agent/agents.py:66` |
+| `next_step_template` | 下一步指导 | `SWE-agent/sweagent/agent/agents.py:67` |
+| `add_instance_template_to_history()` | 添加实例模板到历史 | `SWE-agent/sweagent/agent/agents.py:748` |
 
 ### 2.3 核心组件交互关系
 
@@ -253,80 +254,83 @@ flowchart LR
 ### 5.1 核心数据结构
 
 ```python
-# sweagent/agent/models.py
-from pydantic import BaseModel
-from typing import Dict, Optional
-
+# SWE-agent/sweagent/agent/agents.py:60-126
 class TemplateConfig(BaseModel):
-    """模板配置模型"""
-    templates: Dict[str, str]
-    variables: Optional[Dict[str, any]] = None
-    extends: Optional[str] = None  # 继承其他配置
+    """This configuration is used to define almost all message templates that are
+    formatted by the agent and sent to the LM.
+    """
+
+    system_template: str = ""
+    instance_template: str = ""
+    next_step_template: str = "Observation: {{observation}}"
+
+    next_step_truncated_observation_template: str = (
+        "Observation: {{observation[:max_observation_length]}}<response clipped>"
+        "<NOTE>Observations should not exceeded {{max_observation_length}} characters. "
+        "{{elided_chars}} characters were elided. Please try a different command..."
+    )
+
+    max_observation_length: int = 100_000
+    next_step_no_output_template: str = None  # type: ignore
+    strategy_template: str | None = None
+    demonstration_template: str | None = None
+
+    shell_check_error_template: str = (
+        "Your bash command contained syntax errors and was NOT executed..."
+    )
+
+    command_cancelled_timeout_template: str = (
+        "The command '{{command}}' was cancelled because it took more than {{timeout}} seconds..."
+    )
 ```
 
 **字段说明**：
 
 | 字段 | 类型 | 用途 |
 |-----|------|------|
-| `templates` | `Dict[str, str]` | 存储各类模板文本 |
-| `variables` | `Optional[Dict]` | 默认变量值 |
-| `extends` | `Optional[str]` | 父配置文件路径 |
+| `system_template` | `str` | 系统身份定义 |
+| `instance_template` | `str` | 问题实例描述 |
+| `next_step_template` | `str` | 下一步指导（默认 Observation） |
+| `strategy_template` | `str \| None` | 战略规划（可选） |
+| `demonstration_template` | `str \| None` | 演示模板（可选） |
 
 ### 5.2 主链路代码
 
 ```python
-# sweagent/agent/agents.py
-def build_full_prompt(config: TemplateConfig, context: dict) -> str:
-    """组合多个模板生成完整 prompt"""
+# SWE-agent/sweagent/agent/agents.py:748-770
+def add_instance_template_to_history(self, state: dict[str, str]) -> None:
+    """Add the instance template to the history.
 
-    # 1. 系统层
-    system_prompt = render_template(
-        config.templates['system'],
-        context
-    )
-
-    # 2. 实例层
-    instance_prompt = render_template(
-        config.templates['instance'],
-        context
-    )
-
-    # 3. 策略层（可选）
-    if 'strategy' in config.templates:
-        strategy_prompt = render_template(
-            config.templates['strategy'],
-            context
+    This is called at the beginning of the agent run.
+    """
+    templates = [self.templates.instance_template]
+    if self.templates.strategy_template:
+        templates.append(self.templates.strategy_template)
+    for template in templates:
+        self._add_message_to_history(
+            "user",
+            Template(template).render(**self._get_format_dict(state=state)),
+            agent=self.name,
+            tags=["template"],
         )
-        instance_prompt = f"{strategy_prompt}\n\n{instance_prompt}"
-
-    # 4. 下一步指导（用于决策）
-    next_step_prompt = render_template(
-        config.templates['next_step'],
-        context
-    )
-
-    return combine_prompts([
-        system_prompt,
-        instance_prompt,
-        next_step_prompt
-    ])
 ```
 
 **代码要点**：
 
-1. **分层组合**：按 system → instance → strategy → next_step 顺序组合
-2. **策略可选**：strategy 模板为可选，增强灵活性
-3. **统一输出**：通过 combine_prompts 确保格式一致
+1. **模板渲染**：使用 Jinja2 Template 渲染模板
+2. **状态注入**：通过 `_get_format_dict` 注入环境状态
+3. **标签标记**：添加 "template" 标签便于追踪
 
 ### 5.3 关键调用链
 
 ```text
-Agent.run()                    [sweagent/agent/agents.py:200]
-  -> build_full_prompt()       [sweagent/agent/agents.py:250]
-    -> render_template()       [sweagent/agent/prompts.py:45]
-      - Jinja2 Template.render()
-    -> combine_prompts()       [sweagent/agent/prompts.py:80]
-      - 字符串拼接和格式化
+Agent.run()                    [SWE-agent/sweagent/agent/agents.py:390]
+  -> setup()                   [SWE-agent/sweagent/agent/agents.py:561]
+    -> add_instance_template_to_history() [SWE-agent/sweagent/agent/agents.py:748]
+      - Template.render()      [Jinja2]
+  -> step()                    [SWE-agent/sweagent/agent/agents.py:790]
+    -> _add_step_to_history()  [SWE-agent/sweagent/agent/agents.py:714]
+      - Template(next_step_template).render()
 ```
 
 ---
@@ -347,7 +351,7 @@ Agent.run()                    [sweagent/agent/agents.py:200]
 **核心问题**：如何在保持灵活性的同时降低 prompt 管理复杂度？
 
 **SWE-agent 的解决方案**：
-- 代码依据：`sweagent/agent/models.py:TemplateConfig`
+- 代码依据：`SWE-agent/sweagent/agent/agents.py:60`
 - 设计意图：将 prompt 从代码中抽离，实现配置化管理
 - 带来的好处：
   - 非技术人员可调整 prompt
@@ -399,11 +403,13 @@ templates:
 
 | 功能 | 文件 | 说明 |
 |-----|------|------|
-| 模板配置 | `sweagent/agent/models.py` | Pydantic 配置模型定义 |
-| Prompt 渲染 | `sweagent/agent/prompts.py` | Jinja2 渲染工具和辅助函数 |
-| 模板组合 | `sweagent/agent/agents.py` | Agent 实现，模板调用逻辑 |
-| 配置文件 | `config/` | YAML 配置文件目录 |
-| 默认配置 | `config/default.yaml` | 基础模板定义 |
+| 模板配置 | `SWE-agent/sweagent/agent/agents.py` | 60 | TemplateConfig 类 |
+| 系统模板 | `SWE-agent/sweagent/agent/agents.py` | 65 | system_template |
+| 实例模板 | `SWE-agent/sweagent/agent/agents.py` | 66 | instance_template |
+| 下一步模板 | `SWE-agent/sweagent/agent/agents.py` | 67 | next_step_template |
+| 策略模板 | `SWE-agent/sweagent/agent/agents.py` | 87 | strategy_template |
+| 演示模板 | `SWE-agent/sweagent/agent/agents.py` | 88 | demonstration_template |
+| 添加实例模板 | `SWE-agent/sweagent/agent/agents.py` | 748 | add_instance_template_to_history() |
 
 ---
 
@@ -415,5 +421,5 @@ templates:
 
 ---
 
-*✅ Verified: 基于 sweagent/agent/models.py、sweagent/agent/prompts.py 等源码分析*
-*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-02-24*
+*✅ Verified: 基于 SWE-agent/sweagent/agent/agents.py 源码分析*
+*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-02-25*

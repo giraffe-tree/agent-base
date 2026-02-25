@@ -66,10 +66,10 @@ Code Agent 执行代码时面临安全风险：
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
 | `ToolFilterConfig` | 安全过滤配置 | `sweagent/tools/tools.py` |
-| `should_block_action()` | 命令拦截检查 | `sweagent/tools/tools.py:475` |
+| `should_block_action()` | 命令拦截检查 | `SWE-agent/sweagent/tools/tools.py:353` |
 | `SWEEnv` | 容器化执行环境 | `sweagent/environment/swe_env.py` |
-| `forward_with_handling()` | 错误恢复 | `sweagent/agent/agents.py:700` |
-| `attempt_autosubmit()` | 失败兜底 | `sweagent/agent/agents.py` |
+| `forward_with_handling()` | 错误恢复 | `SWE-agent/sweagent/agent/agents.py:1062` |
+| `attempt_autosubmission_after_error()` | 失败兜底 | `SWE-agent/sweagent/agent/agents.py:823` |
 
 ### 2.3 核心组件交互关系
 
@@ -405,11 +405,11 @@ sequenceDiagram
 
 | 阶段 | 输入 | 处理 | 输出 | 代码位置 |
 |-----|------|------|------|---------|
-| 命令检查 | action | should_block_action() | allowed/blocked | `sweagent/tools/tools.py:475` |
-| 拦截处理 | BlockedActionError | 错误模板 + requery | 修正后动作 | `sweagent/agent/agents.py:700` |
-| 容器执行 | action | Docker 执行 | observation | `sweagent/environment/swe_env.py` |
-| 超时处理 | TimeoutError | 标记并继续 | 错误状态 | `sweagent/tools/tools.py` |
-| 失败兜底 | 致命错误 | attempt_autosubmit() | 提取的 patch | `sweagent/agent/agents.py` |
+| 命令检查 | action | should_block_action() | allowed/blocked | `SWE-agent/sweagent/tools/tools.py:353` |
+| 拦截处理 | BlockedActionError | 错误模板 + requery | 修正后动作 | `SWE-agent/sweagent/agent/agents.py:1062` |
+| 容器执行 | action | Docker 执行 | observation | `SWE-agent/sweagent/environment/swe_env.py` |
+| 超时处理 | TimeoutError | 标记并继续 | 错误状态 | `SWE-agent/sweagent/tools/tools.py` |
+| 失败兜底 | 致命错误 | attempt_autosubmission_after_error() | 提取的 patch | `SWE-agent/sweagent/agent/agents.py:823` |
 
 ---
 
@@ -437,27 +437,21 @@ class ToolFilterConfig(BaseModel):
 ### 5.2 主链路代码
 
 ```python
-# sweagent/tools/tools.py:475-496
+# SWE-agent/sweagent/tools/tools.py:353-367
 def should_block_action(self, action: str) -> bool:
-    """检查命令是否应该被阻止"""
+    """Check if the command should be blocked."""
     action = action.strip()
     if not action:
         return False
-
-    # 1. 前缀匹配阻止
     if any(action.startswith(f) for f in self.config.filter.blocklist):
         return True
-
-    # 2. 完全匹配阻止
     if action in self.config.filter.blocklist_standalone:
         return True
-
-    # 3. 条件阻止
     name = action.split()[0]
-    if name in self.config.filter.block_unless_regex:
-        if not re.search(self.config.filter.block_unless_regex[name], action):
-            return True
-
+    if name in self.config.filter.block_unless_regex and not re.search(
+        self.config.filter.block_unless_regex[name], action
+    ):
+        return True
     return False
 ```
 
@@ -470,8 +464,8 @@ def should_block_action(self, action: str) -> bool:
 ### 5.3 关键调用链
 
 ```text
-Agent.step()                       [sweagent/agent/agents.py:800]
-  -> tools.should_block_action()    [sweagent/tools/tools.py:475]
+Agent.step()                       [SWE-agent/sweagent/agent/agents.py:1062]
+  -> tools.should_block_action()    [SWE-agent/sweagent/tools/tools.py:353]
     -> 前缀匹配 blocklist
     -> 完全匹配 blocklist_standalone
     -> 条件匹配 block_unless_regex
@@ -503,7 +497,7 @@ Agent.step()                       [sweagent/agent/agents.py:800]
 **核心问题**：如何在保证安全的前提下实现高效的自动化代码修复？
 
 **SWE-agent 的解决方案**：
-- 代码依据：`sweagent/tools/tools.py:475-496`
+- 代码依据：`SWE-agent/sweagent/tools/tools.py:353-367`
 - 设计意图：通过配置驱动的三层过滤拦截危险命令，通过 Docker 容器隔离执行环境，通过自动重采样恢复可恢复错误
 - 带来的好处：
   - 自动化程度高，适合批量任务
@@ -531,8 +525,8 @@ Agent.step()                       [sweagent/agent/agents.py:800]
 
 | 终止原因 | 触发条件 | 代码位置 |
 |---------|---------|---------|
-| 命令被拦截 | 命中 blocklist | `sweagent/tools/tools.py:475` |
-| 上下文超限 | token 超限 | `sweagent/agent/agents.py:forward_with_handling` |
+| 命令被拦截 | 命中 blocklist | `SWE-agent/sweagent/tools/tools.py:353` |
+| 上下文超限 | token 超限 | `SWE-agent/sweagent/agent/agents.py:1062` |
 | 成本超限 | 达到 cost_limit | `sweagent/agent/models.py` |
 | 环境崩溃 | runtime 异常 | `sweagent/environment/swe_env.py` |
 | 重采样耗尽 | 超过 max_requeries | `sweagent/agent/agents.py:forward_with_handling` |
@@ -541,11 +535,11 @@ Agent.step()                       [sweagent/agent/agents.py:800]
 
 | 错误类型 | 处理策略 | 代码位置 |
 |---------|---------|---------|
-| BlockedActionError | requery（最多 max_requeries 次） | `sweagent/agent/agents.py:forward_with_handling` |
-| BashIncorrectSyntaxError | requery + 语法检查 | `sweagent/agent/agents.py:forward_with_handling` |
-| ContentPolicyViolationError | requery | `sweagent/agent/agents.py:forward_with_handling` |
-| ContextWindowExceededError | attempt_autosubmit | `sweagent/agent/agents.py:forward_with_handling` |
-| 环境崩溃 | attempt_autosubmit | `sweagent/agent/agents.py` |
+| BlockedActionError | requery（最多 max_requeries 次） | `SWE-agent/sweagent/agent/agents.py:1062` |
+| BashIncorrectSyntaxError | requery + 语法检查 | `SWE-agent/sweagent/agent/agents.py:1062` |
+| ContentPolicyViolationError | requery | `SWE-agent/sweagent/agent/agents.py:1062` |
+| ContextWindowExceededError | attempt_autosubmission_after_error | `SWE-agent/sweagent/agent/agents.py:1062` |
+| 环境崩溃 | attempt_autosubmission_after_error | `SWE-agent/sweagent/agent/agents.py:823` |
 
 ### 7.3 安全配置示例
 
@@ -574,9 +568,9 @@ agent:
 | 功能 | 文件 | 行号 | 说明 |
 |-----|------|------|------|
 | ToolFilterConfig | `sweagent/tools/tools.py` | - | 安全过滤配置 |
-| should_block_action | `sweagent/tools/tools.py` | 475 | 命令拦截检查 |
-| forward_with_handling | `sweagent/agent/agents.py` | 700 | 错误恢复 |
-| attempt_autosubmit | `sweagent/agent/agents.py` | - | 失败兜底 |
+| should_block_action | `SWE-agent/sweagent/tools/tools.py` | 353 | 命令拦截检查 |
+| forward_with_handling | `SWE-agent/sweagent/agent/agents.py` | 1062 | 错误恢复 |
+| attempt_autosubmission_after_error | `SWE-agent/sweagent/agent/agents.py` | 823 | 失败兜底 |
 | SWEEnv | `sweagent/environment/swe_env.py` | - | 容器环境 |
 | HumanModel | `sweagent/agent/models.py` | - | 人工介入模式 |
 
@@ -590,5 +584,5 @@ agent:
 
 ---
 
-*✅ Verified: 基于 sweagent/tools/tools.py、sweagent/agent/agents.py 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*✅ Verified: 基于 SWE-agent/sweagent/tools/tools.py、SWE-agent/sweagent/agent/agents.py 等源码分析*
+*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-02-25*

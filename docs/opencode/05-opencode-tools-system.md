@@ -1,77 +1,418 @@
 # Tool System（opencode）
 
-本文基于 `./opencode/packages/opencode/src/tool` 源码，解释 OpenCode 的工具系统架构——从 Zod Schema 定义、动态注册到权限控制的完整链路。
+## TL;DR（结论先行）
+
+一句话定义：OpenCode 的工具系统是「**Zod Schema 类型安全 + 动态注册扩展 + 权限驱动执行**」的架构。
+
+OpenCode 的核心取舍：**Zod Schema 运行时验证 + 工厂函数定义 + 细粒度权限控制**（对比 SWE-agent 的 YAML 配置、Kimi CLI 的函数装饰器）
 
 ---
 
-## 1. 先看全局（架构图）
+## 1. 为什么需要这个机制？（解决什么问题）
+
+### 1.1 问题场景
+
+没有 Tool System：Agent 只能进行对话，无法与外部环境交互（读文件、执行命令、搜索网络），无法完成实际编程任务。
+
+有 Tool System：
+- Agent: "需要读取配置文件" → 调用 read 工具 → 获取文件内容
+- Agent: "执行测试" → 调用 bash 工具 → 获得测试结果
+- Agent: "搜索相关代码" → 调用 grep 工具 → 获得匹配位置
+- Agent: "修改第 42 行" → 调用 edit 工具 → 成功写入
+
+### 1.2 核心挑战
+
+| 挑战 | 不解决的后果 |
+|-----|-------------|
+| 参数类型安全 | LLM 生成的工具调用参数格式错误，导致执行失败或不可预期行为 |
+| 工具动态扩展 | 无法支持用户自定义工具或第三方插件，功能受限 |
+| 权限控制 | 危险操作（如 `rm -rf /`）未经确认直接执行，造成安全事故 |
+| 输出管理 | 工具输出过长导致上下文溢出，影响后续对话质量 |
+| 模型适配 | 不同模型对工具的理解能力不同，需要针对性调整 |
+
+---
+
+## 2. 整体架构（ASCII 图）
+
+### 2.1 在系统中的位置
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────┐
-│  工具定义层：Zod Schema + 工厂函数                                    │
-│  ┌─────────────────────────────────────────────────────────────────┐│
-│  │  Tool.define(id, init)                                          ││
-│  │  ├── parameters: z.ZodType      (参数 Schema)                   ││
-│  │  ├── description: string        (功能描述)                       ││
-│  │  └── execute(args, ctx)         (执行逻辑)                       ││
-│  │      ├── ctx.ask()              (权限请求)                       ││
-│  │      ├── ctx.metadata()         (元数据更新)                     ││
-│  │      └── ctx.abort              (取消信号)                       ││
-│  └─────────────────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
+│  Agent Loop / Session Runtime                                        │
+│  packages/opencode/src/session/session.ts                            │
+└─────────────────────────────────┬───────────────────────────────────┘
+                                  │ 调用
+                                  ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  工具注册层：ToolRegistry 支持动态扩展                                │
-│  ┌─────────────────────────────────────────────────────────────────┐│
-│  │  ToolRegistry                                                   ││
-│  │  ├── state()                    初始化状态                       ││
-│  │  │   ├── 加载自定义工具 (~/tools/*.{js,ts})                      ││
-│  │  │   └── 加载插件工具 (Plugin.list())                           ││
-│  │  ├── register(tool)             动态注册工具                     ││
-│  │  └── tools(model, agent)        获取工具列表                     ││
-│  │      └── 根据模型过滤 (apply_patch vs edit/write)               ││
-│  └─────────────────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  MCP 集成层：外部工具服务扩展                                         │
-│  ┌─────────────────────────────────────────────────────────────────┐│
-│  │  MCP Server (可选)                                              ││
-│  │  ├── mcp-server.ts              服务器实现                       ││
-│  │  └── 通过 MCP 协议接入外部工具                                   ││
-│  └─────────────────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────────────────┘
+│ ▓▓▓ Tool System ▓▓▓                                                 │
+│ packages/opencode/src/tool/                                          │
+│ - tool.ts        : Tool.define() 工厂函数                           │
+│ - registry.ts    : ToolRegistry 动态注册                            │
+│ - bash.ts        : BashTool 示例实现                                │
+└─────────────────────────────────┬───────────────────────────────────┘
+                                  │ 依赖/调用
+                    ┌─────────────┼─────────────┐
+                    ▼             ▼             ▼
+┌───────────────────────┐ ┌──────────────┐ ┌──────────────┐
+│ Zod Schema            │ │ Permission   │ │ Plugin       │
+│ 参数验证              │ │ Next 权限系统 │ │ 插件系统      │
+│ packages/opencode/    │ │ packages/    │ │ packages/    │
+│ src/tool/tool.ts      │ │ opencode/    │ │ opencode/    │
+│                       │ │ src/permission│ │ src/plugin/  │
+└───────────────────────┘ └──────────────┘ └──────────────┘
+```
+
+### 2.2 核心组件职责
+
+| 组件 | 职责 | 代码位置 |
+|-----|------|---------|
+| `Tool.define()` | 工厂函数，创建工具定义，包装参数验证和输出截断 | `packages/opencode/src/tool/tool.ts:109` |
+| `ToolRegistry` | 管理工具生命周期，支持动态注册和自定义工具加载 | `packages/opencode/src/tool/registry.ts:14` |
+| `ToolRegistry.state()` | 初始化状态，从文件系统和插件加载自定义工具 | `packages/opencode/src/tool/registry.ts:223` |
+| `ToolRegistry.tools()` | 根据模型过滤并初始化工具列表 | `packages/opencode/src/tool/registry.ts:300` |
+| `Tool.Context.ask()` | 细粒度权限请求接口 | `packages/opencode/src/tool/tool.ts:101` |
+
+### 2.3 核心组件交互关系
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Agent Loop
+    participant R as ToolRegistry
+    participant T as Tool.define
+    participant P as PermissionNext
+    participant E as External<br/>(Bash/FS/etc)
+
+    A->>R: 1. tools(model, agent)
+    Note over R: 根据模型过滤工具
+    R->>T: 2. tool.init(ctx)
+    Note over T: 初始化工具，包装 execute
+    T-->>R: 3. 返回 {id, description, parameters, execute}
+    R-->>A: 4. 返回工具列表
+
+    A->>T: 5. execute(args, ctx)
+    Note over T: Zod 参数验证
+    T->>T: 6. parameters.parse(args)
+
+    alt 需要权限
+        T->>P: 7. ctx.ask({permission, patterns})
+        P-->>T: 8. 用户确认结果
+    end
+
+    T->>E: 9. 执行实际操作
+    E-->>T: 10. 返回原始结果
+
+    T->>T: 11. Truncate.output() 截断
+    T-->>A: 12. 返回 {title, metadata, output}
+```
+
+**关键交互说明**：
+
+| 步骤 | 交互内容 | 设计意图 |
+|-----|---------|---------|
+| 1-4 | Agent Loop 获取工具列表 | 解耦工具管理与执行，支持模型特定过滤 |
+| 5-6 | 执行前参数验证 | Zod Schema 保证运行时类型安全 |
+| 7-8 | 权限请求流程 | 细粒度控制，操作前用户确认 |
+| 9-10 | 实际执行 | 职责分离，工具专注业务逻辑 |
+| 11-12 | 输出截断 | 防止上下文溢出，自动管理输出长度 |
+
+---
+
+## 3. 核心组件详细分析
+
+### 3.1 Tool.define 工厂函数
+
+#### 职责定位
+
+`Tool.define` 是工具定义的入口，提供统一的工厂函数封装，内置参数验证和输出截断能力。
+
+#### 内部数据流
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  输入层                                                      │
+│  ├── 工具 ID (string)                                       │
+│  ├── init 函数/对象 (定义 description, parameters, execute) │
+│  └── 用户调用参数 (args)                                     │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  处理层                                                      │
+│  ├── 参数验证: Zod Schema parse                             │
+│  │   └── 失败时调用 formatValidationError 或抛出异常         │
+│  ├── 执行逻辑: 调用原始 execute 函数                         │
+│  └── 输出处理: Truncate.output 自动截断                      │
+│      └── 支持工具自定义截断 (truncated !== undefined)        │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  输出层                                                      │
+│  ├── title: 操作标题                                         │
+│  ├── metadata: 包含 truncated 等元数据                       │
+│  ├── output: 截断后的输出内容                                │
+│  └── attachments: 可选附件                                   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 关键接口
+
+| 接口 | 输入 | 输出 | 说明 | 代码位置 |
+|-----|------|------|------|---------|
+| `define(id, init)` | 工具ID, 初始化函数 | Tool.Info 对象 | 工厂函数，创建工具定义 | `packages/opencode/src/tool/tool.ts:109` |
+| `init(ctx)` | InitContext | 工具配置对象 | 初始化时调用，返回工具元数据 | `packages/opencode/src/tool/tool.ts:78` |
+| `execute(args, ctx)` | 参数, Context | 执行结果 | 实际执行逻辑，包装后自动验证 | `packages/opencode/src/tool/tool.ts:81` |
+
+---
+
+### 3.2 ToolRegistry 注册中心
+
+#### 职责定位
+
+ToolRegistry 负责工具的生命周期管理，包括自定义工具加载、动态注册和模型特定过滤。
+
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Uninitialized: 系统启动
+    Uninitialized --> Loading: 首次调用 state()
+
+    Loading --> Loaded: 加载完成
+    Loading --> Loaded: 部分失败（日志记录）
+
+    Loaded --> Registered: register() 新工具
+    Loaded --> Updated: register() 替换现有工具
+
+    Registered --> Loaded: 状态更新
+    Updated --> Loaded: 状态更新
+
+    Loaded --> [*]: 系统关闭
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Uninitialized | 未初始化 | 系统启动 | 首次调用 state() |
+| Loading | 加载中 | 开始加载自定义工具和插件 | 加载完成或失败 |
+| Loaded | 已加载 | 工具列表可用 | 系统关闭或重新加载 |
+| Registered | 新工具注册 | 调用 register() 新增 | 状态更新完成 |
+| Updated | 工具更新 | 调用 register() 替换 | 状态更新完成 |
+
+#### 关键算法逻辑
+
+```mermaid
+flowchart TD
+    A[tools(model, agent)] --> B{模型过滤}
+
+    B -->|codesearch/websearch| C{opencode provider?}
+    C -->|是| D[保留工具]
+    C -->|否| E{ENABLE_EXA flag?}
+    E -->|是| D
+    E -->|否| F[过滤掉]
+
+    B -->|GPT 模型| G{usePatch?}
+    G -->|是| H[保留 apply_patch]
+    G -->|是| I[过滤 edit/write]
+    G -->|否| J[过滤 apply_patch]
+    G -->|否| K[保留 edit/write]
+
+    B -->|其他工具| L[保留]
+
+    D --> M[初始化工具]
+    F --> M
+    H --> M
+    I --> M
+    J --> M
+    K --> M
+    L --> M
+
+    M --> N[触发 tool.definition 事件]
+    N --> O[返回工具列表]
+```
+
+**算法要点**：
+
+1. **特殊工具权限控制**：codesearch/websearch 需要特定 provider 或 flag
+2. **GPT 模型适配**：GPT 系列（除 GPT-4）使用 apply_patch 替代 edit/write
+3. **插件事件钩子**：工具初始化后触发事件，支持扩展修改
+
+---
+
+### 3.3 组件间协作时序
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant A as Agent Loop
+    participant R as ToolRegistry
+    participant T as Tool
+    participant P as Plugin
+    participant S as Storage
+
+    U->>A: 发起任务
+    activate A
+
+    A->>R: state() 获取工具状态
+    activate R
+
+    R->>S: 扫描 ~/tools/*.{js,ts}
+    S-->>R: 返回文件列表
+
+    R->>R: 加载自定义工具
+    R->>P: Plugin.list()
+    P-->>R: 返回插件列表
+
+    R->>R: 从插件加载工具
+    R-->>A: 返回工具状态
+    deactivate R
+
+    A->>R: tools(model, agent)
+    activate R
+
+    R->>R: 应用模型过滤
+    R->>T: tool.init(ctx)
+    activate T
+
+    T->>P: trigger("tool.definition")
+    P-->>T: 事件处理完成
+    T-->>R: 返回初始化后的工具
+    deactivate T
+
+    R-->>A: 返回过滤后的工具列表
+    deactivate R
+
+    A->>A: 构建 LLM 请求
+    A-->>U: 等待 LLM 响应
+    deactivate A
+```
+
+**协作要点**：
+
+1. **Agent Loop 与 ToolRegistry**：通过 state() 和 tools() 两个接口协作，分离状态管理和工具获取
+2. **ToolRegistry 与 Plugin**：插件系统提供额外的工具来源，支持第三方扩展
+3. **Tool 初始化事件**：tool.definition 事件允许插件修改工具定义，增强可扩展性
+
+---
+
+## 4. 端到端数据流转
+
+### 4.1 正常流程（详细版）
+
+```mermaid
+sequenceDiagram
+    participant A as Agent Loop
+    participant R as ToolRegistry
+    participant T as Tool.execute
+    participant Z as Zod Validator
+    participant P as PermissionNext
+    participant E as External System
+
+    A->>R: 1. tools(model, agent)
+    Note over R: 模型特定过滤
+    R-->>A: 2. 返回可用工具列表
+
+    A->>A: 3. 构建 LLM 请求
+    Note over A: 包含工具定义
+
+    A->>T: 4. execute(args, ctx)
+
+    T->>Z: 5. parameters.parse(args)
+    Z-->>T: 6. 验证通过/失败
+
+    alt 验证失败
+        T-->>A: 返回错误信息
+    end
+
+    alt 需要权限
+        T->>P: 7. ctx.ask({permission, patterns})
+        P-->>T: 8. 用户确认结果
+        alt 拒绝
+            T-->>A: 返回拒绝信息
+        end
+    end
+
+    T->>E: 9. 执行实际操作
+    E-->>T: 10. 返回原始结果
+
+    T->>T: 11. Truncate.output()
+    Note over T: 自动截断处理
+
+    T-->>A: 12. 返回 {title, metadata, output}
+```
+
+**数据变换详情**：
+
+| 阶段 | 输入 | 处理 | 输出 | 代码位置 |
+|-----|------|------|------|---------|
+| 工具获取 | model, agent | 模型过滤 + 初始化 | Tool 列表 | `packages/opencode/src/tool/registry.ts:300` |
+| 参数验证 | 原始 args | Zod Schema parse | 验证后的数据 | `packages/opencode/src/tool/tool.ts:122` |
+| 权限请求 | permission, patterns | 用户确认 | 允许/拒绝 | `packages/opencode/src/tool/tool.ts:101` |
+| 输出截断 | 原始输出 | Truncate.output | 截断后的内容 | `packages/opencode/src/tool/tool.ts:137` |
+
+### 4.2 数据流向图
+
+```mermaid
+flowchart LR
+    subgraph Input["输入阶段"]
+        I1[用户输入] --> I2[Agent Loop]
+        I2 --> I3[工具列表获取]
+    end
+
+    subgraph Process["处理阶段"]
+        P1[LLM 决策] --> P2[工具调用]
+        P2 --> P3[参数验证]
+        P3 --> P4[权限检查]
+        P4 --> P5[实际执行]
+    end
+
+    subgraph Output["输出阶段"]
+        O1[结果截断] --> O2[格式化]
+        O2 --> O3[返回 Agent]
+    end
+
+    I3 --> P1
+    P5 --> O1
+```
+
+### 4.3 异常/边界流程
+
+```mermaid
+flowchart TD
+    A[工具调用开始] --> B{Zod 验证}
+    B -->|失败| C[返回验证错误]
+    B -->|通过| D{需要权限?}
+
+    D -->|是| E{权限检查}
+    E -->|拒绝| F[返回权限拒绝]
+    E -->|允许| G[执行操作]
+    D -->|否| G
+
+    G --> H{执行结果}
+    H -->|成功| I[截断输出]
+    H -->|失败| J[返回执行错误]
+
+    I --> K{输出长度}
+    K -->|超长| L[Truncate 截断]
+    K -->|正常| M[直接返回]
+    L --> N[标记 truncated]
+
+    M --> O[返回结果]
+    N --> O
+    C --> P[结束]
+    F --> P
+    J --> P
+    O --> P
 ```
 
 ---
 
-## 2. 核心概念与设计哲学
+## 5. 关键代码实现
 
-### 2.1 一句话定义
-
-OpenCode 的工具系统是「**Zod Schema 类型安全 + 动态注册扩展 + 权限驱动执行**」的架构：工具通过 `Tool.define` 使用 Zod 定义参数 Schema，支持从文件系统和插件动态加载，执行时通过 `ctx.ask()` 进行细粒度权限控制。
-
-### 2.2 设计特点
-
-| 特性 | 实现方式 | 优势 |
-|------|---------|------|
-| 类型安全 | Zod Schema | 运行时类型验证，自动错误提示 |
-| 动态注册 | ToolRegistry.register() | 支持运行时扩展 |
-| 自定义工具 | ~/tools/*.ts 自动加载 | 用户可自定义工具 |
-| 插件扩展 | Plugin 系统 | 第三方工具集成 |
-| 权限控制 | ctx.ask() 细粒度请求 | 安全可控 |
-| 输出截断 | Truncate 自动处理 | 防止上下文溢出 |
-
----
-
-## 3. 工具定义架构
-
-### 3.1 核心接口
+### 5.1 核心数据结构
 
 ```typescript
-// packages/opencode/src/tool/tool.ts
+// packages/opencode/src/tool/tool.ts:76-103
 namespace Tool {
   export interface Info<Parameters extends z.ZodType = z.ZodType, M extends Metadata = Metadata> {
     id: string;
@@ -103,9 +444,22 @@ namespace Tool {
 }
 ```
 
-### 3.2 工厂函数
+**字段说明**：
+
+| 字段 | 类型 | 用途 |
+|-----|------|------|
+| `id` | `string` | 工具唯一标识 |
+| `init` | `function` | 初始化函数，返回工具元数据和执行函数 |
+| `description` | `string` | 工具功能描述，传递给 LLM |
+| `parameters` | `z.ZodType` | Zod Schema，定义参数结构 |
+| `execute` | `function` | 实际执行逻辑 |
+| `ctx.ask` | `function` | 权限请求接口 |
+| `ctx.abort` | `AbortSignal` | 取消信号，支持中断执行 |
+
+### 5.2 主链路代码
 
 ```typescript
+// packages/opencode/src/tool/tool.ts:109-147
 export function define<Parameters extends z.ZodType, Result extends Metadata>(
   id: string,
   init: Info<Parameters, Result>["init"] | Awaited<ReturnType<Info<Parameters, Result>["init"]>>,
@@ -116,6 +470,7 @@ export function define<Parameters extends z.ZodType, Result extends Metadata>(
       const toolInfo = init instanceof Function ? await init(initCtx) : init;
 
       // 包装 execute 函数，添加参数验证和截断
+      const originalExecute = toolInfo.execute;
       toolInfo.execute = async (args, ctx) => {
         // 1. Zod 参数验证
         try {
@@ -128,7 +483,7 @@ export function define<Parameters extends z.ZodType, Result extends Metadata>(
         }
 
         // 2. 执行工具
-        const result = await execute(args, ctx);
+        const result = await originalExecute(args, ctx);
 
         // 3. 自动截断输出
         if (result.metadata.truncated !== undefined) {
@@ -147,405 +502,167 @@ export function define<Parameters extends z.ZodType, Result extends Metadata>(
 }
 ```
 
-### 3.3 工具定义示例（BashTool）
+**代码要点**：
 
-```typescript
-// packages/opencode/src/tool/bash.ts
-export const BashTool = Tool.define("bash", async () => {
-  const shell = Shell.acceptable();
+1. **工厂函数封装**：`Tool.define` 提供统一的工具定义 API，隐藏内部复杂性
+2. **自动参数验证**：使用 Zod Schema 在运行时验证 LLM 生成的参数
+3. **透明输出截断**：自动处理输出长度，防止上下文溢出，同时允许工具自定义截断逻辑
 
-  return {
-    description: DESCRIPTION.replaceAll("${directory}", Instance.directory),
-    parameters: z.object({
-      command: z.string().describe("The command to execute"),
-      timeout: z.number().optional().describe("Optional timeout in milliseconds"),
-      workdir: z.string().optional().describe("The working directory"),
-      description: z.string().describe("Clear, concise description of what this command does"),
-    }),
+### 5.3 关键调用链
 
-    async execute(params, ctx) {
-      const cwd = params.workdir || Instance.directory;
-      const timeout = params.timeout ?? DEFAULT_TIMEOUT;
+```text
+Agent Loop
+  -> ToolRegistry.tools(model, agent)     [packages/opencode/src/tool/registry.ts:300]
+    -> all()                               [packages/opencode/src/tool/registry.ts:267]
+      -> state()                           [packages/opencode/src/tool/registry.ts:223]
+        -> 加载 ~/tools/*.{js,ts}          [packages/opencode/src/tool/registry.ts:227]
+        -> Plugin.list()                   [packages/opencode/src/tool/registry.ts:241]
+    -> 模型过滤逻辑                        [packages/opencode/src/tool/registry.ts:305]
+    -> tool.init({ agent })                [packages/opencode/src/tool/registry.ts:322]
+      -> Plugin.trigger("tool.definition") [packages/opencode/src/tool/registry.ts:323]
 
-      // 1. 解析命令，识别文件操作
-      const tree = await parser().then((p) => p.parse(params.command));
-      const directories = new Set<string>();
-      const patterns = new Set<string>();
-
-      // 2. 识别 cd/rm/cp/mv 等命令的路径参数
-      for (const node of tree.rootNode.descendantsOfType("command")) {
-        // ... 路径解析逻辑
-      }
-
-      // 3. 请求外部目录权限
-      if (directories.size > 0) {
-        await ctx.ask({
-          permission: "external_directory",
-          patterns: Array.from(directories).map(dir => path.join(dir, "*")),
-          always: globs,
-          metadata: {},
-        });
-      }
-
-      // 4. 请求 bash 执行权限
-      if (patterns.size > 0) {
-        await ctx.ask({
-          permission: "bash",
-          patterns: Array.from(patterns),
-          always: Array.from(always),
-          metadata: {},
-        });
-      }
-
-      // 5. 执行命令
-      const proc = spawn(params.command, { shell, cwd, ... });
-
-      // 6. 流式输出处理
-      // ...
-
-      return { title: params.description, metadata: {...}, output };
-    },
-  };
-});
+Tool Execution
+  -> Tool.execute(args, ctx)               [packages/opencode/src/tool/tool.ts:119]
+    -> parameters.parse(args)              [packages/opencode/src/tool/tool.ts:122]
+    -> ctx.ask({ permission })             [packages/opencode/src/tool/tool.ts:101]
+    -> 实际业务逻辑                        [具体工具实现]
+    -> Truncate.output()                   [packages/opencode/src/tool/tool.ts:137]
 ```
 
 ---
 
-## 4. ToolRegistry：动态注册与加载
+## 6. 设计意图与 Trade-off
 
-### 4.1 核心结构
+### 6.1 OpenCode 的选择
+
+| 维度 | OpenCode 的选择 | 替代方案 | 取舍分析 |
+|-----|-----------------|---------|---------|
+| 工具定义方式 | Zod Schema + 工厂函数 | YAML 配置 (SWE-agent) | 类型安全，IDE 支持好，但需要学习 Zod API |
+| 动态扩展 | 文件系统扫描 + 插件系统 | 纯代码注册 (Codex) | 用户可自定义，灵活度高，但启动时需要扫描文件 |
+| 权限控制 | 细粒度 ctx.ask() | 预定义权限级别 (Kimi) | 精确控制每个操作，但实现复杂度高 |
+| 输出管理 | 自动截断 | 手动截断或无截断 | 防止上下文溢出，但可能丢失信息 |
+| 模型适配 | 运行时过滤 | 静态配置 | 灵活适配不同模型，但增加运行时开销 |
+
+### 6.2 为什么这样设计？
+
+**核心问题**：如何在保证类型安全的同时，支持灵活的工具扩展和细粒度的权限控制？
+
+**OpenCode 的解决方案**：
+
+- 代码依据：`packages/opencode/src/tool/tool.ts:109`
+- 设计意图：通过 Zod Schema 实现运行时类型验证，工厂函数封装通用逻辑（验证、截断），同时保留工具自定义能力
+- 带来的好处：
+  - 类型安全：LLM 生成的参数在执行前经过验证
+  - 开发体验：TypeScript + Zod 提供良好的 IDE 支持
+  - 可扩展性：文件系统扫描和插件系统支持动态扩展
+  - 安全性：细粒度权限控制，操作前用户确认
+- 付出的代价：
+  - 学习成本：需要了解 Zod Schema 语法
+  - 启动开销：每次启动需要扫描文件系统加载自定义工具
+  - 复杂度：细粒度权限系统实现复杂
+
+### 6.3 与其他项目的对比
+
+```mermaid
+gitGraph
+    commit id: "传统函数调用"
+    branch "opencode"
+    checkout "opencode"
+    commit id: "Zod + 工厂函数"
+    checkout main
+    branch "swe-agent"
+    checkout "swe-agent"
+    commit id: "YAML 配置"
+    checkout main
+    branch "kimi-cli"
+    checkout "kimi-cli"
+    commit id: "函数装饰器"
+    checkout main
+    branch "codex"
+    checkout "codex"
+    commit id: "Rust 强类型"
+```
+
+| 项目 | 核心差异 | 适用场景 |
+|-----|---------|---------|
+| OpenCode | Zod Schema 运行时验证 + TypeScript 类型 | 需要类型安全和动态扩展的场景 |
+| SWE-agent | YAML 配置 + 代码生成 | 快速定义工具，无需编写代码 |
+| Kimi CLI | Python 函数装饰器 + 运行时反射 | Python 生态，简洁定义 |
+| Codex | Rust 强类型 + 编译时检查 | 最高性能和安全要求 |
+
+---
+
+## 7. 边界情况与错误处理
+
+### 7.1 终止条件
+
+| 终止原因 | 触发条件 | 代码位置 |
+|---------|---------|---------|
+| 参数验证失败 | Zod Schema parse 抛出异常 | `packages/opencode/src/tool/tool.ts:122` |
+| 权限被拒绝 | 用户拒绝权限请求 | `packages/opencode/src/tool/tool.ts:101` |
+| 执行超时 | 工具执行超过 timeout 设置 | 具体工具实现（如 bash.ts） |
+| 取消信号 | 用户主动取消（Ctrl+C） | `packages/opencode/src/tool/tool.ts:97` |
+| 输出截断 | 输出超过长度限制 | `packages/opencode/src/tool/tool.ts:137` |
+
+### 7.2 超时/资源限制
 
 ```typescript
-namespace ToolRegistry {
-  const log = Log.create({ service: "tool.registry" });
+// packages/opencode/src/tool/bash.ts:166
+async execute(params, ctx) {
+  const timeout = params.timeout ?? DEFAULT_TIMEOUT;  // 默认 60s
 
-  // 状态管理
-  export const state = Instance.state(async () => {
-    const custom = [] as Tool.Info[];
-
-    // 1. 从用户目录加载自定义工具
-    const glob = new Bun.Glob("{tool,tools}/*.{js,ts}");
-    const matches = await Config.directories().then((dirs) =>
-      dirs.flatMap((dir) => [...glob.scanSync({ cwd: dir, absolute: true })]),
-    );
-
-    for (const match of matches) {
-      const namespace = path.basename(match, path.extname(match));
-      const mod = await import(match);
-      for (const [id, def] of Object.entries<ToolDefinition>(mod)) {
-        custom.push(fromPlugin(id === "default" ? namespace : `${namespace}_${id}`, def));
-      }
-    }
-
-    // 2. 从插件加载工具
-    const plugins = await Plugin.list();
-    for (const plugin of plugins) {
-      for (const [id, def] of Object.entries(plugin.tool ?? {})) {
-        custom.push(fromPlugin(id, def));
-      }
-    }
-
-    return { custom };
+  const proc = spawn(params.command, {
+    shell,
+    cwd,
+    timeout,  // 超时控制
+    signal: ctx.abort,  // 取消信号
+    // ...
   });
-
-  // 动态注册
-  export async function register(tool: Tool.Info) {
-    const { custom } = await state();
-    const idx = custom.findIndex((t) => t.id === tool.id);
-    if (idx >= 0) {
-      custom.splice(idx, 1, tool);  // 替换已存在
-    } else {
-      custom.push(tool);  // 新增
-    }
-  }
+  // ...
 }
 ```
 
-### 4.2 工具列表组装
+### 7.3 错误恢复策略
 
-```typescript
-async function all(): Promise<Tool.Info[]> {
-  const custom = await state().then((x) => x.custom);
-  const config = await Config.get();
-  const question = ["app", "cli", "desktop"].includes(Flag.OPENCODE_CLIENT)
-    || Flag.OPENCODE_ENABLE_QUESTION_TOOL;
-
-  return [
-    InvalidTool,
-    ...(question ? [QuestionTool] : []),
-    BashTool,
-    ReadTool,
-    GlobTool,
-    GrepTool,
-    EditTool,
-    WriteTool,
-    TaskTool,
-    WebFetchTool,
-    TodoWriteTool,
-    WebSearchTool,
-    CodeSearchTool,
-    SkillTool,
-    ApplyPatchTool,
-    ...(Flag.OPENCODE_EXPERIMENTAL_LSP_TOOL ? [LspTool] : []),
-    ...(config.experimental?.batch_tool === true ? [BatchTool] : []),
-    ...(Flag.OPENCODE_EXPERIMENTAL_PLAN_MODE ? [PlanExitTool, PlanEnterTool] : []),
-    ...custom,  // 自定义工具
-  ];
-}
-```
-
-### 4.3 模型特定过滤
-
-```typescript
-export async function tools(model: { providerID: string; modelID: string }, agent?: Agent.Info) {
-  const tools = await all();
-
-  return Promise.all(
-    tools
-      .filter((t) => {
-        // 1. 特殊工具权限控制 (codesearch/websearch)
-        if (t.id === "codesearch" || t.id === "websearch") {
-          return model.providerID === "opencode" || Flag.OPENCODE_ENABLE_EXA;
-        }
-
-        // 2. GPT 模型使用 apply_patch 替代 edit/write
-        const usePatch = model.modelID.includes("gpt-")
-          && !model.modelID.includes("oss")
-          && !model.modelID.includes("gpt-4");
-        if (t.id === "apply_patch") return usePatch;
-        if (t.id === "edit" || t.id === "write") return !usePatch;
-
-        return true;
-      })
-      .map(async (t) => {
-        // 初始化工具，触发 tool.definition 插件事件
-        const tool = await t.init({ agent });
-        await Plugin.trigger("tool.definition", { toolID: t.id }, output);
-        return { id: t.id, ...tool };
-      }),
-  );
-}
-```
+| 错误类型 | 处理策略 | 代码位置 |
+|---------|---------|---------|
+| Zod 验证错误 | 返回格式化错误信息，提示参数问题 | `packages/opencode/src/tool/tool.ts:124` |
+| 权限拒绝 | 返回拒绝信息，Agent 可尝试其他方案 | `packages/opencode/src/tool/tool.ts:101` |
+| 执行超时 | 返回超时错误，可重试或调整参数 | 具体工具实现 |
+| 文件不存在 | 返回文件错误，Agent 可创建文件 | 具体工具实现 |
+| 截断标记 | 在 metadata 中标记 truncated | `packages/opencode/src/tool/tool.ts:141` |
 
 ---
 
-## 5. 权限控制系统
+## 8. 关键代码索引
 
-### 5.1 权限请求流程
-
-```
- execute(params, ctx)
-       │
-       ├──► 解析命令/操作
-       │     └── 识别受影响的文件/目录
-       │
-       ├──► ctx.ask({
-       │       permission: "bash" | "external_directory" | ...,
-       │       patterns: ["rm -rf *", "cd /etc"],
-       │       always: [...],  // "总是允许" 模式
-       │       metadata: {}
-       │     })
-       │
-       ├──► 等待用户确认
-       │     └── PermissionNext 系统处理
-       │
-       └──► 执行或拒绝
-```
-
-### 5.2 权限类型
-
-| 权限类型 | 说明 | 示例场景 |
-|----------|------|----------|
-| `bash` | Shell 命令执行 | 执行任意 shell 命令 |
-| `external_directory` | 外部目录访问 | 访问项目目录外的文件 |
-| `write` | 文件写入 | 修改代码文件 |
-| `delete` | 文件删除 | 删除文件 |
-
-### 5.3 Bash 工具权限识别示例
-
-```typescript
-// 使用 Tree-sitter 解析 bash 命令
-const tree = await parser().then((p) => p.parse(params.command));
-
-for (const node of tree.rootNode.descendantsOfType("command")) {
-  const command = [];
-  for (let i = 0; i < node.childCount; i++) {
-    const child = node.child(i);
-    if (["command_name", "word", "string"].includes(child.type)) {
-      command.push(child.text);
-    }
-  }
-
-  // 识别文件操作命令
-  if (["cd", "rm", "cp", "mv", "mkdir", "touch"].includes(command[0])) {
-    for (const arg of command.slice(1)) {
-      if (arg.startsWith("-")) continue;
-      const resolved = await $`realpath ${arg}`.cwd(cwd).quiet().nothrow().text();
-      if (resolved && !Instance.containsPath(resolved)) {
-        directories.add(resolved);  // 标记外部目录
-      }
-    }
-  }
-
-  // 添加 bash 权限模式
-  if (command.length && command[0] !== "cd") {
-    patterns.add(commandText);
-    always.add(BashArity.prefix(command).join(" ") + " *");
-  }
-}
-```
+| 功能 | 文件 | 行号 | 说明 |
+|-----|------|------|------|
+| 入口 | `packages/opencode/src/tool/tool.ts` | 109 | Tool.define 工厂函数 |
+| 核心 | `packages/opencode/src/tool/tool.ts` | 76 | Tool.Info 接口定义 |
+| 核心 | `packages/opencode/src/tool/tool.ts` | 93 | Tool.Context 接口定义 |
+| 注册 | `packages/opencode/src/tool/registry.ts` | 14 | ToolRegistry 命名空间 |
+| 注册 | `packages/opencode/src/tool/registry.ts` | 223 | state() 初始化状态 |
+| 注册 | `packages/opencode/src/tool/registry.ts` | 252 | register() 动态注册 |
+| 注册 | `packages/opencode/src/tool/registry.ts` | 300 | tools() 获取过滤后的工具列表 |
+| 示例 | `packages/opencode/src/tool/bash.ts` | 154 | BashTool 工具定义示例 |
+| 权限 | `packages/opencode/src/tool/tool.ts` | 101 | ctx.ask() 权限请求接口 |
+| 截断 | `packages/opencode/src/tool/tool.ts` | 137 | Truncate.output 自动截断 |
+| 插件 | `packages/opencode/src/tool/registry.ts` | 241 | 从插件加载工具 |
+| 插件 | `packages/opencode/src/tool/registry.ts` | 323 | tool.definition 事件触发 |
 
 ---
 
-## 6. 内置工具清单
+## 9. 延伸阅读
 
-### 6.1 核心工具
-
-| 工具 ID | 功能 | 关键参数 |
-|---------|------|----------|
-| `bash` | Shell 执行 | command, timeout, workdir |
-| `read` | 文件读取 | file_path, offset, limit |
-| `write` | 文件写入 | file_path, content |
-| `edit` | 文件编辑 | file_path, old_string, new_string |
-| `apply_patch` | 补丁应用 | path, diff |
-| `glob` | 文件匹配 | pattern, path |
-| `grep` | 内容搜索 | pattern, path |
-
-### 6.2 扩展工具
-
-| 工具 ID | 功能 | 说明 |
-|---------|------|------|
-| `webfetch` | Web 内容获取 | URL 内容拉取 |
-| `websearch` | Web 搜索 | 需要 opencode provider 或 ENABLE_EXA flag |
-| `codesearch` | 代码搜索 | 语义代码搜索 |
-| `todo` | 待办管理 | 任务追踪 |
-| `task` | 子任务 | 子 Agent 任务委派 |
-| `skill` | 技能管理 | 加载/卸载技能 |
-| `lsp` | LSP 工具 | 实验性功能 |
-| `batch` | 批量操作 | 实验性功能 |
-| `plan` | 计划模式 | 实验性功能 (CLI only) |
-
-### 6.3 模型特定工具选择
-
-```typescript
-// GPT 模型使用 apply_patch 替代 edit/write
-const usePatch = model.modelID.includes("gpt-")
-  && !model.modelID.includes("oss")
-  && !model.modelID.includes("gpt-4");
-```
+- 前置知识：`docs/opencode/04-opencode-agent-loop.md` - Agent Loop 如何驱动工具调用
+- 相关机制：`docs/opencode/06-opencode-mcp-integration.md` - MCP 集成扩展工具能力
+- 相关机制：`docs/opencode/10-opencode-safety-control.md` - 权限与安全控制详解
+- 深度分析：`docs/comm/comm-tools-system.md` - 跨项目工具系统对比
+- 对比项目：`docs/swe-agent/05-swe-agent-tools-system.md` - SWE-agent YAML 配置方案
+- 对比项目：`docs/kimi-cli/05-kimi-cli-tools-system.md` - Kimi CLI 函数装饰器方案
 
 ---
 
-## 7. 插件系统扩展
-
-### 7.1 插件工具转换
-
-```typescript
-function fromPlugin(id: string, def: ToolDefinition): Tool.Info {
-  return {
-    id,
-    init: async (initCtx) => ({
-      parameters: z.object(def.args),
-      description: def.description,
-      execute: async (args, ctx) => {
-        const pluginCtx = {
-          ...ctx,
-          directory: Instance.directory,
-          worktree: Instance.worktree,
-        } as PluginToolContext;
-
-        const result = await def.execute(args as any, pluginCtx);
-        const out = await Truncate.output(result, {}, initCtx?.agent);
-
-        return {
-          title: "",
-          output: out.truncated ? out.content : result,
-          metadata: { truncated: out.truncated, outputPath: out.outputPath },
-        };
-      },
-    }),
-  };
-}
-```
-
-### 7.2 插件事件
-
-```typescript
-// 工具定义事件
-await Plugin.trigger("tool.definition", { toolID: t.id }, output);
-
-// Shell 环境事件
-const shellEnv = await Plugin.trigger("shell.env", { cwd }, { env: {} });
-```
-
----
-
-## 8. 与其他组件的交互
-
-### 8.1 与 Agent Loop 的交互
-
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  Agent Loop │────▶│ToolRegistry │────▶│   tools()   │
-│             │     │   .tools()  │     │  (filtered) │
-└──────┬──────┘     └─────────────┘     └─────────────┘
-       │
-       │ ◄──────────────────────────────────────────────┐
-       │              工具调用结果                       │
-       ▼                                              │
-┌─────────────┐                                       │
-│  Tool.execute                                       │
-│  • Zod 验证  │                                       │
-│  • ctx.ask() │                                       │
-│  • 执行      │───────────────────────────────────────┘
-│  • 截断      │        返回 {title, metadata, output}
-└─────────────┘
-```
-
-### 8.2 与权限系统的交互
-
-```
-┌─────────────────┐
-│   Tool.execute  │
-│  ctx.ask({
-│    permission,
-│    patterns
-│  })             │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ PermissionNext  │
-│  系统           │
-│  • 检查缓存     │
-│  • 用户确认     │
-│  • 记录决策     │
-└────────┬────────┘
-         │
-    ┌────┴────┐
-    ▼         ▼
-  允许       拒绝
-```
-
----
-
-## 9. 架构特点总结
-
-- **Zod 类型安全**: 参数 Schema 定义提供运行时验证
-- **工厂函数定义**: `Tool.define()` 提供一致的 API
-- **动态注册**: 支持自定义工具和插件扩展
-- **细粒度权限**: `ctx.ask()` 支持操作级权限控制
-- **自动截断**: 输出自动截断防止上下文溢出
-- **模型适配**: 根据模型类型选择合适工具 (apply_patch vs edit)
-- **插件事件**: 工具定义和执行钩子支持扩展
-
----
-
-## 10. 排障速查
-
-- **参数验证失败**: 检查 Zod Schema 定义和输入数据类型
-- **工具未加载**: 检查 `~/tools/` 目录或插件配置
-- **权限请求失败**: 检查 `ctx.ask()` 调用和 PermissionNext 系统
-- **输出截断异常**: 查看 `Truncate.output` 配置
-- **Bash 解析错误**: 检查 Tree-sitter 解析器初始化
-- **模型特定工具不显示**: 检查 `tools()` 中的过滤逻辑
+*✅ Verified: 基于 opencode/packages/opencode/src/tool/*.ts 源码分析*
+*基于版本：2026-02-08 | 最后更新：2026-02-25*

@@ -2,7 +2,7 @@
 
 ## TL;DR（结论先行）
 
-SWE-agent 的 Agent Loop 采用"双层循环架构"：内层是 step 级的动作-观察循环（模型输出动作 -> 环境执行 -> 观察回注），外层是 attempt 级的重试循环（失败后重置环境重新尝试）。核心特点是 `forward_with_handling()` 实现的错误恢复机制和 `RetryAgent` 的多尝试选优策略。
+一句话定义：Agent Loop 是 Code Agent 的控制核心，让 LLM 从"一次性回答"变成"多轮执行"。
 
 SWE-agent 的核心取舍：**双层循环 + 错误重采样 + attempt 级重试**（对比 Kimi CLI 的单层 while 循环、Gemini CLI 的递归 continuation、Codex 的 Actor 消息驱动）
 
@@ -337,9 +337,9 @@ stateDiagram-v2
 
 ---
 
-## 4. 端到端数据流转
+### 3.4 组件间协作时序
 
-### 4.1 正常流程（详细版）
+展示多个组件如何协作完成一个复杂操作。
 
 ```mermaid
 sequenceDiagram
@@ -353,16 +353,21 @@ sequenceDiagram
     participant E as Environment
 
     U->>R: 启动任务
+    activate R
+
     R->>E: env.start()
     R->>RA: retry_agent.run()
+    activate RA
 
     loop attempt 循环
         RA->>DA: default_agent.run()
+        activate DA
         DA->>DA: setup()
 
         loop step 循环
             DA->>DA: messages = self.messages
             DA->>F: forward_with_handling(messages)
+            activate F
 
             F->>M: query(messages)
             M-->>F: model_response
@@ -373,6 +378,7 @@ sequenceDiagram
             F->>E: execute(action)
             E-->>F: observation
             F-->>DA: StepOutput
+            deactivate F
 
             DA->>DA: add_step_to_history()
             DA->>DA: add_step_to_trajectory()
@@ -380,6 +386,8 @@ sequenceDiagram
         end
 
         DA-->>RA: AgentRunResult
+        deactivate DA
+
         RA->>RA: on_submit()
         RA->>RA: retry() ?
         opt retry = true
@@ -389,7 +397,112 @@ sequenceDiagram
 
     RA->>RA: choose best attempt
     RA-->>R: final result
+    deactivate RA
     R->>E: env.close()
+    deactivate R
+```
+
+**协作要点**：
+
+1. **调用方与 RetryAgent**：RunSingle 调用 RetryAgent，分离任务调度与执行
+2. **RetryAgent 与 DefaultAgent**：外层管理 attempt 生命周期，内层管理 step 执行
+3. **DefaultAgent 与外部服务**：通过 forward_with_handling 统一处理模型调用和错误恢复
+
+---
+
+### 3.5 关键数据路径
+
+#### 主路径（正常流程）
+
+```mermaid
+flowchart LR
+    subgraph Input["输入阶段"]
+        I1[problem] --> I2[env 初始化]
+        I2 --> I3[history 构建]
+    end
+
+    subgraph Process["处理阶段"]
+        P1[模型调用] --> P2[动作解析]
+        P2 --> P3[动作执行]
+        P3 --> P4[观察回注]
+    end
+
+    subgraph Output["输出阶段"]
+        O1[更新 history] --> O2[持久化 trajectory]
+        O2 --> O3[返回结果]
+    end
+
+    I3 --> P1
+    P4 --> O1
+
+    style Process fill:#e1f5e1,stroke:#333
+```
+
+#### 异常路径（错误恢复）
+
+```mermaid
+flowchart TD
+    E[发生错误] --> E1{错误类型}
+    E1 -->|可恢复| R1[重采样机制]
+    E1 -->|重试类| R2[携带/不携带输出重试]
+    E1 -->|致命错误| R3[attempt_autosubmit]
+
+    R1 --> R1A[组装错误模板]
+    R1A --> R1B[requery 模型]
+    R1B -->|成功| R1C[继续主路径]
+    R1B -->|失败| R3
+
+    R2 --> R2A[继续重采样]
+
+    R3 --> R3A[尝试提取 patch]
+    R3A --> R3B[标记 done=true]
+
+    R1C --> End[结束]
+    R2A --> End
+    R3B --> End
+
+    style R1 fill:#90EE90
+    style R2 fill:#FFD700
+    style R3 fill:#FF6B6B
+```
+
+---
+
+## 4. 端到端数据流转
+
+### 4.1 正常流程（详细版）
+
+展示数据如何从输入到输出的完整变换过程。
+
+```mermaid
+sequenceDiagram
+    participant A as RunSingle
+    participant B as RetryAgent
+    participant C as DefaultAgent
+    participant D as forward_with_handling
+    participant E as Environment
+
+    A->>B: run(env, problem)
+    B->>B: 初始化 retry loop
+    B->>C: default_agent.run()
+    C->>C: setup()
+
+    loop step 循环
+        C->>C: 准备 messages
+        C->>D: forward_with_handling(messages)
+        D->>D: 模型调用 + 错误处理
+        D-->>C: StepOutput
+        C->>C: 更新 history
+        C->>C: save_trajectory()
+    end
+
+    C-->>B: AgentRunResult
+    B->>B: retry() ?
+    opt retry = true
+        B->>E: hard_reset()
+    end
+    B->>B: choose best
+    B-->>A: final result
 ```
 
 ### 4.2 数据变换详情
@@ -405,6 +518,21 @@ sequenceDiagram
 | 提交检测 | observation | check submission | done=true? | `sweagent/agent/agents.py` |
 | 重试决策 | AgentRunResult | retry() | 是否重试 | `sweagent/agent/agents.py` |
 | 选优 | 多次结果 | choose() | 最优结果 | `sweagent/agent/agents.py` |
+
+### 4.3 异常/边界流程
+
+```mermaid
+flowchart TD
+    A[开始] --> B{条件判断}
+    B -->|正常| C[正常处理]
+    B -->|格式错误| D[重采样]
+    B -->|上下文超限| E[attempt_autosubmit]
+    B -->|成本超限| F[退出]
+    C --> G[结束]
+    D --> G
+    E --> G
+    F --> G
+```
 
 ---
 
@@ -431,6 +559,17 @@ class AgentInfo(BaseModel):
     submission: str | None = None
     model_stats: InstanceStats
 ```
+
+**字段说明**：
+
+| 字段 | 类型 | 用途 |
+|-----|------|------|
+| `thought` | `str` | 模型思考过程 |
+| `action` | `str` | 模型生成的动作 |
+| `observation` | `str` | 工具执行结果 |
+| `done` | `bool` | 是否完成任务 |
+| `exit_status` | `int \| str \| None` | 退出状态码 |
+| `submission` | `str \| None` | 最终提交的答案 |
 
 ### 5.2 主链路代码
 
@@ -513,6 +652,26 @@ RunSingle.run()                    [sweagent/run/run_single.py]
 
 ### 6.3 与其他项目的对比
 
+```mermaid
+gitGraph
+    commit id: "传统方案"
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "双层循环+重采样"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "单层+Checkpoint"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "Actor消息驱动"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "递归continuation"
+```
+
 | 项目 | 核心差异 | 适用场景 |
 |-----|---------|---------|
 | SWE-agent | 双层循环 + 错误重采样 + attempt 重试 | 软件工程任务、需要高可靠性 |
@@ -538,20 +697,7 @@ RunSingle.run()                    [sweagent/run/run_single.py]
 | 超时 | 达到 total_execution_timeout | `sweagent/agent/agents.py` |
 | 环境错误 | runtime 崩溃 | `sweagent/environment/swe_env.py` |
 
-### 7.2 错误恢复策略
-
-| 错误类型 | 处理策略 | 代码位置 |
-|---------|---------|---------|
-| FormatError | requery（最多 max_requeries 次） | `sweagent/agent/agents.py:forward_with_handling` |
-| BlockedActionError | requery + 错误提示 | `sweagent/agent/agents.py:forward_with_handling` |
-| BashIncorrectSyntaxError | requery + 语法检查 | `sweagent/agent/agents.py:forward_with_handling` |
-| ContentPolicyViolationError | requery | `sweagent/agent/agents.py:forward_with_handling` |
-| ContextWindowExceededError | attempt_autosubmit | `sweagent/agent/agents.py:forward_with_handling` |
-| CostLimitExceededError | 退出 | `sweagent/agent/models.py` |
-| Timeout | 标记并继续或退出 | `sweagent/tools/tools.py` |
-| 环境崩溃 | attempt_autosubmit | `sweagent/agent/agents.py` |
-
-### 7.3 资源限制
+### 7.2 超时/资源限制
 
 ```python
 # 关键配置参数
@@ -563,6 +709,19 @@ class AgentConfig:
 class ModelConfig:
     per_instance_cost_limit: float = 3.0  # 单次成本限制（美元）
 ```
+
+### 7.3 错误恢复策略
+
+| 错误类型 | 处理策略 | 代码位置 |
+|---------|---------|---------|
+| FormatError | requery（最多 max_requeries 次） | `sweagent/agent/agents.py:forward_with_handling` |
+| BlockedActionError | requery + 错误提示 | `sweagent/agent/agents.py:forward_with_handling` |
+| BashIncorrectSyntaxError | requery + 语法检查 | `sweagent/agent/agents.py:forward_with_handling` |
+| ContentPolicyViolationError | requery | `sweagent/agent/agents.py:forward_with_handling` |
+| ContextWindowExceededError | attempt_autosubmit | `sweagent/agent/agents.py:forward_with_handling` |
+| CostLimitExceededError | 退出 | `sweagent/agent/models.py` |
+| Timeout | 标记并继续或退出 | `sweagent/tools/tools.py` |
+| 环境崩溃 | attempt_autosubmit | `sweagent/agent/agents.py` |
 
 ---
 
@@ -591,4 +750,4 @@ class ModelConfig:
 ---
 
 *✅ Verified: 基于 sweagent/agent/agents.py 源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-02-25*

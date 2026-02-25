@@ -74,13 +74,14 @@ SWE-agent 的核心取舍：**Python 标准库 + 简单轮询**（对比 Gemini 
 
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
-| `start_server()` | 启动 HTTP 服务器 | `sweagent/inspector/server.py` |
-| `CustomHTTPRequestHandler` | 请求处理 | `sweagent/inspector/server.py` |
-| `/directory_info` | 返回目录结构 | `sweagent/inspector/server.py` |
-| `/files` | 返回文件内容 | `sweagent/inspector/server.py` |
-| `/trajectory` | 返回 trajectory 数据 | `sweagent/inspector/server.py` |
-| `/check_update` | 检查更新 | `sweagent/inspector/server.py` |
-| `fileViewer.js` | 前端逻辑 | `sweagent/inspector/fileViewer.js` |
+| `main()` | 启动 HTTP 服务器 | `SWE-agent/sweagent/inspector/server.py:295` |
+| `Handler` | 请求处理器类 | `SWE-agent/sweagent/inspector/server.py:221` |
+| `/directory_info` | 返回目录结构 | `SWE-agent/sweagent/inspector/server.py:234` |
+| `/files` | 返回文件列表 | `SWE-agent/sweagent/inspector/server.py:267` |
+| `/trajectory` | 返回 trajectory 数据 | `SWE-agent/sweagent/inspector/server.py:259` |
+| `/check_update` | 检查更新 | `SWE-agent/sweagent/inspector/server.py:281` |
+| `serve_file_content()` | 读取文件内容 | `SWE-agent/sweagent/inspector/server.py:240` |
+| `load_content()` | 加载并处理 trajectory | `SWE-agent/sweagent/inspector/server.py:168` |
 
 ### 2.3 核心组件交互关系
 
@@ -142,28 +143,28 @@ sequenceDiagram
 #### 核心实现
 
 ```python
-# sweagent/inspector/server.py
-import socketserver
-from http.server import SimpleHTTPRequestHandler
-
-class CustomHTTPRequestHandler(SimpleHTTPRequestHandler):
+# SWE-agent/sweagent/inspector/server.py:221-293
+class Handler(http.server.SimpleHTTPRequestHandler):
     """自定义请求处理器，添加 CORS 和 JSON API 支持"""
+
+    file_mod_times = {}  # 记录文件修改时间
 
     def end_headers(self):
         # 添加 CORS 头，允许跨域访问
-        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header("Access-Control-Allow-Origin", "*")
         super().end_headers()
 
     def do_GET(self):
         # 路由分发到对应的 API 端点
-        if self.path == '/directory_info':
-            self.handle_directory_info()
-        elif self.path.startswith('/files'):
-            self.handle_files()
-        elif self.path.startswith('/trajectory'):
-            self.handle_trajectory()
-        elif self.path == '/check_update':
-            self.handle_check_update()
+        if self.path == "/directory_info":
+            self.serve_directory_info()
+        elif self.path.startswith("/files"):
+            self.handle_files_request()
+        elif self.path.startswith("/trajectory/"):
+            file_path = self.path[len("/trajectory/"):]
+            self.serve_file_content(file_path)
+        elif self.path.startswith("/check_update"):
+            self.check_for_updates()
         else:
             # 静态文件服务（前端资源）
             super().do_GET()
@@ -190,42 +191,33 @@ class CustomHTTPRequestHandler(SimpleHTTPRequestHandler):
 #### `/directory_info` 实现
 
 ```python
-# sweagent/inspector/server.py
-def handle_directory_info(self):
-    """扫描 output_dir 返回目录结构"""
-    result = {"directories": []}
-    output_dir = self.server.output_dir
-
-    for entry in os.scandir(output_dir):
-        if entry.is_dir():
-            dir_info = {"name": entry.name, "path": entry.name, "trajectories": []}
-            for subentry in os.scandir(entry.path):
-                if subentry.name.endswith('.jsonl'):
-                    stat = subentry.stat()
-                    dir_info["trajectories"].append({
-                        "name": subentry.name,
-                        "path": f"{entry.name}/{subentry.name}",
-                        "size": stat.st_size,
-                        "modified": stat.st_mtime
-                    })
-            result["directories"].append(dir_info)
-
-    self.send_json_response(result)
+# SWE-agent/sweagent/inspector/server.py:234-238
+def serve_directory_info(self):
+    """返回目录信息"""
+    self.send_response(200)
+    self.send_header("Content-type", "application/json")
+    self.end_headers()
+    self.wfile.write(json.dumps({"directory": self.traj_dir}).encode())
 ```
 
 #### `/files` 实现
 
 ```python
-# sweagent/inspector/server.py
-def handle_files(self):
-    """读取文件内容"""
-    query = parse_qs(urlparse(self.path).query)
-    file_path = query.get('path', [''])[0]
-
-    # 安全检查：确保路径在 output_dir 内
-    full_path = os.path.abspath(os.path.join(self.server.output_dir, file_path))
-    if not full_path.startswith(os.path.abspath(self.server.output_dir)):
-        self.send_error(403, "Access denied")
+# SWE-agent/sweagent/inspector/server.py:267-279
+def handle_files_request(self):
+    """返回 trajectory 文件列表"""
+    self.send_response(200)
+    self.send_header("Content-type", "application/json")
+    self.end_headers()
+    files = sorted(
+        (
+            str(file.relative_to(Path(self.traj_dir))) + " " * 4 + get_status(file)
+            for file in Path(self.traj_dir).glob("**/*.traj")
+        ),
+        key=lambda x: str(Path(self.traj_dir) / x),
+        reverse=True,
+    )
+    self.wfile.write(json.dumps(files).encode())
         return
 
     try:
@@ -316,11 +308,11 @@ sequenceDiagram
 
 | 阶段 | 输入 | 处理 | 输出 | 代码位置 |
 |-----|------|------|------|---------|
-| 服务器启动 | host, port, output_dir | TCPServer | 监听服务 | `sweagent/inspector/server.py` |
-| 目录扫描 | output_dir | os.scandir | 目录结构 JSON | `sweagent/inspector/server.py` |
-| 文件读取 | file_path | 安全检查 + 读取 | 文件内容 | `sweagent/inspector/server.py` |
-| Trajectory 解析 | file_content | JSON 解析 | trajectory 数据 | `sweagent/inspector/server.py` |
-| 更新检查 | output_dir | 获取最后修改时间 | 时间戳 | `sweagent/inspector/server.py` |
+| 服务器启动 | host, port, traj_dir | TCPServer | 监听服务 | `SWE-agent/sweagent/inspector/server.py:295` |
+| 目录信息 | traj_dir | 返回目录路径 | JSON | `SWE-agent/sweagent/inspector/server.py:234` |
+| 文件列表 | traj_dir | glob 扫描 | 文件列表 JSON | `SWE-agent/sweagent/inspector/server.py:267` |
+| Trajectory 加载 | file_path | load_content | 处理后的 JSON | `SWE-agent/sweagent/inspector/server.py:240` |
+| 更新检查 | traj_dir | 比较修改时间 | 200/204 | `SWE-agent/sweagent/inspector/server.py:281` |
 
 ---
 
@@ -329,56 +321,73 @@ sequenceDiagram
 ### 5.1 核心数据结构
 
 ```python
-# sweagent/inspector/server.py
-class CustomHTTPRequestHandler(SimpleHTTPRequestHandler):
+# SWE-agent/sweagent/inspector/server.py:221-232
+class Handler(http.server.SimpleHTTPRequestHandler):
     """自定义请求处理器"""
 
-    def __init__(self, *args, output_dir: Path, **kwargs):
-        self.output_dir = output_dir
-        super().__init__(*args, **kwargs)
+    file_mod_times = {}  # 记录文件修改时间
 
-    def send_json_response(self, data: dict):
-        """发送 JSON 响应"""
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
+    def __init__(self, *args, **kwargs):
+        self.gold_patches = kwargs.pop("gold_patches", {})
+        self.test_patches = kwargs.pop("test_patches", {})
+        self.traj_dir = kwargs.pop("directory", ".")
+        super().__init__(*args, **kwargs)
 ```
 
 ### 5.2 主链路代码
 
 ```python
-# sweagent/inspector/server.py (简化)
-def start_server(output_dir: Path, host: str = "0.0.0.0", port: int = 8000):
+# SWE-agent/sweagent/inspector/server.py:295-329
+def main(data_path, directory, port):
     """启动 Inspector HTTP 服务器"""
+    # 加载数据文件获取 gold/test patches
+    data = []
+    if data_path is not None:
+        if data_path.endswith(".jsonl"):
+            data = [json.loads(x) for x in Path(data_path).read_text().splitlines(keepends=True)]
+        elif data_path.endswith(".json"):
+            with open(data_path) as f:
+                data = json.load(f)
 
-    class Handler(CustomHTTPRequestHandler):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, output_dir=output_dir, **kwargs)
+    gold_patches = {d["instance_id"]: d["patch"] if "patch" in d else None for d in data}
+    test_patches = {d["instance_id"]: d["test_patch"] if "test_patch" in d else None for d in data}
 
-    with socketserver.TCPServer((host, port), Handler) as httpd:
-        print(f"Serving at http://{host}:{port}")
-        httpd.serve_forever()
+    # 使用 partial 传递参数给 Handler
+    handler_with_directory = partial(
+        Handler,
+        directory=directory,
+        gold_patches=gold_patches,
+        test_patches=test_patches,
+    )
+    try:
+        with socketserver.TCPServer(("", port), handler_with_directory) as httpd:
+            print(f"Serving at http://localhost:{port}")
+            httpd.serve_forever()
+    except OSError as e:
+        if e.errno == 48:
+            print(f"ERROR: Port ({port}) is already in use.")
+        else:
+            raise e
 ```
 
 **代码要点**：
-1. **闭包传递配置**：通过闭包将 output_dir 传递给 Handler
+1. **partial 传递配置**：使用 functools.partial 传递参数给 Handler
 2. **标准库实现**：无需外部依赖
-3. **简单阻塞**：serve_forever() 阻塞运行
+3. **端口占用处理**：捕获 errno 48 并给出友好提示
 
 ### 5.3 关键调用链
 
 ```text
-RunSingle.run()                    [sweagent/run/run_single.py]
-  -> start_server()                 [sweagent/inspector/server.py]
-    -> socketserver.TCPServer()     [Python stdlib]
-      -> serve_forever()            [Python stdlib]
-        -> handle_request()         [Python stdlib]
-          -> CustomHTTPRequestHandler.do_GET()
-            -> handle_directory_info()
-            -> handle_files()
-            -> handle_trajectory()
-            -> handle_check_update()
+run_from_cli()                     [SWE-agent/sweagent/inspector/server.py:344]
+  -> main()                          [SWE-agent/sweagent/inspector/server.py:295]
+    -> socketserver.TCPServer()      [Python stdlib]
+      -> serve_forever()             [Python stdlib]
+        -> handle_request()          [Python stdlib]
+          -> Handler.do_GET()        [SWE-agent/sweagent/inspector/server.py:254]
+            -> serve_directory_info() [SWE-agent/sweagent/inspector/server.py:234]
+            -> handle_files_request() [SWE-agent/sweagent/inspector/server.py:267]
+            -> serve_file_content()   [SWE-agent/sweagent/inspector/server.py:240]
+            -> check_for_updates()    [SWE-agent/sweagent/inspector/server.py:281]
 ```
 
 ---
@@ -400,7 +409,7 @@ RunSingle.run()                    [sweagent/run/run_single.py]
 **核心问题**：如何在零依赖的前提下提供 trajectory 可视化功能？
 
 **SWE-agent 的解决方案**：
-- 代码依据：`sweagent/inspector/server.py`
+- 代码依据：`SWE-agent/sweagent/inspector/server.py:295`
 - 设计意图：使用 Python 标准库实现最简单的 HTTP 服务器，满足只读展示需求
 - 带来的好处：
   - 零外部依赖
@@ -438,10 +447,8 @@ RunSingle.run()                    [sweagent/run/run_single.py]
 
 | 错误类型 | 处理策略 | 代码位置 |
 |---------|---------|---------|
-| 端口占用 | 提示更换端口 | 启动逻辑 |
-| 路径越界 | 返回 403 | `handle_files()` |
-| 文件不存在 | 返回 404 | `handle_files()` |
-| JSON 解析失败 | 返回错误信息 | `handle_trajectory()` |
+| 端口占用 | 提示更换端口 | `SWE-agent/sweagent/inspector/server.py:327` |
+| 文件不存在 | 返回 404 | `SWE-agent/sweagent/inspector/server.py:252` |
 
 ### 7.3 安全配置
 
@@ -459,15 +466,16 @@ if not full_path.startswith(os.path.abspath(self.server.output_dir)):
 
 | 功能 | 文件 | 行号 | 说明 |
 |-----|------|------|------|
-| 服务器启动 | `sweagent/inspector/server.py` | - | start_server() |
-| 请求处理器 | `sweagent/inspector/server.py` | - | CustomHTTPRequestHandler |
-| 目录信息 | `sweagent/inspector/server.py` | - | handle_directory_info() |
-| 文件读取 | `sweagent/inspector/server.py` | - | handle_files() |
-| Trajectory | `sweagent/inspector/server.py` | - | handle_trajectory() |
-| 更新检查 | `sweagent/inspector/server.py` | - | handle_check_update() |
-| 前端 JS | `sweagent/inspector/fileViewer.js` | - | TrajectoryViewer |
-| 前端 HTML | `sweagent/inspector/index.html` | - | 页面结构 |
-| CLI 命令 | `sweagent/run/run.py` | - | inspector 命令 |
+| 服务器启动 | `SWE-agent/sweagent/inspector/server.py` | 295 | main() 函数 |
+| 请求处理器 | `SWE-agent/sweagent/inspector/server.py` | 221 | Handler 类 |
+| 目录信息 | `SWE-agent/sweagent/inspector/server.py` | 234 | serve_directory_info() |
+| 文件列表 | `SWE-agent/sweagent/inspector/server.py` | 267 | handle_files_request() |
+| Trajectory 加载 | `SWE-agent/sweagent/inspector/server.py` | 240 | serve_file_content() |
+| 更新检查 | `SWE-agent/sweagent/inspector/server.py` | 281 | check_for_updates() |
+| 内容处理 | `SWE-agent/sweagent/inspector/server.py` | 168 | load_content() |
+| 状态获取 | `SWE-agent/sweagent/inspector/server.py` | 205 | get_status() |
+| CLI 入口 | `SWE-agent/sweagent/inspector/server.py` | 344 | run_from_cli() |
+| 静态文件 | `SWE-agent/sweagent/inspector/static.py` | - | 静态资源 |
 
 ---
 
@@ -479,5 +487,5 @@ if not full_path.startswith(os.path.abspath(self.server.output_dir)):
 
 ---
 
-*✅ Verified: 基于 sweagent/inspector/server.py 源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*✅ Verified: 基于 SWE-agent/sweagent/inspector/server.py 源码分析*
+*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-02-25*

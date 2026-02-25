@@ -77,11 +77,11 @@ Code Agent 在处理复杂任务时面临内存管理挑战：
 
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
-| `history` | 原始对话历史 | `sweagent/agent/agents.py:481` |
-| `History Processors` | 历史记录变换链 | `sweagent/agent/history_processors.py` |
-| `trajectory` | 执行轨迹 | `sweagent/agent/agents.py:482` |
-| `save_trajectory()` | 持久化到文件 | `sweagent/agent/agents.py` |
-| `RunReplay` | 轨迹重放 | `sweagent/run/run_replay.py` |
+| `history` | 原始对话历史 | `SWE-agent/sweagent/agent/agents.py:481` |
+| `History Processors` | 历史记录变换链 | `SWE-agent/sweagent/agent/history_processors.py` |
+| `trajectory` | 执行轨迹 | `SWE-agent/sweagent/agent/agents.py:482` |
+| `save_trajectory()` | 持久化到文件 | `SWE-agent/sweagent/agent/agents.py` |
+| `RunReplay` | 轨迹重放 | `SWE-agent/sweagent/run/run_replay.py` |
 
 ### 2.3 核心组件交互关系
 
@@ -432,7 +432,7 @@ sequenceDiagram
 | History 处理 | raw history | Processors 链 | processed messages | `sweagent/agent/agents.py:540` |
 | 模型输入 | processed messages | query() | model_response | `sweagent/agent/models.py` |
 | History 更新 | StepOutput | add_step_to_history() | 更新后 history | `sweagent/agent/agents.py:556` |
-| Trajectory 更新 | StepOutput | add_step_to_trajectory() | 更新后 trajectory | `sweagent/agent/agents.py:300` |
+| Trajectory 更新 | StepOutput | add_step_to_trajectory() | 更新后 trajectory | `SWE-agent/sweagent/agent/agents.py:714` |
 | 持久化 | trajectory + history + info | JSON 序列化 | .traj 文件 | `sweagent/agent/agents.py:save_trajectory` |
 
 ---
@@ -504,7 +504,7 @@ Agent.step()                       [sweagent/agent/agents.py:800]
       -> RemoveRegex()              [sweagent/agent/history_processors.py]
   -> model.query(messages)         [sweagent/agent/models.py]
   -> add_step_to_history()         [sweagent/agent/agents.py:556]
-  -> add_step_to_trajectory()      [sweagent/agent/agents.py:300]
+  -> add_step_to_trajectory()      [SWE-agent/sweagent/agent/agents.py:714]
   -> save_trajectory()             [sweagent/agent/agents.py]
 ```
 
@@ -587,16 +587,16 @@ class LastNObservations:
 | 功能 | 文件 | 行号 | 说明 |
 |-----|------|------|------|
 | History 定义 | `sweagent/types.py` | 44 | HistoryItem |
-| Trajectory 定义 | `sweagent/types.py` | 120 | TrajectoryStep |
-| History Processors | `sweagent/agent/history_processors.py` | - | 处理器链 |
-| LastNObservations | `sweagent/agent/history_processors.py` | 86 | 上下文压缩 |
-| CacheControl | `sweagent/agent/history_processors.py` | 200 | 缓存控制 |
-| messages property | `sweagent/agent/agents.py` | 540 | 获取处理后 history |
-| 添加 History | `sweagent/agent/agents.py` | 556 | add_step_to_history() |
-| 添加 Trajectory | `sweagent/agent/agents.py` | 300 | add_step_to_trajectory() |
-| 持久化 | `sweagent/agent/agents.py` | - | save_trajectory() |
-| Replay | `sweagent/run/run_replay.py` | - | RunReplay |
-| Trajectory 转 Demo | `sweagent/run/run_traj_to_demo.py` | - | convert_trajectory_to_demo() |
+| Trajectory 定义 | `SWE-agent/sweagent/types.py` | - | TrajectoryStep |
+| History Processors | `SWE-agent/sweagent/agent/history_processors.py` | - | 处理器链 |
+| LastNObservations | `SWE-agent/sweagent/agent/history_processors.py` | 85 | 上下文压缩 |
+| CacheControl | `SWE-agent/sweagent/agent/history_processors.py` | 261 | 缓存控制 |
+| messages property | `SWE-agent/sweagent/agent/agents.py` | 540 | 获取处理后 history |
+| 添加 History | `SWE-agent/sweagent/agent/agents.py` | 556 | add_step_to_history() |
+| 添加 Trajectory | `SWE-agent/sweagent/agent/agents.py` | 714 | add_step_to_trajectory() |
+| 持久化 | `SWE-agent/sweagent/agent/agents.py` | - | save_trajectory() |
+| Replay | `SWE-agent/sweagent/run/run_replay.py` | - | RunReplay |
+| Trajectory 转 Demo | `SWE-agent/sweagent/run/run_traj_to_demo.py` | - | convert_trajectory_to_demo() |
 
 ---
 
@@ -608,5 +608,5 @@ class LastNObservations:
 
 ---
 
-*✅ Verified: 基于 sweagent/agent/history_processors.py、sweagent/types.py 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*✅ Verified: 基于 SWE-agent/sweagent/agent/agents.py、SWE-agent/sweagent/agent/history_processors.py 等源码分析*
+*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-02-25*

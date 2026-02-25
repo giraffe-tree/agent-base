@@ -131,7 +131,7 @@ sequenceDiagram
 | 步骤 | 交互内容 | 设计意图 |
 |-----|---------|---------|
 | 1 | 主代理通过 Task 工具发起调用 | 将子代理调用统一为工具调用语义 |
-| 4 | 创建独立 Context 文件 | ✅ 实现上下文隔离，子代理无法访问主上下文 |
+| 4 | 创建独立 Context 文件 | 实现上下文隔离，子代理无法访问主上下文 |
 | 6-7 | 通过 SubagentEvent 透传事件 | 保持用户体验一致性，子代理执行可见 |
 | 11-12 | 仅返回最终文本结果 | 子代理的中间步骤不污染主上下文 |
 
@@ -295,7 +295,7 @@ async def __call__(self, params: Params) -> ToolReturnValue:
     subagent = Agent(
         name=params.name,
         system_prompt=params.system_prompt,
-        toolset=self._toolset,  # ✅ 共享父代理的工具集
+        toolset=self._toolset,  # 共享父代理的工具集
         runtime=self._runtime.copy_for_dynamic_subagent(),
     )
     self._runtime.labor_market.add_dynamic_subagent(params.name, subagent)
@@ -520,12 +520,57 @@ Task.__call__()                    [kimi-cli/src/kimi_cli/tools/multiagent/task.
 
 ### 6.3 与其他项目的对比
 
-| 项目 | 核心差异 | 适用场景 |
-|-----|---------|---------|
-| **Kimi CLI** | Task 工具 + 独立 Context | 需要上下文隔离的复杂任务分解 |
-| **OpenCode** | 并发子代理 + 共享内存 | 需要真正并行执行的高性能场景 |
-| **Codex** | 无内置子代理，依赖外部工具 | 简单任务，不需要任务分解 |
-| **Gemini CLI** | 无子代理机制 | 单代理模式，依赖上下文窗口 |
+```mermaid
+flowchart LR
+    subgraph "上下文隔离机制"
+        K1[Kimi CLI<br/>独立 Context 文件]:::kimi
+        O1[OpenCode<br/>隔离进程 + 共享内存]:::opencode
+        C1[Codex<br/>无内置子代理]:::codex
+        G1[Gemini CLI<br/>无子代理机制]:::gemini
+        S1[SWE-agent<br/>无子代理机制]:::swe
+    end
+
+    subgraph "并行执行策略"
+        K2[顺序执行<br/>单次响应多 Task]:::kimi
+        O2[并发子代理<br/>独立进程并行]:::opencode
+        C2[并行任务队列<br/>异步执行]:::codex
+        G2[单代理模式]:::gemini
+        S2[单代理模式]:::swe
+    end
+
+    subgraph "子代理创建方式"
+        K3[固定 + 动态<br/>Task 工具创建]:::kimi
+        O3[动态创建<br/>配置驱动]:::opencode
+        C3[外部工具调用]:::codex
+        G3[无]:::gemini
+        S3[无]:::swe
+    end
+
+    classDef kimi fill:#e1f5e1,stroke:#333
+    classDef opencode fill:#fff2cc,stroke:#333
+    classDef codex fill:#dae8fc,stroke:#333
+    classDef gemini fill:#f5f5f5,stroke:#333
+    classDef swe fill:#ffe6cc,stroke:#333
+```
+
+| 项目 | 核心差异 | 上下文隔离机制 | 并行执行策略 | 适用场景 |
+|-----|---------|---------------|-------------|---------|
+| **Kimi CLI** | Task 工具 + 独立 Context | 独立 Context 文件，完全隔离 | 同步顺序执行，单次响应可包含多个 Task 调用 | 需要上下文隔离的复杂任务分解，子代理执行过程可见 |
+| **OpenCode** | 并发子代理 + 共享内存 | 隔离进程但共享内存空间 | 真正的并发执行，多个子代理同时运行 | 需要真正并行执行的高性能场景，如同时分析多个文件 |
+| **Codex** | 无内置子代理机制 | 依赖外部工具实现 | 有并行任务队列，但非子代理机制 | 简单任务，不需要任务分解，依赖外部工具扩展 |
+| **Gemini CLI** | 无子代理机制 | 单代理上下文 | 单代理顺序执行 | 单代理模式，依赖大上下文窗口处理复杂任务 |
+| **SWE-agent** | 无子代理机制 | 单代理上下文 | 单代理顺序执行，有错误重试机制 | 专注软件工程任务，通过工具调用而非子代理实现功能分解 |
+
+**详细对比分析**：
+
+| 对比维度 | Kimi CLI | OpenCode | Codex | Gemini CLI | SWE-agent |
+|---------|----------|----------|-------|-----------|-----------|
+| **子代理实现方式** | Task 工具调用 | 内置并发子代理 | 无内置机制 | 无 | 无 |
+| **上下文隔离级别** | 文件级完全隔离 | 进程级隔离 | - | - | - |
+| **并行能力** | 伪并行（LLM 单次生成多个 Task） | 真并行（多进程） | 任务级并行 | 无 | 无 |
+| **动态创建** | 支持（CreateSubagent 工具） | 支持 | - | - | - |
+| **生命周期管理** | LaborMarket 统一管理 | 进程管理 | - | - | - |
+| **事件可见性** | SubagentEvent 透传 | 独立输出流 | - | - | - |
 
 ---
 
@@ -582,5 +627,5 @@ MAX_CONTINUE_ATTEMPTS = 1  # 最大续写尝试次数
 
 ---
 
-*✅ Verified: 基于 kimi-cli/src/kimi_cli/soul/agent.py、kimi-cli/src/kimi_cli/tools/multiagent/task.py 等源码分析*
-*基于版本：kimi-cli 2026-02-08 | 最后更新：2026-02-24*
+*基于 kimi-cli/src/kimi_cli/soul/agent.py、kimi-cli/src/kimi_cli/tools/multiagent/task.py 等源码分析*
+*基于版本：kimi-cli 2026-02-08 | 最后更新：2026-02-25*

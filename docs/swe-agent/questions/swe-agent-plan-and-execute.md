@@ -254,12 +254,12 @@ def run(self, env, problem_statement, output_dir) -> AgentRunResult:
 ### 5.3 关键调用链
 
 ```text
-Agent.run()                          [sweagent/agent/agents.py:150]
-  -> step()                          [sweagent/agent/agents.py:200]
-    -> forward_with_handling()       [sweagent/agent/agents.py:1062]
+Agent.run()                          [SWE-agent/sweagent/agent/agents.py:390]
+  -> step()                          [SWE-agent/sweagent/agent/agents.py:790]
+    -> forward_with_handling()       [SWE-agent/sweagent/agent/agents.py:1062]
       - 模型调用
-    -> parse_response()              [sweagent/agent/agents.py:250]
-      -> ThoughtActionParser()       [sweagent/tools/parsing.py:80]
+    -> parse_response()              [SWE-agent/sweagent/agent/agents.py:790]
+      -> ThoughtActionParser()       [SWE-agent/sweagent/tools/parsing.py]
     -> execute_action()              [sweagent/agent/agents.py:300]
       - 执行工具
 ```
@@ -310,8 +310,8 @@ Agent.run()                          [sweagent/agent/agents.py:150]
 | 终止原因 | 触发条件 | 代码位置 |
 |---------|---------|---------|
 | 任务完成 | step_output.done = True | `sweagent/agent/agents.py` |
-| 重试耗尽 | n_format_fails >= max_requeries | `sweagent/agent/agents.py:1195` |
-| 上下文溢出 | ContextWindowExceededError | `sweagent/agent/agents.py:1176` |
+| 重试耗尽 | n_format_fails >= max_requeries | `SWE-agent/sweagent/agent/agents.py:1211` |
+| 上下文溢出 | ContextWindowExceededError | `SWE-agent/sweagent/agent/agents.py:1175` |
 
 ### 7.2 错误恢复策略
 
@@ -326,11 +326,10 @@ Agent.run()                          [sweagent/agent/agents.py:150]
 
 | 功能 | 文件 | 行号 | 说明 |
 |-----|------|------|------|
-| Agent Loop | `sweagent/agent/agents.py` | 150 | run() 主循环 |
-| Step 实现 | `sweagent/agent/agents.py` | 200 | step() thought-action |
-| 模板配置 | `sweagent/agent/agents.py` | TemplateConfig | 模板定义 |
-| 响应解析 | `sweagent/tools/parsing.py` | 80 | ThoughtActionParser |
-| 默认配置 | `config/default.yaml` | - | 程序性指导模板 |
+| Agent Loop | `SWE-agent/sweagent/agent/agents.py` | 390 | run() 主循环 |
+| Step 实现 | `SWE-agent/sweagent/agent/agents.py` | 790 | step() thought-action |
+| 模板配置 | `SWE-agent/sweagent/agent/agents.py` | 60 | TemplateConfig |
+| 响应解析 | `SWE-agent/sweagent/tools/parsing.py` | - | ThoughtActionParser |
 
 ---
 
@@ -343,4 +342,4 @@ Agent.run()                          [sweagent/agent/agents.py:150]
 ---
 
 *✅ Verified: 基于 sweagent/agent/agents.py、sweagent/tools/parsing.py 等源码分析*
-*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-02-24*
+*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-02-25*

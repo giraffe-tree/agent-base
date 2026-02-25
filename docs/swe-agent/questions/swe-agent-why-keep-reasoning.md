@@ -293,7 +293,7 @@ Agent.step()                         [sweagent/agent/agents.py:200]
       -> 保存 thinking_blocks        [sweagent/types.py:HistoryItem]
     -> FormatError 捕获              [sweagent/agent/agents.py:1153]
       -> 利用原推理构造重试历史
-  -> ScoreRetryLoop.get_best()       [sweagent/agent/reviewer.py:45]
+  -> ScoreRetryLoop.get_best()       [sweagent/agent/reviewer.py:559]
     -> 比较各轮次 thinking_blocks
 ```
 
@@ -327,11 +327,46 @@ Agent.step()                         [sweagent/agent/agents.py:200]
 
 ### 6.3 与其他项目的对比
 
-| 项目 | 核心差异 | 适用场景 |
-|-----|---------|---------|
-| SWE-agent | 完整保留 thinking_blocks | 代码修复，需要错误恢复 |
-| Kimi CLI | Checkpoint 保存完整状态 | 交互式对话，支持回滚 |
-| Gemini CLI | 分层记忆管理 | 复杂任务，多层次上下文 |
+```mermaid
+gitGraph
+    commit id: "基础推理支持"
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "thinking_blocks 完整保留"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "Checkpoint 保存推理"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "分层记忆管理"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "AgentReasoning 事件流"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "MessagePart 推理组件"
+```
+
+| 项目 | 核心差异 | 推理内容使用方式 | 适用场景 |
+|-----|---------|-----------------|---------|
+| SWE-agent | 完整保留 thinking_blocks | 错误恢复 + 重试选择 | 代码修复，需要错误恢复 |
+| Kimi CLI | Checkpoint 保存完整状态 | 对话回滚时恢复推理 | 交互式对话，支持回滚 |
+| Gemini CLI | 分层记忆管理 | 长期任务上下文保持 | 复杂任务，多层次上下文 |
+| Codex | AgentReasoning 事件流 | 实时展示 + 可配置摘要 | 企业级应用，可观测性 |
+| OpenCode | MessagePart 组件化 | UI 展示 + 调试分析 | 可视化交互，开发调试 |
+
+#### 各项目推理内容处理对比
+
+| 维度 | SWE-agent | Kimi CLI | Gemini CLI | Codex | OpenCode |
+|-----|-----------|----------|------------|-------|----------|
+| **存储位置** | HistoryItem | Checkpoint 文件 | 分层内存 | 事件日志 | 消息组件 |
+| **保留策略** | 完整保留 | 状态快照 | 智能压缩 | 可配置 | 结构化存储 |
+| **主要用途** | 错误恢复 | 状态回滚 | 上下文保持 | 可观测性 | UI 展示 |
+| **过滤机制** | History Processors | D-Mail 选择 | 分层淘汰 | 摘要配置 | 组件渲染 |
 
 ---
 
@@ -363,7 +398,7 @@ class LastNObservations:
 |-----|------|------|------|
 | 数据结构 | `sweagent/types.py` | - | HistoryItem.thinking_blocks |
 | 错误恢复 | `sweagent/agent/agents.py` | 1062 | forward_with_handling |
-| 重试选择 | `sweagent/agent/reviewer.py` | 45 | ScoreRetryLoop.get_best |
+| 重试选择 | `sweagent/agent/reviewer.py` | 559 | ScoreRetryLoop 类 |
 | 历史处理 | `sweagent/agent/history_processors.py` | - | 智能过滤推理内容 |
 
 ---
@@ -372,9 +407,10 @@ class LastNObservations:
 
 - 前置知识：`docs/swe-agent/04-swe-agent-agent-loop.md`（Agent 循环中的历史管理）
 - 相关机制：`docs/swe-agent/questions/swe-agent-tool-error-handling.md`（错误处理详细分析）
-- 深度分析：`docs/swe-agent/questions/swe-agent-context-compaction.md`（上下文压缩与推理内容管理）
+- 对比分析：`docs/kimi-cli/questions/kimi-cli-checkpoint-implementation.md`（Kimi CLI 的推理内容保存）
+- 协议参考：`docs/codex/06-codex-mcp-integration.md`（Codex 的 AgentReasoning 事件）
 
 ---
 
 *✅ Verified: 基于 sweagent/types.py、sweagent/agent/agents.py:1062 等源码分析*
-*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-02-24*
+*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-02-25*

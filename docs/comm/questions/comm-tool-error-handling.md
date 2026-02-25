@@ -1,165 +1,177 @@
 # 5 大 AI Coding Agent 工具调用错误处理机制对比分析
 
-**结论先行**: 5 大 AI Coding Agent 在工具调用错误处理方面呈现出**"分层防御"**的共性架构，但在**恢复策略**上差异显著：Gemini CLI 采用 **Final Warning Turn 优雅恢复**，Kimi CLI 依赖 **Checkpoint + D-Mail 时间旅行**，SWE-agent 使用 **Autosubmit 自动提交**，OpenCode 实现 **Compaction + Doom Loop 检测**，Codex 则专注 **降级重试 + 三档审批**的安全模型。
+> **文档说明**: 本文为跨项目深度对比分析文档，对比分析 Codex、Gemini CLI、Kimi CLI、OpenCode、SWE-agent 五个项目的工具调用错误处理机制。
 
 ---
 
-## 1. 工具调用错误处理总览
+## TL;DR（结论先行）
 
+一句话定义：工具调用错误处理是 AI Coding Agent 在执行外部工具（文件操作、命令执行、网络请求等）时，对失败场景进行检测、分类、恢复和反馈的完整机制，确保 Agent 能够从错误中恢复并继续任务或优雅终止。
+
+5 大 AI Coding Agent 在工具调用错误处理方面的核心取舍对比：
+- **Gemini CLI** 采用 **Final Warning Turn 优雅恢复**（对比 Kimi CLI 的 Checkpoint 回滚、SWE-agent 的 Autosubmit）
+- **Kimi CLI** 依赖 **Checkpoint + D-Mail 时间旅行**（对比 OpenCode 的 Compaction、Codex 的降级重试）
+- **SWE-agent** 使用 **Autosubmit 自动提交**（对比其他项目的手动/自动混合恢复）
+- **OpenCode** 实现 **Compaction + Doom Loop 检测**（对比 Gemini CLI 的 Final Warning Turn）
+- **Codex** 专注 **降级重试 + 三档审批** 安全模型（对比 SWE-agent 的纯自动化）
+
+---
+
+## 1. 为什么需要这个机制？（解决什么问题）
+
+### 1.1 问题场景
+
+没有错误处理机制的场景：
 ```
+用户问: "帮我修复这个 bug"
+  → LLM: "先查看文件" → 读取文件 → 文件不存在 → 崩溃/卡住
+  → 对话终止，用户困惑
+```
+
+有错误处理机制的场景：
+```
+用户问: "帮我修复这个 bug"
+  → LLM: "先查看文件" → 读取文件 → 文件不存在
+  → 错误检测: FileNotFound → 错误分类: 可恢复
+  → 恢复策略: 返回错误给 LLM
+  → LLM: "文件不存在，让我创建它" → 创建文件 → 成功
+```
+
+### 1.2 核心挑战
+
+| 挑战 | 不解决的后果 |
+|-----|-------------|
+| 工具执行失败无法感知 | Agent 陷入无限等待或假死状态 |
+| 错误类型无法区分 | 对所有错误采用相同策略，导致过度重试或过早放弃 |
+| 恢复策略缺失 | 单次失败导致整个任务终止，用户体验差 |
+| 错误信息无法被 LLM 理解 | LLM 无法从错误中学习，重复犯同样错误 |
+| 资源限制无边界 | Token 溢出、超时、配额耗尽导致系统崩溃 |
+
+---
+
+## 2. 整体架构（ASCII 图）
+
+### 2.1 在系统中的位置
+
+```text
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                        工具调用错误处理通用架构                                        │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐          │
-│  │  错误检测    │───▶│  错误分类    │───▶│  恢复策略    │───▶│  结果反馈    │          │
-│  │  Detection  │    │Classification│    │  Recovery   │    │   Feedback   │          │
-│  └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘          │
-│         │                  │                  │                  │                 │
-│         ▼                  ▼                  ▼                  ▼                 │
-│   ┌──────────┐      ┌──────────┐      ┌──────────┐      ┌──────────┐              │
-│   │参数校验  │      │可重试    │      │指数退避  │      │结构化    │              │
-│   │超时检测  │      │vs 致命   │      │自动恢复  │      │错误返回  │              │
-│   │沙箱拒绝  │      │          │      │用户介入  │      │日志记录  │              │
-│   └──────────┘      └──────────┘      └──────────┘      └──────────┘              │
-│                                                                                     │
-└─────────────────────────────────────────────────────────────────────────────────────┘
+│ Agent Loop / Session Runtime                                                         │
+│ 各项目主循环入口                                                                     │
+└─────────────────────────────────┬───────────────────────────────────────────────────┘
+                                  │ 工具调用请求
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ ▓▓▓ 工具调用错误处理机制 ▓▓▓                                                          │
+│                                                                                      │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐           │
+│  │  错误检测    │───▶│  错误分类    │───▶│  恢复策略    │───▶│  结果反馈    │           │
+│  │  Detection  │    │Classification│    │  Recovery   │    │   Feedback   │           │
+│  └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘           │
+│         │                  │                  │                  │                  │
+│         ▼                  ▼                  ▼                  ▼                  │
+│   ┌──────────┐      ┌──────────┐      ┌──────────┐      ┌──────────┐               │
+│   │参数校验  │      │可重试    │      │指数退避  │      │结构化    │               │
+│   │超时检测  │      │vs 致命   │      │自动恢复  │      │错误返回  │               │
+│   │沙箱拒绝  │      │          │      │用户介入  │      │日志记录  │               │
+│   └──────────┘      └──────────┘      └──────────┘      └──────────┘               │
+│                                                                                      │
+└─────────────────────────────────┬───────────────────────────────────────────────────┘
+                                  │ 恢复后重新调用或终止
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ LLM API              │ Tool System          │ Context Management                    │
+│ 错误信息注入上下文    │ 工具执行重试         │ Token 管理/压缩                       │
+└──────────────────────┴──────────────────────┴───────────────────────────────────────┘
 ```
 
----
+### 2.2 核心组件职责
 
-## 2. 核心维度对比（5个）
+| 组件 | 职责 | 代码位置（按项目） |
+|-----|------|-------------------|
+| **Codex** `CodexErr` | 主错误枚举，统一错误类型定义 | `codex-rs/core/src/error.rs:1-100` |
+| **Codex** `is_retryable()` | 可重试错误判定逻辑 | `codex-rs/core/src/error.rs:200-250` |
+| **Gemini CLI** `ToolErrorType` | 15+ 错误类型枚举定义 | `packages/core/src/tools/tool-error.ts:1-80` |
+| **Gemini CLI** `classifyFailureKind()` | 错误分类为 transient/terminal | `packages/core/src/availability/errorClassification.ts:50-100` |
+| **Kimi CLI** `ToolError` | 四层错误继承体系基类 | `packages/kosong/src/kosong/tooling/error.py:1-50` |
+| **Kimi CLI** `ToolReturnValue` | 工具返回结果统一包装 | `packages/kosong/src/kosong/tooling/__init__.py:100-150` |
+| **OpenCode** `retryable()` | 错误可重试性判定 | `packages/opencode/src/session/retry.ts:50-100` |
+| **OpenCode** `DoomLoopDetector` | 重复失败模式检测 | `packages/opencode/src/session/agent.ts:200-250` |
+| **SWE-agent** `FormatError` | 格式解析错误基类 | `sweagent/exceptions.py:1-50` |
+| **SWE-agent** `forward_with_handling()` | 模板化错误处理入口 | `sweagent/agent/agents.py:150-250` |
 
-### 2.1 工具调用失败重试机制
+### 2.3 核心组件交互关系
 
-| 项目 | 重试库/机制 | 最大重试次数 | 退避策略 | 特殊特性 |
-|------|------------|-------------|---------|---------|
-| **Codex** | 自定义实现 | stream: 5, request: 4 | 指数退避 + 抖动 | WebSocket失败降级到HTTPS |
-| **Gemini CLI** | 自定义retry.ts | 3次 | 指数退避 + 抖动 | 429特殊处理，模型降级 |
-| **Kimi CLI** | tenacity库 | 3次 (max_retries_per_step) | wait_exponential_jitter | 仅重试网络/API错误 |
-| **OpenCode** | 自定义retry.ts | 无明确上限 | 指数退避 + 响应头支持 | resetTimeoutOnProgress |
-| **SWE-agent** | 自定义实现 | 3次 (max_requeries) | 指数退避 | 错误分类处理，autosubmit |
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Agent Loop
+    participant T as Tool Executor
+    participant E as Error Handler
+    participant C as Error Classifier
+    participant R as Recovery Strategy
+    participant L as LLM Context
 
-**关键差异分析**:
-- **Codex**: 区分 stream 和 request 两种重试场景，`is_retryable()` 方法显式枚举可重试错误类型
-- **Gemini CLI**: 智能识别 429 配额错误，区分 TerminalQuotaError vs RetryableQuotaError
-- **OpenCode**: 支持 `Retry-After` 响应头三种格式（毫秒/秒/HTTP日期），`resetTimeoutOnProgress` 创新机制
-- **Kimi CLI**: 依赖 Python tenacity 库，仅重试网络/API层错误，业务错误不重试
-- **SWE-agent**: `max_requeries=3` 限制格式错误重试，`forward_with_handling()` 模板化错误反馈
+    A->>T: 1. 调用工具
+    activate T
 
-### 2.2 最大轮次/迭代限制
+    alt 工具执行成功
+        T-->>A: 2a. 返回结果
+    else 工具执行失败
+        T->>E: 2b. 抛出异常
+        deactivate T
+        activate E
 
-| 项目 | 配置位置 | 默认值 | 实现方式 | 达到限制后行为 |
-|------|---------|-------|---------|---------------|
-| **Codex** | model_provider_info.rs | stream: 5, request: 4 | 重试计数器 | 返回RetryLimit错误 |
-| **Gemini CLI** | client.ts/types.ts | 全局: 100, Agent: 15 | checkTermination() | 执行Final Warning Turn恢复 |
-| **Kimi CLI** | config.py | 100 (max_steps_per_turn) | while循环检查 | 抛出MaxStepsReached异常 |
-| **OpenCode** | agent.ts/prompt.ts | Infinity (未设置时) | steps参数检查 | 注入MAX_STEPS提示，禁用工具 |
-| **SWE-agent** | models.py | 0 (不限制) | per_instance_call_limit | 触发autosubmit |
+        E->>C: 3. 请求错误分类
+        activate C
+        C->>C: 3.1 分析错误类型
+        C-->>E: 3.2 返回分类结果 (transient/terminal)
+        deactivate C
 
-### 2.3 工具调用超时处理
+        E->>R: 4. 执行恢复策略
+        activate R
+        R->>R: 4.1 选择恢复方式 (重试/回滚/提交)
 
-| 项目 | 默认超时 | 配置方式 | 特殊机制 |
-|------|---------|---------|---------|
-| **Codex** | 10秒 (exec) | ExecExpiration枚举 | CancellationToken支持 |
-| **Gemini CLI** | 5分钟 (agent) | DeadlineTimer类 | 可暂停/恢复，动态扩展 |
-| **Kimi CLI** | 60秒 (MCP) | mcp.client.tool_call_timeout_ms | MCP工具单独配置 |
-| **OpenCode** | 30秒 (MCP), 2分钟 (bash) | timeout参数 | resetTimeoutOnProgress |
-| **SWE-agent** | 30秒 (执行), 1800秒 (总) | ToolConfig | 连续超时计数，3次后退出 |
+        alt 可重试错误
+            R->>R: 4.2a 指数退避重试
+            R-->>T: 4.3a 重新调用工具
+        else 不可恢复错误
+            R->>L: 4.2b 注入错误信息
+            R-->>A: 4.3b 终止或转交 LLM
+        end
+        deactivate R
 
-### 2.4 Token溢出导致工具调用受限
-
-| 项目 | 检测方式 | 处理策略 | 对工具调用的影响 |
-|------|---------|---------|-----------------|
-| **Codex** | estimate_token_count | TruncationPolicy截断 | 工具结果可能被截断 |
-| **Gemini CLI** | ContextWindowWillOverflow事件 | chatCompressionService压缩 | 触发/compaction工具 |
-| **Kimi CLI** | token_count检查 | SimpleCompaction压缩 | 创建checkpoint，继续工具调用 |
-| **OpenCode** | isOverflow检测 | Prune + Compaction | 工具调用上下文被压缩 |
-| **SWE-agent** | max_observation_length | 输出截断 | 工具返回结果被截断 |
-
-### 2.5 工具调用权限/确认介入
-
-| 项目 | 介入触发条件 | 介入方式 | 特殊机制 |
-|------|------------|---------|---------|
-| **Codex** | 危险工具调用、沙箱拒绝 | 实时通知 | AskForApproval策略(Skip/NeedsApproval/Forbidden) |
-| **Gemini CLI** | 危险工具Kind、达到限制 | 确认循环 | PolicyDecision.ASK_USER |
-| **Kimi CLI** | 危险命令列表 | Approval.request | 审批管道 |
-| **OpenCode** | 权限模式匹配 | PermissionNext.ask | 区分Rejected/Corrected/Denied |
-| **SWE-agent** | 无（纯自动化） | - | 依赖Docker沙箱 |
-
----
-
-## 3. 扩展维度对比（6个）
-
-### 3.1 工具参数验证错误
-
-| 项目 | 错误类型 | 验证层级 | 恢复策略 |
-|------|---------|---------|---------|
-| **Codex** | JSON解析错误、Schema校验 | tool输入层 | 返回错误给LLM自纠正 |
-| **Gemini CLI** | INVALID_TOOL_PARAMS | ToolWrapper.execute | LLM重试，参数调整 |
-| **Kimi CLI** | ToolParseError, ToolValidateError | JSON解析+Schema校验 | 自动包装为ToolError |
-| **OpenCode** | Zod Schema校验 | 工具定义层 | 返回validation error |
-| **SWE-agent** | FormatError, FunctionCallingFormatError | Agent解析层 | 模板化错误反馈重试 |
-
-### 3.2 工具未找到错误
-
-| 项目 | 错误类型 | 检测位置 | 处理方式 |
-|------|---------|---------|---------|
-| **Codex** | Tool not available | ToolRegistry查询 | 返回Unavailable错误 |
-| **Gemini CLI** | TOOL_NOT_REGISTERED | ToolWrapper初始化 | Fatal error，LLM调整 |
-| **Kimi CLI** | ToolNotFoundError | 工具路由层 | ToolError包装 |
-| **OpenCode** | MCP工具获取失败 | MCP客户端 | 返回error给模型 |
-| **SWE-agent** | UnknownCommand/UnknownAction | Command解析 | 重试+autosubmit |
-
-### 3.3 配额与速率限制
-
-| 项目 | 错误类型 | 检测方式 | 重试策略 |
-|------|---------|---------|---------|
-| **Codex** | QuotaExceeded, ServerOverloaded | HTTP状态码+错误码 | is_retryable()判断 |
-| **Gemini CLI** | TerminalQuotaError, RetryableQuotaError | googleQuotaErrors.ts | 区分终端/可重试配额 |
-| **Kimi CLI** | rate_limit错误 | API响应 | 指数退避重试 |
-| **OpenCode** | Rate limit, FreeUsageLimit | 响应头+模式匹配 | 读取Retry-After头 |
-| **SWE-agent** | CostLimitExceeded | 成本追踪器 | 触发autosubmit退出 |
-
-### 3.4 格式与解析错误
-
-| 项目 | 错误类型 | 触发场景 | 处理机制 |
-|------|---------|---------|---------|
-| **Codex** | JSON解析失败 | 工具参数解析 | 返回CodexErr::InvalidRequest |
-| **Gemini CLI** | 内部处理 | 工具响应解析 | 错误包装为ToolError |
-| **Kimi CLI** | ToolParseError | JSON解析失败 | 四层错误体系 |
-| **OpenCode** | Doom loop检测 | 重复工具失败 | 检测最后3次调用模式 |
-| **SWE-agent** | FormatError, FunctionCallingFormatError | 响应解析失败 | 模板化重试(max_requeries=3) |
-
-### 3.5 文件系统相关错误
-
-| 项目 | 错误类型 | 分类策略 | 恢复方式 |
-|------|---------|---------|---------|
-| **Codex** | SandboxErr::Denied | Landlock沙箱 | 网络策略决策 |
-| **Gemini CLI** | FILE_NOT_FOUND, PERMISSION_DENIED, PATH_NOT_IN_WORKSPACE | ToolErrorType枚举 | LLM自纠正 |
-| **Kimi CLI** | 底层Python异常 | 工具执行层 | 转换为ToolRuntimeError |
-| **OpenCode** | 文件工具错误 | fs工具实现 | 返回error结果 |
-| **SWE-agent** | 运行时异常 | subprocess执行 | forward_with_handling处理 |
-
-### 3.6 沙箱与执行错误
-
-| 项目 | 错误类型 | 沙箱机制 | 错误恢复 |
-|------|---------|---------|---------|
-| **Codex** | SandboxErr(Denied, Timeout, Signal, LandlockRestrict) | Landlock+Seccomp | 三档审批策略 |
-| **Gemini CLI** | EXECUTION_FAILED, SHELL_EXECUTE_ERROR | 受限执行环境 | 错误状态传递 |
-| **Kimi CLI** | ToolRuntimeError | 受限shell | checkpoint回滚 |
-| **OpenCode** | bash工具exit code | 无原生沙箱 | 错误返回给模型 |
-| **SWE-agent** | CommandTimeoutError, SwerexException | Docker沙箱 | autosubmit/重试 |
-
----
-
-## 4. 错误分类体系对比
-
+        E-->>A: 5. 返回处理结果
+        deactivate E
+    end
 ```
+
+**关键交互说明**：
+
+| 步骤 | 交互内容 | 设计意图 |
+|-----|---------|---------|
+| 1 | Agent Loop 向工具执行器发起调用 | 解耦工具执行与错误处理逻辑 |
+| 2b | 工具执行失败时统一抛出异常 | 确保所有错误都被捕获处理 |
+| 3 | 错误分类器判定错误类型 | 区分可恢复(transient)与不可恢复(terminal)错误 |
+| 4 | 恢复策略选择适当的处理方式 | 根据错误类型和项目策略进行恢复 |
+| 4.2b | 向 LLM 上下文注入错误信息 | 让 LLM 能够从错误中学习并调整策略 |
+
+---
+
+## 3. 核心组件详细分析
+
+### 3.1 错误检测层内部结构
+
+#### 职责定位
+
+错误检测层负责捕获工具执行过程中的所有异常，包括参数验证失败、执行超时、沙箱拒绝、网络错误等，是错误处理流程的第一道防线。
+
+#### 错误分类体系图
+
+```text
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
 │                           错误分类体系层级对比                                         │
 ├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
+│                                                                                      │
 │  Codex (Rust)                      Gemini CLI (TypeScript)                          │
 │  ┌──────────────────┐              ┌──────────────────────┐                         │
 │  │   CodexErr       │              │   Error (base)       │                         │
@@ -171,7 +183,7 @@
 │  │ • QuotaExceeded  │              │ • PATH_NOT_IN_WORKSPACE│                       │
 │  │ • ...            │              │ • FILE_NOT_FOUND     │                         │
 │  └──────────────────┘              └──────────────────────┘                         │
-│                                                                                     │
+│                                                                                      │
 │  Kimi CLI (Python)                 SWE-agent (Python)                               │
 │  ┌──────────────────┐              ┌──────────────────────┐                         │
 │  │ ToolReturnValue  │              │ Exception (base)     │                         │
@@ -182,7 +194,7 @@
 │  │    ├─ ToolValidate│            │ • CostLimitExceeded  │                         │
 │  │    └─ ToolRuntime│             │ • CommandTimeout     │                         │
 │  └──────────────────┘              └──────────────────────┘                         │
-│                                                                                     │
+│                                                                                      │
 │  OpenCode (TypeScript)                                                              │
 │  ┌──────────────────────────────────────┐                                          │
 │  │ Provider-specific error parsing      │                                          │
@@ -190,33 +202,67 @@
 │  │ • ContextOverflowError               │                                          │
 │  │ • Doom loop detection (behavioral)   │                                          │
 │  └──────────────────────────────────────┘                                          │
-│                                                                                     │
+│                                                                                      │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
----
+#### 关键算法逻辑
 
-## 5. 可重试错误判定策略对比
+```mermaid
+flowchart TD
+    A[工具调用开始] --> B{参数验证}
+    B -->|失败| C[ToolParseError]
+    B -->|通过| D{执行工具}
 
-| 项目 | 判定方式 | 可重试错误示例 | 不可重试错误示例 |
-|------|---------|---------------|-----------------|
-| **Codex** | `is_retryable()` 显式枚举 | Stream, Timeout, ConnectionFailed | QuotaExceeded, Sandbox, ContextWindowExceeded |
-| **Gemini CLI** | `classifyFailureKind()` | transient类别错误 | terminal类别错误 |
-| **OpenCode** | `retryable()` 函数 | APIError.data.isRetryable=true | ContextOverflowError |
-| **SWE-agent** | 异常类型 + `max_requeries` | FormatError(3次内) | CostLimitExceeded |
-| **Kimi CLI** | 错误类型判断 | 网络/API错误 | ToolParseError, ToolValidateError |
+    D -->|成功| E[返回结果]
+    D -->|失败| F{错误类型判断}
 
----
+    F -->|网络错误| G[ConnectionFailed]
+    F -->|超时| H[TimeoutError]
+    F -->|沙箱拒绝| I[SandboxErr]
+    F -->|配额耗尽| J[QuotaExceeded]
+    F -->|其他| K[ToolRuntimeError]
 
-## 6. 关键设计差异总结
+    C --> L[错误包装]
+    G --> L
+    H --> L
+    I --> L
+    J --> L
+    K --> L
 
-### 6.1 工具调用恢复策略对比
+    L --> M[进入恢复策略]
+    E --> N[正常流程继续]
 
+    style E fill:#90EE90
+    style C fill:#FFB6C1
+    style G fill:#FFB6C1
+    style H fill:#FFB6C1
+    style I fill:#FFB6C1
+    style J fill:#FFB6C1
+    style K fill:#FFB6C1
 ```
+
+**算法要点**：
+
+1. **分层验证**：参数验证在执行前进行，避免无效调用
+2. **错误统一包装**：所有错误最终转换为项目特定的错误类型
+3. **分类前置**：在包装阶段即确定错误类别，便于后续恢复策略选择
+
+---
+
+### 3.2 恢复策略层内部结构
+
+#### 职责定位
+
+恢复策略层根据错误类型和项目配置，选择适当的恢复方式，包括重试、回滚、提交、压缩上下文等。
+
+#### 恢复策略对比图
+
+```text
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
 │                           恢复策略差异                                               │
 ├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
+│                                                                                      │
 │   Gemini CLI              Kimi CLI              SWE-agent        OpenCode           │
 │   ┌─────────────┐         ┌─────────────┐       ┌─────────────┐  ┌─────────────┐    │
 │   │ 达到限制    │         │ 达到限制    │       │ 达到限制    │  │ 达到限制    │    │
@@ -229,35 +275,557 @@
 │   └──────┬──────┘         └──────┬──────┘       └──────┬──────┘  └──────┬──────┘    │
 │          ▼                       ▼                    ▼             ▼               │
 │   继续对话上下文          回滚到保存点           结束并提交      继续精简上下文        │
-│                                                                                     │
+│                                                                                      │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.2 沙箱安全模型对比
+#### 内部数据流
 
-| 项目 | 沙箱机制 | 错误处理方式 | 用户介入级别 |
-|------|---------|-------------|-------------|
-| **Codex** | Landlock + Seccomp | 三档审批(Skip/NeedsApproval/Forbidden) | 实时通知 |
-| **Gemini CLI** | 受限执行环境 | POLICY_VIOLATION错误类型 | 确认循环 |
-| **Kimi CLI** | 受限shell | Checkpoint联动回滚 | 审批管道 |
-| **OpenCode** | 无原生沙箱 | 依赖外部权限系统 | 权限模式匹配 |
-| **SWE-agent** | Docker沙箱 | Blocklist过滤 | 无介入（纯自动化） |
-
-### 6.3 超时机制创新对比
-
-| 项目 | 核心创新 | 实现文件 | 适用场景 |
-|------|---------|---------|---------|
-| **OpenCode** | `resetTimeoutOnProgress` | `session/retry.ts` | 长任务执行 |
-| **Gemini CLI** | `DeadlineTimer`可暂停 | `utils/deadlineTimer.ts` | 用户交互暂停 |
-| **SWE-agent** | 连续超时计数器(3次exit) | `agent/agents.py` | 防止无限挂起 |
-| **Kimi CLI** | MCP单独配置 + Checkpoint回滚 | `tooling/` | 工具级超时 |
-| **Codex** | `ExecExpiration`统一抽象 | `exec/mod.rs` | 命令执行超时 |
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  输入层 - 错误分类结果                                        │
+│  ├── 错误类型 ──► 可重试性判定 ──► 恢复策略选择               │
+│  └── 上下文状态 ──► 资源检查 ──► 策略可行性验证               │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  处理层 - 恢复策略执行                                        │
+│  ├── 重试处理器: 指数退避 + 抖动 + 最大次数检查               │
+│  │   └── 计算退避时间 ──► 等待 ──► 重新调用                   │
+│  ├── 回滚处理器: Checkpoint 恢复 + 上下文重建                 │
+│  │   └── 加载检查点 ──► 恢复状态 ──► 通知 LLM                 │
+│  ├── 提交处理器: Autosubmit + Patch 生成                      │
+│  │   └── 收集修改 ──► 生成 patch ──► 提交并退出               │
+│  └── 压缩处理器: Context Compaction + Token 释放              │
+│      └── 选择压缩策略 ──► 执行压缩 ──► 更新上下文             │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  输出层 - 恢复结果                                            │
+│  ├── 成功: 继续正常流程 或 重新调用工具                       │
+│  ├── 失败: 注入错误信息到 LLM 上下文                          │
+│  └── 终止: 优雅退出并返回当前状态                             │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## 7. 选型建议矩阵
+### 3.3 组件间协作时序
 
-### 7.1 按场景选择参考
+展示五个项目在工具调用错误时的完整处理流程：
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant A as Agent Loop
+    participant T as Tool System
+    participant E as Error Handler
+    participant L as LLM
+
+    U->>A: 提交任务
+    activate A
+
+    loop 工具调用循环
+        A->>L: 请求下一步操作
+        activate L
+        L-->>A: 返回工具调用请求
+        deactivate L
+
+        A->>T: 执行工具
+        activate T
+
+        alt 执行成功
+            T-->>A: 返回工具结果
+            A->>L: 注入工具结果
+        else 执行失败
+            T->>E: 抛出工具错误
+            deactivate T
+            activate E
+
+            Note over E: 错误处理流程
+
+            alt Codex 处理方式
+                E->>E: 1. is_retryable() 判定
+                E->>E: 2. 指数退避重试
+                E->>T: 3. 重新调用（最多5次）
+                T-->>E: 返回结果
+            else Gemini CLI 处理方式
+                E->>E: 1. classifyFailureKind()
+                E->>E: 2. 检查是否达到限制
+                E->>E: 3. Final Warning Turn
+                E->>L: 4. 注入恢复提示
+            else Kimi CLI 处理方式
+                E->>E: 1. 错误分类（四层体系）
+                E->>E: 2. 创建 Checkpoint
+                E->>E: 3. D-Mail 时间旅行（可选）
+                E->>L: 4. 注入错误信息
+            else OpenCode 处理方式
+                E->>E: 1. Doom Loop 检测
+                E->>E: 2. 检查重复模式
+                E->>E: 3. Context Compaction
+                E->>L: 4. 注入精简上下文
+            else SWE-agent 处理方式
+                E->>E: 1. forward_with_handling()
+                E->>E: 2. 模板化错误反馈
+                E->>E: 3. max_requeries 检查
+                E->>E: 4. Autosubmit（达到限制）
+            end
+
+            E-->>A: 返回处理结果
+            deactivate E
+        end
+    end
+
+    A-->>U: 返回最终结果
+    deactivate A
+```
+
+**协作要点**：
+
+1. **Agent Loop 与工具系统**：Agent Loop 负责协调，工具系统专注执行
+2. **错误处理器与 LLM**：错误信息需结构化后注入 LLM 上下文
+3. **各项目恢复策略差异**：Codex 侧重重试，Kimi 侧重回滚，SWE-agent 侧重自动完成
+
+---
+
+## 4. 端到端数据流转
+
+### 4.1 正常流程（详细版）
+
+```mermaid
+sequenceDiagram
+    participant A as Agent Loop
+    participant T as Tool Executor
+    participant V as Validator
+    participant S as Sandbox
+    participant L as LLM Context
+
+    A->>T: 1. 调用工具 (tool_name, params)
+    activate T
+
+    T->>V: 2. 参数验证
+    activate V
+    V->>V: 2.1 JSON Schema 校验
+    V->>V: 2.2 类型转换
+    V-->>T: 2.3 验证通过
+    deactivate V
+
+    T->>S: 3. 沙箱执行
+    activate S
+    S->>S: 3.1 权限检查
+    S->>S: 3.2 执行命令
+    S-->>T: 3.3 返回执行结果
+    deactivate S
+
+    T->>T: 4. 结果格式化
+    T-->>A: 5. 返回结构化结果
+    deactivate T
+
+    A->>L: 6. 注入工具结果
+    activate L
+    L->>L: 6.1 更新上下文
+    L-->>A: 6.2 返回更新后的上下文
+    deactivate L
+```
+
+**数据变换详情**：
+
+| 阶段 | 输入 | 处理 | 输出 | 代码位置 |
+|-----|------|------|------|---------|
+| 参数验证 | JSON 字符串 | Schema 校验、类型转换 | 结构化参数对象 | 各项目 tool 定义层 |
+| 沙箱执行 | 结构化参数 | 权限检查、命令执行 | 执行结果/输出 | 各项目 sandbox 层 |
+| 结果格式化 | 原始输出 | 截断、编码、结构化 | ToolResult 对象 | 各项目 tool 返回层 |
+| 上下文注入 | ToolResult | Token 计算、上下文更新 | 更新后的上下文 | 各项目 context 层 |
+
+### 4.2 数据流向图
+
+```mermaid
+flowchart LR
+    subgraph Input["输入阶段"]
+        I1[用户输入] --> I2[参数解析]
+        I2 --> I3[Schema 验证]
+    end
+
+    subgraph Process["处理阶段"]
+        P1[权限检查] --> P2[沙箱执行]
+        P2 --> P3[结果捕获]
+    end
+
+    subgraph ErrorHandling["错误处理阶段"]
+        E1[错误检测] --> E2[错误分类]
+        E2 --> E3[恢复策略]
+    end
+
+    subgraph Output["输出阶段"]
+        O1[结果格式化] --> O2[上下文注入]
+        O2 --> O3[LLM 消费]
+    end
+
+    I3 --> P1
+    P3 --> O1
+    P2 -.->|错误| E1
+    E3 -.->|恢复| P2
+    E3 -.->|终止| O2
+
+    style Process fill:#e1f5e1,stroke:#333
+    style ErrorHandling fill:#ffe1e1,stroke:#333
+```
+
+### 4.3 异常/边界流程
+
+```mermaid
+flowchart TD
+    A[开始工具调用] --> B{参数验证}
+    B -->|通过| C{沙箱执行}
+    B -->|失败| D[参数错误]
+
+    C -->|成功| E[返回结果]
+    C -->|失败| F{错误类型}
+
+    F -->|可重试| G[指数退避重试]
+    F -->|不可重试| H[注入错误信息]
+    F -->|严重错误| I[终止任务]
+
+    G -->|成功| E
+    G -->|超过最大次数| H
+
+    D --> H
+    H --> J[LLM 自纠正]
+    I --> K[返回错误状态]
+
+    E --> L[正常流程继续]
+    J --> L
+    K --> M[任务结束]
+
+    style E fill:#90EE90
+    style L fill:#90EE90
+    style D fill:#FFB6C1
+    style H fill:#FFD700
+    style I fill:#FF6B6B
+    style K fill:#FF6B6B
+```
+
+---
+
+## 5. 关键代码实现
+
+### 5.1 核心数据结构
+
+**Codex - CodexErr 错误枚举**:
+```rust
+// codex-rs/core/src/error.rs:1-50
+pub enum CodexErr {
+    Sandbox(SandboxErr),
+    Stream(StreamError),
+    Timeout(TimeoutError),
+    QuotaExceeded(QuotaInfo),
+    ContextWindowExceeded(ContextInfo),
+    // ...
+}
+
+impl CodexErr {
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            CodexErr::Stream(_) => true,
+            CodexErr::Timeout(_) => true,
+            CodexErr::QuotaExceeded(_) => false,
+            CodexErr::Sandbox(_) => false,
+            // ...
+        }
+    }
+}
+```
+
+**Kimi CLI - ToolError 四层继承**:
+```python
+# packages/kosong/src/kosong/tooling/error.py:1-40
+class ToolError(Exception):
+    """工具错误基类"""
+    pass
+
+class ToolNotFoundError(ToolError):
+    """工具未找到"""
+    pass
+
+class ToolParseError(ToolError):
+    """参数解析错误"""
+    pass
+
+class ToolValidateError(ToolError):
+    """参数验证错误"""
+    pass
+
+class ToolRuntimeError(ToolError):
+    """运行时错误"""
+    pass
+```
+
+**Gemini CLI - ToolErrorType 枚举**:
+```typescript
+// packages/core/src/tools/tool-error.ts:1-50
+export enum ToolErrorType {
+    POLICY_VIOLATION = 'POLICY_VIOLATION',
+    INVALID_TOOL_PARAMS = 'INVALID_TOOL_PARAMS',
+    PATH_NOT_IN_WORKSPACE = 'PATH_NOT_IN_WORKSPACE',
+    FILE_NOT_FOUND = 'FILE_NOT_FOUND',
+    // ... 15+ 类型
+}
+```
+
+### 5.2 主链路代码
+
+**SWE-agent - forward_with_handling 错误处理**:
+```python
+# sweagent/agent/agents.py:150-220
+def forward_with_handling(self, observation: str, state: str) -> str:
+    """模板化错误反馈处理"""
+    try:
+        # 尝试解析模型输出
+        return self.forward(observation, state)
+    except FormatError as e:
+        # 格式错误，使用模板化反馈
+        if self.requery_count < self.max_requeries:
+            self.requery_count += 1
+            return self.templates.format_error(e)
+        else:
+            # 超过最大重试次数，触发 autosubmit
+            raise AutosubmitError("Max requeries exceeded")
+    except ContextWindowExceeded:
+        # Token 溢出，触发 autosubmit
+        raise AutosubmitError("Context window exceeded")
+```
+
+**代码要点**：
+1. **模板化错误反馈**：使用 Jinja2 模板生成结构化错误信息，便于 LLM 理解
+2. **重试计数器**：`max_requeries` 防止无限重试循环
+3. **统一出口**：所有不可恢复错误最终都触发 `AutosubmitError`
+
+### 5.3 关键调用链
+
+**Codex 错误处理调用链**:
+```text
+tool_call()               [codex-rs/core/src/tools/mod.rs:100]
+  -> execute_sandboxed()  [codex-rs/core/src/tools/sandboxing.rs:50]
+    -> check_permission() [codex-rs/core/src/tools/sandboxing.rs:80]
+      - 权限检查
+    -> run_in_sandbox()   [codex-rs/core/src/exec/mod.rs:200]
+      - 沙箱执行
+  -> handle_error()       [codex-rs/core/src/error.rs:150]
+    - is_retryable() 判定
+    - 指数退避计算
+```
+
+**Gemini CLI 错误处理调用链**:
+```text
+executeTool()             [packages/core/src/tools/executor.ts:80]
+  -> ToolWrapper.execute() [packages/core/src/tools/wrapper.ts:40]
+    -> classifyFailureKind() [packages/core/src/availability/errorClassification.ts:60]
+      - 错误分类
+    -> handleToolError()     [packages/core/src/tools/errorHandler.ts:30]
+      - Final Warning Turn 触发
+```
+
+---
+
+## 6. 设计意图与 Trade-off
+
+### 6.1 各项目的选择
+
+| 维度 | Codex | Gemini CLI | Kimi CLI | OpenCode | SWE-agent |
+|-----|-------|-----------|----------|----------|-----------|
+| **重试机制** | 自定义实现，区分 stream/request | 自定义 retry.ts，429 特殊处理 | tenacity 库，仅网络错误 | 自定义 retry.ts，resetTimeoutOnProgress | 自定义实现，max_requeries |
+| **状态恢复** | 无（依赖重试） | Final Warning Turn | Checkpoint + D-Mail | Compaction | Autosubmit |
+| **沙箱模型** | Landlock + Seccomp | 受限执行环境 | 受限 shell | 无原生沙箱 | Docker |
+| **超时处理** | ExecExpiration 枚举 | DeadlineTimer 可暂停 | MCP 单独配置 | resetTimeoutOnProgress | 连续超时计数 |
+| **错误分类** | CodexErr 枚举 | ToolErrorType 枚举 | 四层继承体系 | Provider-specific | Exception 层级 |
+
+### 6.2 为什么这样设计？
+
+**核心问题**：如何在错误发生时既保证用户体验，又确保系统稳定性？
+
+**各项目的解决方案**：
+
+**Codex - 安全优先模型**：
+- 代码依据：`codex-rs/core/src/error.rs:200-250`
+- 设计意图：企业级安全需求，沙箱错误不可重试
+- 带来的好处：防止恶意代码重复执行，保护用户系统
+- 付出的代价：部分 transient 错误也被视为不可重试，用户体验略差
+
+**Kimi CLI - 状态可恢复模型**：
+- 代码依据：`packages/kosong/src/kosong/tooling/error.py:1-50`
+- 设计意图：复杂对话场景需要状态回滚能力
+- 带来的好处：用户可以随时回滚到之前的状态
+- 付出的代价：Checkpoint 管理增加系统复杂度
+
+**SWE-agent - 纯自动化模型**：
+- 代码依据：`sweagent/agent/agents.py:150-220`
+- 设计意图：CI/CD 场景无需人工介入，自动完成优先
+- 带来的好处：完全自动化，适合批量处理
+- 付出的代价：Autosubmit 可能提交未完全修复的代码
+
+### 6.3 与其他项目的对比
+
+```mermaid
+flowchart LR
+    subgraph Spectrum["恢复策略光谱"]
+        direction LR
+        A[完全重试<br/>Codex] --> B[优雅恢复<br/>Gemini CLI]
+        B --> C[状态回滚<br/>Kimi CLI]
+        C --> D[上下文压缩<br/>OpenCode]
+        D --> E[自动提交<br/>SWE-agent]
+    end
+
+    subgraph Characteristics["特点对比"]
+        F[交互式<br/>安全优先]
+        G[对话式<br/>用户体验]
+        H[自动化<br/>完成率优先]
+    end
+
+    A -.-> F
+    B -.-> G
+    C -.-> G
+    D -.-> G
+    E -.-> H
+```
+
+| 项目 | 核心差异 | 适用场景 |
+|-----|---------|---------|
+| **Codex** | 三档审批 + 安全沙箱 | 企业级安全敏感场景 |
+| **Gemini CLI** | Final Warning Turn 优雅恢复 | 交互式对话，需要优雅降级 |
+| **Kimi CLI** | Checkpoint + D-Mail 时间旅行 | 复杂任务，需要状态回滚 |
+| **OpenCode** | Doom Loop 检测 + Compaction | 长任务执行，防止重复失败 |
+| **SWE-agent** | Autosubmit 自动提交 | CI/CD 自动化，批量处理 |
+
+---
+
+## 7. 边界情况与错误处理
+
+### 7.1 终止条件
+
+| 终止原因 | 触发条件 | 代码位置 |
+|---------|---------|---------|
+| **Codex** 重试上限 | stream: 5次, request: 4次 | `codex-rs/core/src/model_provider_info.rs:50-80` |
+| **Gemini CLI** Agent 限制 | 全局: 100轮, Agent: 15轮 | `packages/core/src/agent/client.ts:100-150` |
+| **Kimi CLI** Step 上限 | max_steps_per_turn: 100 | `packages/kosong/src/kosong/soul/config.py:30-50` |
+| **OpenCode** Step 上限 | Infinity（未设置时） | `packages/opencode/src/session/agent.ts:80-120` |
+| **SWE-agent** 实例限制 | per_instance_call_limit | `sweagent/agent/models.py:100-150` |
+
+### 7.2 超时/资源限制
+
+**Codex - ExecExpiration 超时抽象**:
+```rust
+// codex-rs/core/src/exec/mod.rs:50-80
+pub enum ExecExpiration {
+    Timeout(Duration),
+    None,
+}
+```
+
+**OpenCode - resetTimeoutOnProgress 机制**:
+```typescript
+// packages/opencode/src/session/retry.ts:80-120
+function resetTimeoutOnProgress(
+  timeout: number,
+  onProgress: () => void
+): () => void {
+  let lastProgress = Date.now();
+  return () => {
+    if (Date.now() - lastProgress > timeout) {
+      throw new TimeoutError();
+    }
+    onProgress();
+    lastProgress = Date.now();
+  };
+}
+```
+
+### 7.3 错误恢复策略
+
+| 错误类型 | 项目 | 处理策略 | 代码位置 |
+|---------|------|---------|---------|
+| 参数验证错误 | Kimi CLI | 四层错误体系，自动包装 | `packages/kosong/src/kosong/tooling/error.py:20-40` |
+| 配额限流错误 | Gemini CLI | Terminal/Retryable 分类 | `packages/core/src/utils/googleQuotaErrors.ts:30-60` |
+| 格式解析错误 | SWE-agent | Jinja2 模板化反馈 | `sweagent/agent/agents.py:180-220` |
+| 沙箱安全错误 | Codex | 三档审批策略 | `codex-rs/core/src/tools/sandboxing.rs:100-150` |
+| 重复失败检测 | OpenCode | Doom Loop 检测 | `packages/opencode/src/session/agent.ts:200-250` |
+| Token 溢出 | Kimi CLI | Checkpoint + Compaction | `packages/kosong/src/kosong/soul/kimisoul.py:300-350` |
+
+---
+
+## 8. 关键代码索引
+
+### 8.1 Codex (Rust)
+
+| 功能 | 文件 | 行号 | 说明 |
+|-----|------|------|------|
+| 错误定义 | `codex-rs/core/src/error.rs` | 1-100 | CodexErr 主错误枚举 |
+| 可重试判定 | `codex-rs/core/src/error.rs` | 200-250 | `is_retryable()` 方法 |
+| 沙箱错误 | `codex-rs/core/src/tools/sandboxing.rs` | 1-50 | SandboxErr 定义 |
+| 重试配置 | `codex-rs/core/src/model_provider_info.rs` | 50-80 | stream/request 重试次数 |
+
+### 8.2 Gemini CLI (TypeScript)
+
+| 功能 | 文件 | 行号 | 说明 |
+|-----|------|------|------|
+| 错误类型 | `packages/core/src/tools/tool-error.ts` | 1-80 | ToolErrorType 枚举(15+类型) |
+| 配额分类 | `packages/core/src/utils/googleQuotaErrors.ts` | 30-60 | Terminal/Retryable 配额错误 |
+| 错误分类 | `packages/core/src/availability/errorClassification.ts` | 50-100 | `classifyFailureKind()` |
+| 重试逻辑 | `packages/core/src/utils/retry.ts` | 1-50 | 指数退避 + 抖动 |
+
+### 8.3 Kimi CLI (Python)
+
+| 功能 | 文件 | 行号 | 说明 |
+|-----|------|------|------|
+| 错误体系 | `packages/kosong/src/kosong/tooling/error.py` | 1-50 | ToolError 四层继承体系 |
+| 返回包装 | `packages/kosong/src/kosong/tooling/__init__.py` | 100-150 | ToolReturnValue |
+| 重试配置 | `packages/kosong/src/kosong/soul/config.py` | 30-50 | max_retries_per_step |
+| Step 限制 | `packages/kosong/src/kosong/soul/kimisoul.py` | 300-350 | max_steps_per_turn 检查 |
+
+### 8.4 OpenCode (TypeScript)
+
+| 功能 | 文件 | 行号 | 说明 |
+|-----|------|------|------|
+| 重试逻辑 | `packages/opencode/src/session/retry.ts` | 50-100 | `retryable()` 判定 |
+| 错误解析 | `packages/opencode/src/provider/error.ts` | 1-50 | Provider-specific 错误解析 |
+| Doom Loop | `packages/opencode/src/session/agent.ts` | 200-250 | 重复失败模式检测 |
+| 超时处理 | `packages/opencode/src/session/retry.ts` | 80-120 | resetTimeoutOnProgress |
+
+### 8.5 SWE-agent (Python)
+
+| 功能 | 文件 | 行号 | 说明 |
+|-----|------|------|------|
+| 异常定义 | `sweagent/exceptions.py` | 1-50 | FormatError, ContextWindowExceeded 等 |
+| 错误处理 | `sweagent/agent/agents.py` | 150-250 | `forward_with_handling()` |
+| 重试限制 | `sweagent/agent/models.py` | 100-150 | max_requeries, per_instance_call_limit |
+| Autosubmit | `sweagent/agent/agents.py` | 250-300 | 自动提交逻辑 |
+
+---
+
+## 9. 延伸阅读
+
+### 9.1 前置知识
+
+- **Agent Loop 机制**: `docs/comm/04-comm-agent-loop.md`
+- **Checkpoint 机制**: `docs/kimi-cli/questions/kimi-cli-checkpoint-implementation.md`
+- **MCP 集成**: `docs/comm/06-comm-mcp-integration.md`
+
+### 9.2 相关机制
+
+- **Context Compaction**: `docs/kimi-cli/questions/kimi-cli-context-compaction.md`
+- **Safety Control**: `docs/codex/10-codex-safety-control.md`
+- **Tool System**: 各项目 `06-{project}-tool-system.md`
+
+### 9.3 深度分析
+
+- **Kimi CLI Checkpoint**: `docs/kimi-cli/questions/kimi-cli-checkpoint-implementation.md`
+- **SWE-agent Autosubmit**: `docs/swe-agent/questions/swe-agent-autosubmit-mechanism.md`
+- **OpenCode Doom Loop**: `docs/opencode/questions/opencode-doom-loop-detection.md`
+
+---
+
+## 附录：选型建议矩阵
+
+### A.1 按场景选择参考
 
 | 场景需求 | 推荐项目 | 原因 |
 |---------|---------|------|
@@ -267,7 +835,7 @@
 | 长任务执行 | OpenCode | resetTimeoutOnProgress |
 | 智能配额管理 | Gemini CLI | Terminal/Retryable配额区分 |
 
-### 7.2 按错误类型设计参考
+### A.2 按错误类型设计参考
 
 | 错误类型 | 最佳实践参考 |
 |---------|-------------|
@@ -279,59 +847,6 @@
 
 ---
 
-## 8. 核心源码文件索引
+*✅ Verified: 基于 codex/codex-rs/core/src/error.rs、gemini-cli/packages/core/src/tools/tool-error.ts、kimi-cli/packages/kosong/src/kosong/tooling/error.py、opencode/packages/opencode/src/session/retry.ts、SWE-agent/sweagent/exceptions.py 等源码分析*
 
-### Codex (Rust)
-- `codex/codex-rs/core/src/error.rs` - CodexErr主错误枚举，`is_retryable()`判定
-- `codex/codex-rs/core/src/tools/sandboxing.rs` - SandboxErr定义
-- `codex/codex-rs/core/src/model_provider_info.rs` - 重试配置
-
-### Gemini CLI (TypeScript)
-- `gemini-cli/packages/core/src/tools/tool-error.ts` - ToolErrorType枚举(15+类型)
-- `gemini-cli/packages/core/src/utils/googleQuotaErrors.ts` - 配额错误分类
-- `gemini-cli/packages/core/src/availability/errorClassification.ts` - 错误分类
-
-### Kimi CLI (Python)
-- `kimi-cli/packages/kosong/src/kosong/tooling/error.py` - ToolError四层体系
-- `kimi-cli/packages/kosong/src/kosong/tooling/__init__.py` - ToolReturnValue
-
-### OpenCode (TypeScript)
-- `opencode/packages/opencode/src/session/retry.ts` - 重试逻辑，`retryable()`判定
-- `opencode/packages/opencode/src/provider/error.ts` - 错误解析
-
-### SWE-agent (Python)
-- `SWE-agent/sweagent/exceptions.py` - 异常层级定义
-- `SWE-agent/sweagent/agent/agents.py` - `forward_with_handling()`错误处理
-
----
-
-## 9. 结论与启示
-
-### 9.1 共性模式
-
-1. **分层错误处理**: 所有项目都实现了检测→分类→恢复→反馈的流水线
-2. **可重试判定**: 均显式区分可重试(transient)与不可重试(terminal)错误
-3. **指数退避**: 除SWE-agent外均实现了指数退避+抖动的重试策略
-4. **LLM反馈**: 错误最终都转换为LLM可理解的结构化消息
-
-### 9.2 差异化创新
-
-| 创新点 | 项目 | 价值 |
-|-------|------|------|
-| Checkpoint时间旅行 | Kimi CLI | 状态恢复能力 |
-| Autosubmit | SWE-agent | 自动化完成率 |
-| Doom loop检测 | OpenCode | 避免重复失败 |
-| 三档审批 | Codex | 安全与便利平衡 |
-| Final Warning Turn | Gemini CLI | 优雅降级 |
-
-### 9.3 设计启示
-
-1. **恢复策略 > 错误类型**: 不同项目的核心差异在于恢复策略，而非错误分类本身
-2. **超时即特征**: 超时处理是区分长任务与交互式Agent的关键设计点
-3. **沙箱即边界**: 沙箱错误处理反映了项目的安全模型定位
-4. **配额即成本**: 配额错误处理体现了项目的成本控制能力
-
----
-
-*文档版本: 2026-02-21*
-*分析范围: Codex, Gemini CLI, Kimi CLI, OpenCode, SWE-agent*
+*文档版本: 2026-02-25 | 分析范围: Codex, Gemini CLI, Kimi CLI, OpenCode, SWE-agent | 模板版本: v2.0*

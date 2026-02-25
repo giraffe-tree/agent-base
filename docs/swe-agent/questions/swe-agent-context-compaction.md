@@ -2,7 +2,9 @@
 
 ## TL;DR（结论先行）
 
-SWE-agent **不支持 LLM 压缩**，仅使用简单的滑动窗口和历史处理器来管理上下文长度。核心取舍是**简单可靠**（对比 Codex/Gemini CLI 的 LLM 驱动压缩）。
+SWE-agent **不支持 LLM 压缩**，仅使用简单的滑动窗口和历史处理器来管理上下文长度。
+
+SWE-agent 的核心取舍：**简单滑动窗口**（对比 Codex/Gemini CLI 的 LLM 驱动压缩）
 
 ---
 
@@ -45,7 +47,7 @@ SWE-agent 的设计选择：
                         ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ ▓▓▓ Context Management ▓▓▓                                  │
-│ sweagent/agent/history_processors.py                         │
+│ SWE-agent/sweagent/agent/history_processors.py               │
 │ - LastNObservations: 滑动窗口                               │
 │ - CacheControlHistoryProcessor: Claude 缓存控制             │
 │ - ClosedWindowHistoryProcessor: 关闭窗口替换                │
@@ -62,10 +64,10 @@ SWE-agent 的设计选择：
 
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
-| `LastNObservations` | 滑动窗口截断 | `sweagent/agent/history_processors.py:25` |
-| `CacheControlHistoryProcessor` | Claude 缓存控制 | `sweagent/agent/history_processors.py:80` |
-| `ClosedWindowHistoryProcessor` | 替换已关闭窗口 | `sweagent/agent/history_processors.py:140` |
-| `RemoveRegex` | 正则清理 | `sweagent/agent/history_processors.py:200` |
+| `LastNObservations` | 滑动窗口截断 | `SWE-agent/sweagent/agent/history_processors.py:85` |
+| `CacheControlHistoryProcessor` | Claude 缓存控制 | `SWE-agent/sweagent/agent/history_processors.py:261` |
+| `ClosedWindowHistoryProcessor` | 替换已关闭窗口 | `SWE-agent/sweagent/agent/history_processors.py:215` |
+| `TagToolCallObservations` | 标签工具调用 | `SWE-agent/sweagent/agent/history_processors.py:179` |
 
 ### 2.3 核心组件交互关系
 
@@ -217,21 +219,40 @@ flowchart LR
 ### 5.1 核心数据结构
 
 ```python
-# sweagent/agent/history_processors.py
-@dataclass
-class LastNObservations:
-    """
-    只保留最近 N 条观察记录的简单滑动窗口。
-    这是 SWE-agent 最主要的上下文控制机制。
-    没有智能压缩，只是简单的截断。
-    """
-    n: int = 10  # 默认保留最近 10 条
+# SWE-agent/sweagent/agent/history_processors.py:85-170
+class LastNObservations(BaseModel):
+    """Elide all but the last n observations or remove tagged observations.
 
-    def process(self, history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """返回最近 N 条历史记录"""
-        if len(history) <= self.n:
-            return history
-        return history[-self.n:]
+    This is our most classic history processor, used in the original paper
+    to elide but the last 5 observations.
+    Elided observations are replaced by "Old environment output: (n lines omitted)".
+    """
+    n: int = 5
+    polling: int = 1
+    always_remove_output_for_tags: set[str] = {"remove_output"}
+    always_keep_output_for_tags: set[str] = {"keep_output"}
+    type: Literal["last_n_observations"] = "last_n_observations"
+
+    def __call__(self, history: History) -> History:
+        """只保留最近 N 条观察记录的简单滑动窗口"""
+        new_history = []
+        omit_content_idxs = self._get_omit_indices(history)
+
+        for idx, entry in enumerate(history):
+            tags = set(entry.get("tags", []))
+
+            if (idx not in omit_content_idxs or
+                tags & self.always_keep_output_for_tags) and not (
+                tags & self.always_remove_output_for_tags
+            ):
+                new_history.append(entry)
+            else:
+                # 替换为摘要
+                num_text_lines, num_images = _get_content_stats(entry)
+                entry["content"] = f"Old environment output: ({num_text_lines} lines omitted)"
+                new_history.append(entry)
+
+        return new_history
 ```
 
 **字段说明**：
@@ -243,42 +264,33 @@ class LastNObservations:
 ### 5.2 主链路代码
 
 ```python
-# sweagent/agent/history_processors.py
-class HistoryProcessorPipeline:
-    """组合多个历史处理器按顺序执行。"""
+# SWE-agent/sweagent/agent/agents.py:155
+history_processors: list[HistoryProcessor] = Field(default_factory=lambda: [DefaultHistoryProcessor()])
 
-    def __init__(self):
-        self.processors: List[Any] = [
-            RemoveRegex(),                      # 1. 清理格式
-            ClosedWindowHistoryProcessor(),     # 2. 替换已关闭窗口
-            LastNObservations(n=15),            # 3. 滑动窗口截断
-            CacheControlHistoryProcessor(),     # 4. 添加缓存控制
-        ]
-
-    def process(self, history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """依次应用所有处理器"""
-        result = history
-        for processor in self.processors:
-            result = processor.process(result)
-        return result
+# 配置示例 (config/default.yaml):
+# agent:
+#   history_processors:
+#     - type: last_n_observations
+#       n: 5
+#     - type: cache_control
+#       last_n_messages: 2
 ```
 
 **代码要点**：
 
-1. **管道模式**：按顺序应用多个处理器
+1. **Pydantic 模型**：使用 Pydantic BaseModel 定义处理器
 2. **简单处理**：无 LLM 调用，纯本地处理
-3. **可配置**：处理器列表可自定义
+3. **可配置**：通过 YAML 配置处理器列表
 
 ### 5.3 关键调用链
 
 ```text
 Agent.step()                         [sweagent/agent/agents.py:200]
   -> build_history()                 [sweagent/agent/agents.py:400]
-    -> HistoryProcessorPipeline()    [sweagent/agent/history_processors.py:260]
-      -> RemoveRegex.process()       [sweagent/agent/history_processors.py:200]
-      -> ClosedWindowHistoryProcessor.process() [sweagent/agent/history_processors.py:140]
-      -> LastNObservations.process()  [sweagent/agent/history_processors.py:60]
-      -> CacheControlHistoryProcessor.process() [sweagent/agent/history_processors.py:85]
+    -> history_processors           [SWE-agent/sweagent/agent/agents.py:155]
+      -> LastNObservations()          [SWE-agent/sweagent/agent/history_processors.py:85]
+      -> ClosedWindowHistoryProcessor() [SWE-agent/sweagent/agent/history_processors.py:215]
+      -> CacheControlHistoryProcessor() [SWE-agent/sweagent/agent/history_processors.py:261]
 ```
 
 ---
@@ -299,7 +311,7 @@ Agent.step()                         [sweagent/agent/agents.py:200]
 **核心问题**：软件工程研究任务是否需要智能上下文压缩？
 
 **SWE-agent 的解决方案**：
-- 代码依据：`sweagent/agent/history_processors.py`
+- 代码依据：`SWE-agent/sweagent/agent/history_processors.py:85`
 - 设计意图：简单可靠，专注研究场景
 - 带来的好处：
   - 确定性行为，便于实验复现
@@ -326,9 +338,8 @@ Agent.step()                         [sweagent/agent/agents.py:200]
 
 | 情况 | 处理策略 | 代码位置 |
 |---------|---------|---------|
-| 历史过长 | LastNObservations 截断 | `sweagent/agent/history_processors.py:60` |
-| 窗口关闭 | ClosedWindow 替换为标记 | `sweagent/agent/history_processors.py:140` |
-| ANSI 代码 | RemoveRegex 清理 | `sweagent/agent/history_processors.py:200` |
+| 历史过长 | LastNObservations 截断 | `SWE-agent/sweagent/agent/history_processors.py:85` |
+| 窗口关闭 | ClosedWindow 替换为标记 | `SWE-agent/sweagent/agent/history_processors.py:215` |
 
 ### 7.2 配置示例
 
@@ -363,11 +374,11 @@ history:
 
 | 功能 | 文件 | 行号 | 说明 |
 |-----|------|------|------|
-| 滑动窗口 | `sweagent/agent/history_processors.py` | 25 | LastNObservations |
-| 缓存控制 | `sweagent/agent/history_processors.py` | 80 | CacheControlHistoryProcessor |
-| 窗口替换 | `sweagent/agent/history_processors.py` | 140 | ClosedWindowHistoryProcessor |
-| 正则清理 | `sweagent/agent/history_processors.py` | 200 | RemoveRegex |
-| 处理器管道 | `sweagent/agent/history_processors.py` | 260 | HistoryProcessorPipeline |
+| 滑动窗口 | `SWE-agent/sweagent/agent/history_processors.py` | 85 | LastNObservations |
+| 缓存控制 | `SWE-agent/sweagent/agent/history_processors.py` | 261 | CacheControlHistoryProcessor |
+| 窗口替换 | `SWE-agent/sweagent/agent/history_processors.py` | 215 | ClosedWindowHistoryProcessor |
+| 标签工具 | `SWE-agent/sweagent/agent/history_processors.py` | 179 | TagToolCallObservations |
+| 默认处理器 | `SWE-agent/sweagent/agent/history_processors.py` | 74 | DefaultHistoryProcessor |
 
 ---
 
@@ -379,5 +390,5 @@ history:
 
 ---
 
-*✅ Verified: 基于 sweagent/agent/history_processors.py 源码分析*
-*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-02-24*
+*✅ Verified: 基于 SWE-agent/sweagent/agent/history_processors.py 源码分析*
+*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-02-25*

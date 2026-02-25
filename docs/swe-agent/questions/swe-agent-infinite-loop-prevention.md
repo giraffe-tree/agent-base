@@ -2,7 +2,9 @@
 
 ## TL;DR（结论先行）
 
-SWE-agent 通过 **`max_requeries` 重试上限** + **Autosubmit 自动提交** + **连续超时计数器**防止 tool 无限循环。核心设计是"优雅完成"，即使发生异常也尝试提取 patch 提交结果，而非强制中断。
+SWE-agent 通过 **`max_requeries` 重试上限** + **Autosubmit 自动提交** + **连续超时计数器**防止 tool 无限循环。
+
+SWE-agent 的核心取舍：**优雅完成**（对比 Gemini CLI 的递归限制、Kimi CLI 的 Checkpoint 回滚）
 
 ---
 
@@ -44,7 +46,7 @@ SWE-agent 通过 **`max_requeries` 重试上限** + **Autosubmit 自动提交** 
                         ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ ▓▓▓ Loop Prevention ▓▓▓                                     │
-│ sweagent/agent/agents.py:451                                 │
+│ SWE-agent/sweagent/agent/agents.py:158                                 │
 │ - max_requeries: 格式错误重试上限                           │
 │ - _n_consecutive_timeouts: 连续超时计数器                   │
 │ - attempt_autosubmission_after_error(): 自动提交兜底        │
@@ -63,10 +65,10 @@ SWE-agent 通过 **`max_requeries` 重试上限** + **Autosubmit 自动提交** 
 
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
-| `max_requeries` | 限制格式错误重试次数 | `sweagent/agent/agents.py:451` |
-| `_n_consecutive_timeouts` | 追踪连续超时次数 | `sweagent/agent/agents.py:968` |
-| `forward_with_handling()` | 集中重试控制 | `sweagent/agent/agents.py:1062` |
-| `attempt_autosubmission_after_error()` | 异常时自动提交 | `sweagent/agent/agents.py:823` |
+| `max_requeries` | 限制格式错误重试次数 | `SWE-agent/sweagent/agent/agents.py:158` |
+| `_n_consecutive_timeouts` | 追踪连续超时次数 | `SWE-agent/sweagent/agent/agents.py:968` |
+| `forward_with_handling()` | 集中重试控制 | `SWE-agent/sweagent/agent/agents.py:1062` |
+| `attempt_autosubmission_after_error()` | 异常时自动提交 | `SWE-agent/sweagent/agent/agents.py:823` |
 
 ### 2.3 核心组件交互关系
 
@@ -286,7 +288,7 @@ flowchart LR
 ### 5.1 核心数据结构
 
 ```python
-# sweagent/agent/agents.py:451
+# SWE-agent/sweagent/agent/agents.py:158
 class DefaultAgent(AbstractAgent):
     def __init__(
         self,
@@ -308,7 +310,7 @@ class DefaultAgent(AbstractAgent):
 ### 5.2 主链路代码
 
 ```python
-# sweagent/agent/agents.py:968
+# SWE-agent/sweagent/agent/agents.py:968
 # 初始化
 self._n_consecutive_timeouts = 0
 
@@ -342,11 +344,11 @@ else:
 ### 5.3 关键调用链
 
 ```text
-Agent.step()                         [sweagent/agent/agents.py:200]
+Agent.step()                         [SWE-agent/sweagent/agent/agents.py:790]
   -> handle_action()                 [sweagent/agent/agents.py:900]
     -> _env.execute()                [sweagent/environment/swe_env.py:150]
       - subprocess.run(timeout=...)
-    -> CommandTimeoutError 捕获      [sweagent/agent/agents.py:968]
+    -> CommandTimeoutError 捕获      [SWE-agent/sweagent/agent/agents.py:968]
       - _n_consecutive_timeouts += 1
       - 检查 >= 3?
       - 是：raise 终止
@@ -371,7 +373,7 @@ Agent.step()                         [sweagent/agent/agents.py:200]
 **核心问题**：如何在防止无限循环的同时最大化任务完成率？
 
 **SWE-agent 的解决方案**：
-- 代码依据：`sweagent/agent/agents.py:451`
+- 代码依据：`SWE-agent/sweagent/agent/agents.py:158`
 - 设计意图："优雅完成"而非"完美完成"
 - 带来的好处：
   - 有限重试防止资源浪费
@@ -399,16 +401,16 @@ Agent.step()                         [sweagent/agent/agents.py:200]
 
 | 终止原因 | 触发条件 | 代码位置 |
 |---------|---------|---------|
-| 格式重试耗尽 | n_format_fails >= max_requeries | `sweagent/agent/agents.py:1195` |
-| 连续超时 | _n_consecutive_timeouts >= 3 | `sweagent/agent/agents.py:971` |
+| 格式重试耗尽 | n_format_fails >= max_requeries | `SWE-agent/sweagent/agent/agents.py:1211` |
+| 连续超时 | _n_consecutive_timeouts >= 3 | `SWE-agent/sweagent/agent/agents.py:971` |
 | 总执行时间 | _total_execution_time > 1800s | `sweagent/agent/agents.py:1020` |
-| 上下文溢出 | ContextWindowExceededError | `sweagent/agent/agents.py:1176` |
+| 上下文溢出 | ContextWindowExceededError | `SWE-agent/sweagent/agent/agents.py:1175` |
 | 成本超限 | CostLimitExceededError | `sweagent/agent/agents.py:1178` |
 
 ### 7.2 超时/资源限制
 
 ```python
-# sweagent/agent/agents.py:1018
+# SWE-agent/sweagent/agent/agents.py:1018
 def forward(self, history: list[dict[str, str]]) -> StepOutput:
     # 检查总执行时间
     if self._total_execution_time > self.tools.config.total_execution_timeout:
@@ -425,9 +427,9 @@ class ToolConfig(BaseModel):
 
 | 错误类型 | 处理策略 | 代码位置 |
 |---------|---------|---------|
-| 格式错误 | 模板反馈 + 重试 | `sweagent/agent/agents.py:1153` |
-| 连续超时 | Autosubmit | `sweagent/agent/agents.py:971` |
-| 重试耗尽 | Autosubmit | `sweagent/agent/agents.py:1195` |
+| 格式错误 | 模板反馈 + 重试 | `SWE-agent/sweagent/agent/agents.py:1152` |
+| 连续超时 | Autosubmit | `SWE-agent/sweagent/agent/agents.py:971` |
+| 重试耗尽 | Autosubmit | `SWE-agent/sweagent/agent/agents.py:1211` |
 
 ---
 
@@ -451,5 +453,5 @@ class ToolConfig(BaseModel):
 
 ---
 
-*✅ Verified: 基于 sweagent/agent/agents.py:451、sweagent/agent/agents.py:968 等源码分析*
-*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-02-24*
+*✅ Verified: 基于 SWE-agent/sweagent/agent/agents.py:158、SWE-agent/sweagent/agent/agents.py:968 等源码分析*
+*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-02-25*

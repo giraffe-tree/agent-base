@@ -579,32 +579,20 @@ KimiSoul._turn()          [src/kimi_cli/soul/kimisoul.py:210]
 
 ### 6.3 与其他项目的对比
 
-```mermaid
-graph LR
-    subgraph "推理内容处理方式"
-        A[Kimi CLI<br/>ThinkPart 持久化] --> B[支持 D-Mail<br/>状态回滚]
-        C[Codex<br/>流式思考] --> D[实时展示<br/>不持久化]
-        E[Gemini CLI<br/>无专门结构] --> F[依赖 API<br/>原生支持]
-        G[SWE-agent<br/>无思考保留] --> H[专注执行<br/>不重推理]
-    end
-
-    style A fill:#90EE90
-    style B fill:#90EE90
-```
-
 | 项目 | 核心差异 | 适用场景 |
 |-----|---------|---------|
-| Kimi CLI | 完整的 ThinkPart 结构，支持加密签名和持久化 | 需要时间旅行、状态回滚的复杂任务 |
-| Codex | 流式处理思考内容，实时展示但不专门持久化 | 注重实时交互体验的场景 |
-| Gemini CLI | 依赖 Gemini API 原生思考支持，无专门封装 | 使用 Gemini 模型的标准场景 |
-| SWE-agent | 无专门的思考保留机制，专注工具执行 | 软件工程任务的自动化执行 |
-| OpenCode | 通过 resetTimeoutOnProgress 处理长思考 | 长运行任务的超时管理 |
+| **Kimi CLI** | 完整的 ThinkPart 结构，支持加密签名和持久化，与 D-Mail 时间旅行机制深度集成 | 需要时间旅行、状态回滚的复杂任务 |
+| **Codex** | 流式处理思考内容，实时展示但不专门持久化，侧重沙箱安全隔离 | 注重实时交互体验和安全性优先的场景 |
+| **Gemini CLI** | 依赖 Gemini API 原生思考支持，无专门封装结构，由底层模型提供 | 使用 Gemini 模型的标准场景 |
+| **SWE-agent** | 无专门的思考保留机制，专注工具执行和错误恢复 | 软件工程任务的自动化执行 |
+| **OpenCode** | 通过 resetTimeoutOnProgress 机制处理长思考，侧重超时管理 | 长运行任务的超时管理和流式响应场景 |
 
 **关键差异分析**：
 
-1. **Kimi CLI vs Codex**：Kimi CLI 将思考内容结构化持久化，Codex 更注重流式实时处理
-2. **Kimi CLI vs Gemini CLI**：Kimi CLI 提供跨模型的一致思考内容抽象，Gemini CLI 依赖特定 API 能力
-3. **Kimi CLI vs SWE-agent**：Kimi CLI 保留推理用于状态回滚，SWE-agent 通过 `forward_with_handling` 实现错误恢复
+1. **Kimi CLI vs Codex**：Kimi CLI 将思考内容结构化持久化以支持状态回滚，Codex 更注重流式实时处理和沙箱安全
+2. **Kimi CLI vs Gemini CLI**：Kimi CLI 提供跨模型的一致思考内容抽象，Gemini CLI 依赖特定 API 的原生能力
+3. **Kimi CLI vs SWE-agent**：Kimi CLI 保留推理用于状态回滚和 D-Mail 机制，SWE-agent 通过 `forward_with_handling` 实现错误恢复而不保留思考过程
+4. **Kimi CLI vs OpenCode**：Kimi CLI 关注推理内容的持久化和时间旅行，OpenCode 关注长思考过程中的超时管理
 
 ---
 
