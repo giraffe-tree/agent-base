@@ -33,3 +33,5 @@ env/
 build/
 dist/
 *.egg-info/
+
+reviews/

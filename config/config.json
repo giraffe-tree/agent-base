@@ -1,0 +1,41 @@
+{
+    "agents": {
+        "codex": {
+            "name": "codex",
+            "url": "https://github.com/openai/codex",
+            "branch": "main",
+            "path": "codex"
+        },
+        "gemini-cli": {
+            "name": "gemini-cli",
+            "url": "https://github.com/google-gemini/gemini-cli",
+            "branch": "main",
+            "path": "gemini-cli"
+        },
+        "kimi-cli": {
+            "name": "kimi-cli",
+            "url": "https://github.com/MoonshotAI/kimi-cli",
+            "branch": "main",
+            "path": "kimi-cli"
+        },
+        "opencode": {
+            "name": "opencode",
+            "url": "https://github.com/anomalyco/opencode",
+            "branch": "dev",
+            "path": "opencode"
+        },
+        "swe-agent": {
+            "name": "swe-agent",
+            "url": "https://github.com/SWE-agent/SWE-agent",
+            "branch": "main",
+            "path": "swe-agent"
+        },
+        "qwen-code": {
+            "name": "qwen-code",
+            "url": "https://github.com/QwenLM/qwen-code",
+            "branch": "main",
+            "path": "qwen-code"
+        }
+    }
+
+}
