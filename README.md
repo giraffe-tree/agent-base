@@ -139,13 +139,15 @@
 | `11` | Prompt Organization |
 | `12` | Logging |
 
+> **扩展内容**：`13` [ACP Integration](./docs/comm/13-comm-acp-integration.md) - 跨项目 ACP（Agent Connect Protocol）实现对比
+
 ---
 
 ## 文档地图（按目录）
 
 | 目录 | 主线文档 | Questions | 快速入口 |
 |:---|:---:|:---:|:---|
-| [comm](./docs/comm/) | 14 | 2 | [概览](./docs/comm/01-comm-overview.md) / [Agent Loop 对比](./docs/comm/04-comm-agent-loop.md) / [ACP 是什么](./docs/comm/comm-what-is-acp.md) / [Plan and Execute 对比](./docs/comm/comm-plan-and-execute.md) |
+| [comm](./docs/comm/) | 15 | 2 | [概览](./docs/comm/01-comm-overview.md) / [Agent Loop 对比](./docs/comm/04-comm-agent-loop.md) / [ACP 是什么](./docs/comm/comm-what-is-acp.md) / [ACP 跨项目对比](./docs/comm/13-comm-acp-integration.md) / [Plan and Execute 对比](./docs/comm/comm-plan-and-execute.md) |
 | [codex](./docs/codex/) | 13 | 8 | [概览](./docs/codex/01-codex-overview.md) / [Loop](./docs/codex/04-codex-agent-loop.md) / [Safety](./docs/codex/10-codex-safety-control.md) |
 | [gemini-cli](./docs/gemini-cli/) | 13 | 9 | [概览](./docs/gemini-cli/01-gemini-cli-overview.md) / [Loop](./docs/gemini-cli/04-gemini-cli-agent-loop.md) / [Memory](./docs/gemini-cli/07-gemini-cli-memory-context.md) |
 | [kimi-cli](./docs/kimi-cli/) | 16 | 12 | [入门](./docs/kimi-cli/00-kimi-cli-onboarding.md) / [概览](./docs/kimi-cli/01-kimi-cli-overview.md) / [Memory+Checkpoint](./docs/kimi-cli/07-kimi-cli-memory-context.md) |
@@ -171,6 +173,7 @@
 | Checkpoint 与回滚 | [Kimi 实现](./docs/kimi-cli/questions/kimi-cli-checkpoint-implementation.md) / [Kimi 权衡](./docs/kimi-cli/questions/kimi-cli-checkpoint-no-file-rollback-tradeoffs.md) / [OpenCode 实现](./docs/opencode/questions/opencode-checkpoint-implementation.md) / [SWE-agent 实现](./docs/swe-agent/questions/swe-agent-checkpoint-implementation.md) / [SWE-agent 权衡](./docs/swe-agent/questions/swe-agent-checkpoint-no-file-rollback-tradeoffs.md) / [Cursor 映射分析](./docs/cursor/questions/cursor-checkpoint-official-description-and-state-vscdb-mapping.md) |
 | Subagent / 多代理 | [Codex](./docs/codex/questions/codex-subagent-implementation.md) / [Gemini CLI](./docs/gemini-cli/questions/gemini-cli-subagent-implementation.md) / [Kimi CLI](./docs/kimi-cli/questions/kimi-cli-subagent-implementation.md) / [OpenCode](./docs/opencode/questions/opencode-subagent-implementation.md) / [SWE-agent](./docs/swe-agent/questions/swe-agent-subagent-implementation.md) / [Qwen Code](./docs/qwen-code/questions/qwen-code-subagent-implementation.md) |
 | Why keep reasoning | [Gemini CLI](./docs/gemini-cli/questions/gemini-cli-why-keep-reasoning.md) / [Kimi CLI](./docs/kimi-cli/questions/kimi-cli-why-keep-reasoning.md) / [OpenCode](./docs/opencode/questions/opencode-why-keep-reasoning.md) / [SWE-agent](./docs/swe-agent/questions/swe-agent-why-keep-reasoning.md) / [Claude](./docs/claude/questions/claude-message-context-retention.md) |
+| ACP 协议实现 | [跨项目 ACP 对比](./docs/comm/13-comm-acp-integration.md) / [什么是 ACP](./docs/comm/comm-what-is-acp.md) |
 
 ---
 
@@ -190,6 +193,7 @@
 4. [Memory 对比](./docs/comm/07-comm-memory-context.md)
 5. [Safety 对比](./docs/comm/10-comm-safety-control.md)
 6. [Plan & Execute 对比](./docs/comm/comm-plan-and-execute.md)
+7. [ACP Integration 对比](./docs/comm/13-comm-acp-integration.md)
 
 ### 路线 C：专题深入
 
