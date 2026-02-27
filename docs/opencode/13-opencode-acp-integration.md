@@ -4,7 +4,7 @@
 
 **OpenCode 实现了两套独立的 Agent 协作机制：内置多 Agent 系统（通过 `task` 工具以函数调用方式协作）和 ACP (Agent Client Protocol) 服务端模式（标准化协议暴露 Agent 能力），前者是内部架构设计，后者是对外服务协议。**
 
-OpenCode 的核心取舍：**函数调用式子 Agent 协作**（对比 Kimi CLI 的 ACP 协议子 Agent、Codex/Gemini CLI/SWE-agent 的单 Agent 架构）
+OpenCode 的核心取舍：**函数调用式子 Agent 协作 + ACP 服务端并存**（对比 Kimi/Qwen/Gemini 的 ACP 模式与 Codex/SWE-agent 的非 ACP 架构）
 
 ---
 
@@ -250,7 +250,7 @@ export const AcpCommand = cmd({
 
 #### ACP 能力支持
 
-✅ **Verified**: 代码依据 `opencode/packages/opencode/src/acp/README.md`
+✅ **Verified**: 代码依据 `opencode/packages/opencode/src/acp/agent.ts`
 
 | 能力 | 状态 | 说明 |
 |------|------|------|
@@ -260,9 +260,9 @@ export const AcpCommand = cmd({
 | `session/prompt` | ✅ | 处理用户消息 |
 | 文件操作 | ✅ | `readTextFile`, `writeTextFile` |
 | 权限请求 | ✅ | 自动批准（可配置） |
-| 流式响应 | ⚠️ | 当前返回完整响应，非流式 |
-| 工具调用报告 | ❌ | 尚未实现 |
-| 终端支持 | ❌ | 占位实现 |
+| 流式响应 | ✅ | 通过 `session/update` 发送 `agent_message_chunk` / `agent_thought_chunk` |
+| 工具调用报告 | ✅ | 支持 `tool_call` / `tool_call_update` / `plan` |
+| 终端支持 | ⚠️ | 支持 terminal-auth 元数据，终端能力仍依赖客户端实现 |
 
 ### 3.3 组件间协作时序
 
@@ -531,8 +531,8 @@ AcpCommand.handler()       [opencode/packages/opencode/src/cli/cmd/acp.ts:22]
 
 | 维度 | OpenCode 的选择 | 替代方案 | 取舍分析 |
 |-----|----------------|---------|---------|
-| 子 Agent 通信 | 函数调用（同进程） | ACP 协议（Kimi CLI） | 低延迟、简单，但仅限内部使用 |
-| 外部集成 | ACP Server 模式 | 无（Codex/Gemini） | 支持 IDE 集成，但需要额外协议实现 |
+| 子 Agent 通信 | 函数调用（同进程） | ACP 协议（Kimi/Qwen/Gemini） | 低延迟、简单，但仅限内部使用 |
+| 外部集成 | ACP Server 模式 | 无 ACP 模式（Codex/SWE-agent） | 支持 IDE 集成，但需要额外协议实现 |
 | Session 管理 | 父子 Session 关联 | 独立 Session（无关联） | 支持任务续接，但增加复杂度 |
 | 权限隔离 | PermissionNext 规则 | 沙箱隔离（Codex） | 灵活配置，但非强制隔离 |
 
@@ -549,7 +549,7 @@ AcpCommand.handler()       [opencode/packages/opencode/src/cli/cmd/acp.ts:22]
   - 两种模式复用同一执行引擎
 - 付出的代价：
   - 需要维护两套机制
-  - ACP 功能尚不完整（无流式响应）
+  - 协议能力仍有缺口（例如终端能力仍依赖客户端）
 
 ### 6.3 与其他项目的对比
 
@@ -560,26 +560,27 @@ flowchart LR
         OC3[ACP Server] --> OC4[JSON-RPC]
     end
 
-    subgraph Kimi["Kimi CLI"]
-        K1[子 Agent] --> K2[ACP 协议]
+    subgraph ACPAgents["Kimi/Qwen/Gemini"]
+        K1[ACP 模式] --> K2[JSON-RPC]
     end
 
-    subgraph Others["Codex/Gemini/SWE-agent"]
-        O1[单 Agent] --> O2[无协作]
+    subgraph Others["Codex/SWE-agent"]
+        O1[非 ACP] --> O2[本地协作或单 Agent]
     end
 
     style OpenCode fill:#e1f5e1
-    style Kimi fill:#fff3cd
+    style ACPAgents fill:#fff3cd
     style Others fill:#f8d7da
 ```
 
 | 项目 | 多 Agent 支持 | 实现方式 | ACP 支持 |
 |------|--------------|----------|----------|
 | **OpenCode** | ✅ 内置多 Agent | `task` 工具 + Session 父子关系 | ✅ ACP Server 模式 |
-| **Kimi CLI** | ✅ ACP 子 Agent | `kimi --acp` 启动服务端 | ✅ 完整 ACP 实现 |
-| **Codex** | ❌ 单 Agent | 无 | ❌ |
-| **Gemini CLI** | ❌ 单 Agent | 无 | ❌ |
-| **SWE-agent** | ❌ 单 Agent | 无 | ❌ |
+| **Kimi CLI** | ✅（ACP 会话） | ACP Server (`acp_main`) | ✅ |
+| **Qwen Code** | ✅（TaskTool + SubAgentTracker） | `--acp` / `runAcpAgent` | ✅ |
+| **Gemini CLI** | ✅（SubAgent + A2A） | `--experimental-acp` + zed integration | ✅（实验性 ACP） |
+| **Codex** | ⚠️（实验性进程内协作） | `multi_agent`/collab tools | ❌ |
+| **SWE-agent** | ❌ | 单 Agent 重试循环 | ❌ |
 
 ---
 

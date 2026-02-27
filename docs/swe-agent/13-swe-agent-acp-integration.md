@@ -2,7 +2,7 @@
 
 ## TL;DR（结论先行）
 
-**SWE-agent 不支持 ACP (Agent Communication Protocol)，采用严格的单 Agent 架构。** 代码库中不存在多 Agent 协作、子 Agent 创建、Agent 间通信或远程 Agent 调用的任何实现。`RetryAgent` 虽然包含"子 Agent"概念，但这只是同一 Agent 配置的多次实例化用于重试机制，而非真正的多 Agent 协作。
+**SWE-agent 不支持 ACP (Agent Client Protocol)，采用严格的单 Agent 架构。** 代码库中不存在多 Agent 协作、子 Agent 创建、Agent 间通信或远程 Agent 调用的任何实现。`RetryAgent` 虽然包含"子 Agent"概念，但这只是同一 Agent 配置的多次实例化用于重试机制，而非真正的多 Agent 协作。
 
 ---
 
@@ -10,7 +10,7 @@
 
 ### 1.1 ACP 的定义与价值
 
-ACP (Agent Communication Protocol) 解决的是"Agent 如何与其他 Agent 协作"以及"Agent 如何被外部系统调用"的问题：
+ACP (Agent Client Protocol) 主要解决的是"客户端（IDE/TUI）如何与 Agent 标准化通信"，也可为多 Agent 系统提供统一会话与能力协商接口：
 
 | 能力 | 说明 | 典型场景 |
 |-----|------|---------|
@@ -464,7 +464,7 @@ AGENT_CONFIG = {
 - 相关机制：`docs/swe-agent/05-swe-agent-tools-system.md`（工具系统对比 MCP）
 - ACP 概念介绍：`docs/comm/comm-what-is-acp.md`
 - 跨项目对比：
-  - `docs/kimi-cli/13-kimi-cli-acp-integration.md`（唯一支持 ACP 的项目）
+  - `docs/kimi-cli/13-kimi-cli-acp-integration.md`
   - `docs/codex/13-codex-acp-integration.md`
   - `docs/gemini-cli/13-gemini-cli-acp-integration.md`
   - `docs/opencode/13-opencode-acp-integration.md`

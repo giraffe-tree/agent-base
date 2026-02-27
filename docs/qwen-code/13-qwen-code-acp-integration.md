@@ -2,7 +2,7 @@
 
 ## TL;DR（结论先行）
 
-**一句话定义**：Qwen Code 实现了完整的 ACP (Agent Communication Protocol) 协议，通过 JSON-RPC 2.0 协议为 IDE 扩展（VSCode、Zed、JetBrains）提供标准化的 Agent 服务化能力，支持会话管理、流式状态更新、权限请求和子 Agent 任务分发。
+**一句话定义**：Qwen Code 实现了完整的 ACP (Agent Client Protocol) 协议，通过 JSON-RPC 2.0 协议为 IDE 扩展（VSCode、Zed、JetBrains）提供标准化的 Agent 服务化能力，支持会话管理、流式状态更新、权限请求和子 Agent 任务分发。
 
 **核心取舍**：**ACP 协议解耦 IDE 与 Agent 实现**（对比传统 CLI 交互方式），通过标准化 JSON-RPC 接口实现 IDE 与 Agent 的进程间通信，适合企业级 IDE 集成场景。
 
@@ -542,10 +542,10 @@ runAcpAgent()                  [gemini.tsx:196]
 | 项目 | ACP 支持 | 实现方式 | 多 Agent 支持 |
 |------|---------|---------|--------------|
 | **Qwen Code** | **是** | 完整的 JSON-RPC 2.0 ACP 协议 | 子 Agent 通过 TaskTool |
-| Kimi CLI | 是 | JSON-RPC ACP 协议 | 子 Agent 通过 ACP 创建 |
-| Codex | 否 | - | 单 Agent |
-| Gemini CLI | 否 | - | 单 Agent |
-| OpenCode | 否 | - | 内置多 Agent（Build/Plan/Explore），非 ACP |
+| Kimi CLI | 是 | JSON-RPC ACP 协议 | 会话内协作与工具事件流 |
+| Codex | 否 | - | 实验性进程内 sub-agent（collab） |
+| Gemini CLI | 是（实验性） | `--experimental-acp` + zed integration | SubAgent + A2A |
+| OpenCode | 是 | `opencode acp` + 内置多 Agent | Build/Plan/Explore + TaskTool |
 | SWE-agent | 否 | - | 单 Agent |
 
 ---

@@ -13,9 +13,9 @@
 
 ## TL;DR（结论先行）
 
-**一句话定义**：Gemini CLI 不实现 ACP（Agent Communication Protocol）协议，但实现了 SubAgent（子 Agent）机制和 A2A（Agent-to-Agent）远程 Agent 调用能力，采用「主 Agent 调度 + 本地/远程子 Agent 执行」的分层协作架构。
+**一句话定义**：Gemini CLI 实现了实验性 ACP（Agent Client Protocol）模式（`--experimental-acp`，主要用于 IDE 集成），并实现了 SubAgent（子 Agent）机制和 A2A（Agent-to-Agent）远程 Agent 调用能力，采用「主 Agent 调度 + 本地/远程子 Agent 执行」的分层协作架构。
 
-**核心取舍**：**SubAgent 工具化封装 + A2A 远程调用**（对比 Kimi CLI 的完整 ACP 协议实现、OpenCode 的内置多 Agent 无标准协议）
+**核心取舍**：**ACP(IDE) + SubAgent 工具化封装 + A2A 远程调用**
 
 ---
 
@@ -151,7 +151,7 @@ sequenceDiagram
 
 ### 3.1 ACP 模式（IDE 集成）
 
-**⚠️ Inferred**: Gemini CLI 中的 ACP 实现实际上是 **Agent Client Protocol** 的实验性支持，用于 IDE 集成（如 Zed 编辑器），而非通用的 ACP 协议。
+**✅ Verified**: Gemini CLI 中存在 **Agent Client Protocol** 的实验性实现（`--experimental-acp`），入口为 Zed 集成通道。
 
 ```typescript
 // gemini-cli/packages/cli/src/zed-integration/zedIntegration.ts:61
@@ -183,10 +183,10 @@ export async function runZedIntegration(
   - MCP Server 配置传递
   - 文件系统代理（readTextFile/writeTextFile）
 
-**与标准 ACP 的区别**：
-- 这是 Google 特有的 IDE 集成协议
-- 不是通用的 Agent-to-Agent 通信协议
-- 主要用于编辑器与 Gemini CLI 的集成
+**定位说明**：
+- ACP 模式主要用于 IDE 与 Gemini CLI 集成
+- A2A 是独立的 Agent-to-Agent 协议路径
+- ACP 与 A2A 是并行能力，不是互斥替代关系
 
 ### 3.2 SubAgent 本地执行机制
 
@@ -492,7 +492,7 @@ Main Agent
 | **Gemini CLI** | 是 | SubAgent + A2A + ACP(IDE) | 本地子 Agent + 远程 A2A 调用 | 需要本地专业化 + 远程扩展 |
 | **Kimi CLI** | 是 | ACP 协议 | 完整的 ACP 实现，支持子 Agent 创建 | 需要标准 ACP 互操作 |
 | **OpenCode** | 是 | 内置多 Agent | Build/Plan/Explore 内置 Agent，非标准协议 | 固定工作流场景 |
-| **Codex** | 否 | 单 Agent | 纯单 Agent 架构 | 简单任务，无需协作 |
+| **Codex** | ⚠️ 实验性 | 进程内 Collab/multi_agent | 进程内 sub-agent 协作，非 ACP | 本地并行协作 |
 | **SWE-agent** | 否 | 单 Agent | 纯单 Agent 架构 | 软件工程任务 |
 
 ---

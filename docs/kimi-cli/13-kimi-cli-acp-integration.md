@@ -2,9 +2,9 @@
 
 ## TL;DR（结论先行）
 
-Kimi CLI 是目前 5 个主流 AI Coding Agent 项目中唯一完整实现 ACP（Agent Communication Protocol）协议的项目，通过 ACP Server 模式将 Agent 能力服务化，支持外部系统调用、多 Agent 协作、MCP 配置桥接和流式状态传输。
+Kimi CLI 实现了 ACP（Agent Client Protocol）协议，通过 ACP Server 模式将 Agent 能力服务化，支持外部系统调用、多会话管理、MCP 配置桥接和流式状态传输。
 
-Kimi CLI 的核心取舍：**协议分层架构 + 能力协商机制**（对比其他项目无 ACP 支持）
+Kimi CLI 的核心取舍：**协议分层架构 + 能力协商机制**（对比 Codex/SWE-agent 等非 ACP 架构）
 
 ---
 
@@ -538,7 +538,7 @@ acp_main()                    [kimi-cli/src/kimi_cli/acp/__init__.py:1]
 
 | 维度 | Kimi CLI 的选择 | 替代方案 | 取舍分析 |
 |-----|----------------|---------|---------|
-| 协议实现 | 原生 ACP Server | 无 ACP 支持 | 支持服务化调用，但增加协议复杂度 |
+| 协议实现 | 原生 ACP Server | 非 ACP 实现 | 支持服务化调用，但增加协议复杂度 |
 | 会话管理 | 多会话 dict 管理 | 单会话 | 支持并发，但增加状态管理复杂度 |
 | 能力协商 | 运行时协商 + fallback | 固定能力假设 | 灵活适配不同客户端，但代码更复杂 |
 | 工具替换 | 动态替换 Shell -> Terminal | 固定工具集 | 支持远程终端，但需要维护两套工具 |
@@ -563,11 +563,12 @@ acp_main()                    [kimi-cli/src/kimi_cli/acp/__init__.py:1]
 
 | 项目 | ACP 支持 | 实现方式 | 多 Agent 协作 |
 |-----|---------|---------|--------------|
-| **Kimi CLI** | **✅ 完整支持** | 原生 ACP Server 实现 | ACP 协议 + 子 Agent |
-| Codex | ❌ 不支持 | 无 | 单 Agent |
-| Gemini CLI | ❌ 不支持 | 无 | 单 Agent |
-| OpenCode | ❌ 不支持 | 无 | 内置多 Agent（非 ACP）|
-| SWE-agent | ❌ 不支持 | 无 | 单 Agent |
+| **Kimi CLI** | **✅** | 原生 ACP Server 实现 | ACP 会话内协作能力 |
+| OpenCode | ✅ | `opencode acp` + 内置多 Agent | `task` 工具 + ACP 并存 |
+| Gemini CLI | ✅（实验性） | `--experimental-acp` + IDE 集成 | SubAgent + A2A |
+| Qwen Code | ✅ | `--acp` + acp-integration 模块 | TaskTool + SubAgentTracker |
+| Codex | ❌ | 无 ACP，实现进程内 collab | 实验性进程内 sub-agent |
+| SWE-agent | ❌ | 无 ACP | 单 Agent |
 
 ---
 
