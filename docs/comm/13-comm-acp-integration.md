@@ -115,10 +115,10 @@
 
 | 项目 | ACP 支持 | 实现状态 | 启动方式 | 协议版本 |
 |-----|---------|---------|---------|---------|
-| **Kimi CLI** | 完整实现 | 生产级 | `kimi --acp` | JSON-RPC 2.0 |
-| **Qwen Code** | 完整实现 | 生产级 | `qwen --acp` | JSON-RPC 2.0 |
+| **Kimi CLI** | 完整实现 | 已实现（`--acp` 已弃用） | `kimi acp` | JSON-RPC 2.0 |
+| **Qwen Code** | 完整实现 | 已实现 | `qwen --acp` | JSON-RPC 2.0 |
 | **Gemini CLI** | 实验性 | Beta | `--experimental-acp` | JSON-RPC 2.0 |
-| **OpenCode** | 完整实现 | 生产级 | `opencode acp` | JSON-RPC 2.0 |
+| **OpenCode** | 完整实现 | 已实现 | `opencode acp` | JSON-RPC 2.0 |
 | **Codex** | 不支持 | - | - | - |
 | **SWE-agent** | 不支持 | - | - | - |
 
@@ -126,7 +126,7 @@
 
 | 项目 | 多 Agent 支持 | 实现方式 | 通信机制 |
 |-----|--------------|---------|---------|
-| **Kimi CLI** | 会话内协作 | ACP 协议 | JSON-RPC |
+| **Kimi CLI** | ACP 会话级协作（外部编排） | ACP 协议 | JSON-RPC |
 | **Qwen Code** | TaskTool + SubAgentTracker | 内置工具 | 事件发射器 |
 | **Gemini CLI** | SubAgent + A2A | 工具化封装 | 函数调用/A2A |
 | **OpenCode** | 内置多 Agent | `task` 工具 | 函数调用 |
@@ -378,24 +378,24 @@
 
 | 方法 | Kimi CLI | Qwen Code | Gemini CLI | OpenCode |
 |-----|----------|-----------|------------|----------|
-| `initialize` |  |  |  |  |
-| `session/new` |  |  |  |  |
-| `session/load` |  |  |  |  |
-| `session/prompt` |  |  |  |  |
-| `session/cancel` |  |  |  |  |
-| `session/update` (流式) |  |  |  |  |
-| `request_permission` |  |  |  |  |
-| `fs/read_text_file` |  |  |  |  |
-| `fs/write_text_file` |  |  |  |  |
+| `initialize` | ✅ | ✅ | ✅ | ✅ |
+| `session/new` | ✅ | ✅ | ✅ | ✅ |
+| `session/load` | ✅ | ✅ | ✅ | ✅ |
+| `session/prompt` | ✅ | ✅ | ✅ | ✅ |
+| `session/cancel` | ✅ | ✅ | ✅ | ✅ |
+| `session/update` (流式) | ✅ | ✅ | ✅ | ✅ |
+| `request_permission` | ✅ | ✅ | ✅ | ✅ |
+| `fs/read_text_file` | ✅（能力协商后） | ✅ | ✅（依赖客户端能力） | ⚠️ 未见调用路径 |
+| `fs/write_text_file` | ✅（能力协商后） | ✅ | ✅（依赖客户端能力） | ✅ |
 
 ### 4.2 子 Agent 创建方式对比
 
 | 项目 | 创建方式 | 代码示例 | 特点 |
 |-----|---------|---------|------|
-| **Kimi CLI** | ACP 协议创建 | `ACPServer.new_session()` | 独立进程，完整隔离 |
+| **Kimi CLI** | ACP 会话创建（非子进程） | `ACPServer.new_session()` | 同一 ACP Server 进程内多会话，逻辑隔离 |
 | **Qwen Code** | TaskTool 内部 | `TaskTool` + `SubAgentTracker` | 事件跟踪，层级展示 |
 | **Gemini CLI** | 工具化封装 | `delegate_to_X` 工具 | 统一工具接口 |
-| **OpenCode** | 函数调用 | `TaskTool.execute()` | 同进程，Session 父子关联 |
+| **OpenCode** | 函数调用 | `TaskTool` + `Session.create()` | 同进程，Session 父子关联 |
 | **Codex** | 线程创建 | `spawn_agent()` | 共享内存，低延迟 |
 | **SWE-agent** | 不支持 | - | - |
 
@@ -435,7 +435,7 @@ async newSessionConfig(cwd: string, mcpServers: acp.McpServer[]): Promise<Config
 | 维度 | Kimi/Qwen | Gemini/OpenCode | Codex | SWE-agent |
 |-----|-----------|-----------------|-------|-----------|
 | **协议标准** | ACP 完整实现 | ACP + 内置双轨 | 内部实现 | 无 |
-| **进程模型** | 多进程/服务化 | 混合 | 单进程多线程 | 单进程 |
+| **进程模型** | 单进程多会话（服务端模式） | 单进程为主（本地子会话 + ACP 对外） | 单进程多线程 | 单进程 |
 | **通信方式** | JSON-RPC | JSON-RPC/函数调用 | 共享内存 | - |
 | **部署模式** | 服务化 | 混合 | 本地 CLI | 本地 CLI |
 | **适用场景** | IDE 集成/企业 | IDE + 本地协作 | 本地并行 | 学术研究 |
