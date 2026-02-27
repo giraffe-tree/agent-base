@@ -59,6 +59,7 @@
   - [Safety Control](docs/gemini-cli/10-gemini-cli-safety-control.md)
   - [Prompt 组织](docs/gemini-cli/11-gemini-cli-prompt-organization.md)
   - [日志记录机制](docs/gemini-cli/12-gemini-cli-logging.md)
+  - [ACP / 多 Agent 协作](docs/gemini-cli/13-gemini-cli-acp-integration.md)
   - **Questions**
     - [并发 Tool 调用](docs/gemini-cli/questions/gemini-cli-tool-call-concurrency.md)
     - [用户编辑冲突回退](docs/gemini-cli/questions/gemini-cli-revert-user-edit-conflict.md)
@@ -138,6 +139,7 @@
   - [Safety Control](docs/swe-agent/10-swe-agent-safety-control.md)
   - [Prompt 组织](docs/swe-agent/11-swe-agent-prompt-organization.md)
   - [日志记录机制](docs/swe-agent/12-swe-agent-logging.md)
+  - [ACP / 多 Agent 协作](docs/swe-agent/13-swe-agent-acp-integration.md)
   - **Questions**
     - [并发 Tool 调用](docs/swe-agent/questions/swe-agent-tool-call-concurrency.md)
     - [Checkpoint 实现](docs/swe-agent/questions/swe-agent-checkpoint-implementation.md)
