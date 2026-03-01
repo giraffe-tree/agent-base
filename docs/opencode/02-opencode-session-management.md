@@ -39,7 +39,7 @@ OpenCode 的核心取舍：**SQLite 关系型存储 + 消息-部件分离架构*
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
-│ ACP Layer (Agent Communication Protocol)                    │
+│ ACP Layer (Agent Client Protocol)                           │
 │ packages/opencode/src/acp/session.ts                        │
 │ - ACPSessionManager: 对外暴露 Session 服务                   │
 └─────────────────────────┬───────────────────────────────────┘

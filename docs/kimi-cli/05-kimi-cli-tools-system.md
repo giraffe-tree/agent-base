@@ -262,7 +262,7 @@ flowchart TD
 
 #### 职责定位
 
-ACP (Agent Communication Protocol) 是 Kimi CLI 的 MCP 集成层，负责将 ACP MCP Server 配置转换为内部 MCPConfig，支持多种传输方式。
+ACP (Agent Client Protocol) 是 Kimi CLI 的 MCP 集成层，负责将 ACP MCP Server 配置转换为内部 MCPConfig，支持多种传输方式。
 
 #### 架构位置
 

@@ -2,7 +2,7 @@
 
 ## TL;DR（结论先行）
 
-一句话定义：Kimi CLI 的 MCP 集成采用"**ACP 协议桥接 + fastmcp 执行引擎**"的设计，通过 ACP (Agent Connect Protocol) 获取 MCP 服务器配置并转换为标准 MCP 配置，由 `fastmcp` 库负责实际的工具调用执行。
+一句话定义：Kimi CLI 的 MCP 集成采用"**ACP 协议桥接 + fastmcp 执行引擎**"的设计，通过 ACP (Agent Client Protocol) 获取 MCP 服务器配置并转换为标准 MCP 配置，由 `fastmcp` 库负责实际的工具调用执行。
 
 Kimi CLI 的核心取舍：**协议层桥接 + 第三方库执行**（对比 Codex 的原生 Rust 实现、Gemini CLI 的自研 McpClient、OpenCode 的 AI SDK 原生集成）
 

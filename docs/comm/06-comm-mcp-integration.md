@@ -278,7 +278,7 @@ MCP (2)          → 外部 MCP Server 提供的工具
 
 #### Kimi CLI：通过 ACP 层集成 MCP
 
-Kimi CLI 将 MCP 包装在 ACP（Agent Communication Protocol）层之下，对外暴露的是 ACP 接口而不是直接的 MCP 接口。
+Kimi CLI 将 MCP 包装在 ACP（Agent Client Protocol）层之下，对外暴露的是 ACP 接口而不是直接的 MCP 接口。
 
 **配置转换层**（`kimi-cli/src/kimi_cli/tools/dmail/mcp_adapter.py:1`）：
 ```python

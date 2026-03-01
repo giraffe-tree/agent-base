@@ -413,6 +413,8 @@ flowchart TD
 
 ### 5.1 核心数据结构
 
+#### 5.1.1 ACPServer 内部数据结构
+
 ```python
 # kimi-cli/src/kimi_cli/acp/server.py:27-31
 class ACPServer:
@@ -430,7 +432,94 @@ class ACPServer:
 | `conn` | `acp.Client \| None` | ACP 连接对象，用于发送响应 |
 | `sessions` | `dict[str, tuple[ACPSession, _ModelIDConv]]` | 会话映射表，支持多会话管理 |
 
+#### 5.1.2 ACPSession 内部数据结构
+
+```python
+# kimi-cli/src/kimi_cli/acp/session.py:71-112
+class _ToolCallState:
+    """Manages the state of a single tool call for streaming updates."""
+    def __init__(self, tool_call: ToolCall):
+        self.tool_call = tool_call
+        self.args = tool_call.function.arguments or ""
+        self.lexer = streamingjson.Lexer()
+
+    @property
+    def acp_tool_call_id(self) -> str:
+        # 复合 ID 避免冲突: {turn_id}/{tool_call_id}
+        turn_id = _current_turn_id.get()
+        assert turn_id is not None
+        return f"{turn_id}/{self.tool_call.id}"
+
+    def append_args_part(self, args_part: str) -> None:
+        """Append a new arguments part to the accumulated args and lexer."""
+        self.args += args_part
+        self.lexer.append_string(args_part)
+
+    def get_title(self) -> str:
+        """Get the current title with subtitle if available."""
+        tool_name = self.tool_call.function.name
+        subtitle = extract_key_argument(self.lexer, tool_name)
+        if subtitle:
+            return f"{tool_name}: {subtitle}"
+        return tool_name
+
+
+class _TurnState:
+    def __init__(self):
+        self.id = str(uuid.uuid4())
+        """Unique ID for the turn."""
+        self.tool_calls: dict[str, _ToolCallState] = {}
+        """Map of tool call ID (LLM-side ID) to tool call state."""
+        self.last_tool_call: _ToolCallState | None = None
+        self.cancel_event = asyncio.Event()
+```
+
+**关键设计说明**：
+
+| 设计点 | 说明 |
+|-------|------|
+| `_ToolCallState.acp_tool_call_id` | 使用 `{turn_id}/{tool_call_id}` 复合 ID 避免不同 turn 间工具调用 ID 冲突 |
+| `streamingjson.Lexer` | 用于实时解析流式 JSON 参数，提取关键参数显示在标题中 |
+| `_TurnState.cancel_event` | asyncio.Event 用于异步取消信号传递 |
+
+#### 5.1.3 ACPKaos 能力协商机制
+
+```python
+# kimi-cli/src/kimi_cli/acp/kaos.py:144-168
+class ACPKaos:
+    def __init__(
+        self,
+        client: acp.Client,
+        session_id: str,
+        client_capabilities: acp.schema.ClientCapabilities | None,
+        fallback: Kaos | None = None,
+        *,
+        output_byte_limit: int | None = _DEFAULT_TERMINAL_OUTPUT_LIMIT,
+        poll_interval: float = _DEFAULT_POLL_INTERVAL,
+    ) -> None:
+        self._client = client
+        self._session_id = session_id
+        self._fallback = fallback or local_kaos
+        fs = client_capabilities.fs if client_capabilities else None
+        self._supports_read = bool(fs and fs.read_text_file)
+        self._supports_write = bool(fs and fs.write_text_file)
+        self._supports_terminal = bool(client_capabilities and client_capabilities.terminal)
+        self._output_byte_limit = output_byte_limit
+        self._poll_interval = poll_interval
+```
+
+**能力协商逻辑**：
+
+| 操作 | ACP 支持时 | ACP 不支持时 | 代码位置 |
+|-----|-----------|-------------|---------|
+| `read_text` | 通过 ACP 读取远程文件 | fallback 到 local_kaos | `kaos.py:198-209` |
+| `write_text` | 通过 ACP 写入远程文件 | fallback 到 local_kaos | `kaos.py:225-258` |
+| `exec` | 通过 ACP Terminal 执行 | fallback 到 local_kaos | `kaos.py:265-266` |
+| 其他文件操作 | 总是 fallback 到 local_kaos | local_kaos | - |
+
 ### 5.2 MCP 配置桥接实现
+
+#### 5.2.1 桥接函数实现
 
 ```python
 # kimi-cli/src/kimi_cli/acp/mcp.py:13-46
@@ -471,10 +560,20 @@ def _convert_acp_mcp_server(server: MCPServer) -> dict[str, Any]:
             }
 ```
 
-**代码要点**：
-1. **类型安全转换**：使用 Python 3.10+ match-case 进行类型分发
-2. **统一配置格式**：转换为内部 MCPConfig，与现有 MCP 系统无缝集成
-3. **错误处理**：ValidationError 转换为 MCPConfigError，提供清晰错误信息
+#### 5.2.2 转换映射表
+
+| ACP 类型 | 字段映射 | 内部格式 |
+|---------|---------|---------|
+| `HttpMcpServer` | `url` → `url`<br>`headers[]` → `headers{}` | `{"url": ..., "transport": "http", "headers": {...}}` |
+| `SseMcpServer` | `url` → `url`<br>`headers[]` → `headers{}` | `{"url": ..., "transport": "sse", "headers": {...}}` |
+| `McpServerStdio` | `command` → `command`<br>`args[]` → `args`<br>`env[]` → `env{}` | `{"command": ..., "args": [...], "env": {...}, "transport": "stdio"}` |
+
+#### 5.2.3 代码要点
+
+1. **类型安全转换**：使用 Python 3.10+ match-case 进行类型分发，利用 `acp.schema` 的类型定义
+2. **统一配置格式**：转换为内部 `MCPConfig`，与现有 MCP 系统无缝集成
+3. **错误处理**：`ValidationError` 转换为 `MCPConfigError`，提供清晰错误信息
+4. **调用时机**：在 `ACPServer.new_session()` 和 `ACPServer.load_session()` 中调用，将会话级别的 MCP 配置注入到 KimiCLI 实例
 
 ### 5.3 权限审批实现
 
@@ -511,7 +610,127 @@ async def _handle_approval_request(self, request: ApprovalRequest):
             request.resolve("reject")
 ```
 
-### 5.4 关键调用链
+### 5.4 流式响应实现细节
+
+ACPSession 通过 `_send_*` 系列方法将 Agent Loop 的内部消息转换为 ACP 协议的 `session_update` 通知。
+
+#### 5.4.1 思考内容流式发送
+
+```python
+# kimi-cli/src/kimi_cli/acp/session.py:216-227
+async def _send_thinking(self, think: str):
+    """Send thinking content to client."""
+    if not self._id or not self._conn:
+        return
+
+    await self._conn.session_update(
+        self._id,
+        acp.schema.AgentThoughtChunk(
+            content=acp.schema.TextContentBlock(type="text", text=think),
+            session_update="agent_thought_chunk",
+        ),
+    )
+```
+
+#### 5.4.2 消息内容流式发送
+
+```python
+# kimi-cli/src/kimi_cli/acp/session.py:229-240
+async def _send_text(self, text: str):
+    """Send text chunk to client."""
+    if not self._id or not self._conn:
+        return
+
+    await self._conn.session_update(
+        session_id=self._id,
+        update=acp.schema.AgentMessageChunk(
+            content=acp.schema.TextContentBlock(type="text", text=text),
+            session_update="agent_message_chunk",
+        ),
+    )
+```
+
+#### 5.4.3 工具调用流式发送
+
+```python
+# kimi-cli/src/kimi_cli/acp/session.py:242-268
+async def _send_tool_call(self, tool_call: ToolCall):
+    """Send tool call to client."""
+    assert self._turn_state is not None
+    if not self._id or not self._conn:
+        return
+
+    # Create and store tool call state
+    state = _ToolCallState(tool_call)
+    self._turn_state.tool_calls[tool_call.id] = state
+    self._turn_state.last_tool_call = state
+
+    await self._conn.session_update(
+        session_id=self._id,
+        update=acp.schema.ToolCallStart(
+            session_update="tool_call",
+            tool_call_id=state.acp_tool_call_id,
+            title=state.get_title(),
+            status="in_progress",
+            content=[
+                acp.schema.ContentToolCallContent(
+                    type="content",
+                    content=acp.schema.TextContentBlock(type="text", text=state.args),
+                )
+            ],
+        ),
+    )
+```
+
+#### 5.4.4 工具调用参数流式更新
+
+```python
+# kimi-cli/src/kimi_cli/acp/session.py:270-301
+async def _send_tool_call_part(self, part: ToolCallPart):
+    """Send tool call part (streaming arguments)."""
+    assert self._turn_state is not None
+    if (
+        not self._id
+        or not self._conn
+        or not part.arguments_part
+        or self._turn_state.last_tool_call is None
+    ):
+        return
+
+    # Append new arguments part to the last tool call
+    self._turn_state.last_tool_call.append_args_part(part.arguments_part)
+
+    # Update the tool call with new content and title
+    update = acp.schema.ToolCallProgress(
+        session_update="tool_call_update",
+        tool_call_id=self._turn_state.last_tool_call.acp_tool_call_id,
+        title=self._turn_state.last_tool_call.get_title(),
+        status="in_progress",
+        content=[
+            acp.schema.ContentToolCallContent(
+                type="content",
+                content=acp.schema.TextContentBlock(
+                    type="text", text=self._turn_state.last_tool_call.args
+                ),
+            )
+        ],
+    )
+
+    await self._conn.session_update(session_id=self._id, update=update)
+```
+
+#### 5.4.5 流式响应类型映射
+
+| Agent Loop 消息类型 | ACP 更新类型 | 发送方法 |
+|-------------------|-------------|---------|
+| `ThinkPart` | `AgentThoughtChunk` | `_send_thinking()` |
+| `TextPart` | `AgentMessageChunk` | `_send_text()` |
+| `ToolCall` | `ToolCallStart` | `_send_tool_call()` |
+| `ToolCallPart` | `ToolCallProgress` | `_send_tool_call_part()` |
+| `ToolResult` | `ToolCallProgress` (status=completed/failed) | `_send_tool_result()` |
+| `TodoDisplayBlock` | `AgentPlanUpdate` | `_send_plan_update()` |
+
+### 5.5 关键调用链
 
 ```text
 acp_main()                    [kimi-cli/src/kimi_cli/acp/__init__.py:1]

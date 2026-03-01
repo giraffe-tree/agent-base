@@ -139,7 +139,7 @@
 | `11` | Prompt Organization |
 | `12` | Logging |
 
-> **扩展内容**：`13` [ACP Integration](./docs/comm/13-comm-acp-integration.md) - 跨项目 ACP（Agent Connect Protocol）实现对比
+> **扩展内容**：`13` [ACP Integration](./docs/comm/13-comm-acp-integration.md) - 跨项目 ACP（Agent Client Protocol）实现对比
 
 ---
 

@@ -32,6 +32,83 @@
 | 能力协商 | 客户端不支持的功能无法优雅降级 |
 | 流式状态传输 | 用户无法实时看到 Agent 执行进度 |
 
+### 1.3 ACP 协议概述
+
+#### 1.3.1 ACP 协议定义
+
+**ACP (Agent Client Protocol)** 是一种基于 JSON-RPC 2.0 的协议，用于标准化 Agent 与外部系统（IDE、其他 Agent）之间的通信。
+
+https://agentclientprotocol.com/get-started/introduction
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                    ACP 协议栈架构                             │
+├─────────────────────────────────────────────────────────────┤
+│  应用层：Agent 能力声明、会话管理、流式状态传输                   │
+├─────────────────────────────────────────────────────────────┤
+│  协议层：JSON-RPC 2.0（方法调用 + 通知）                       │
+├─────────────────────────────────────────────────────────────┤
+│  传输层：stdio（标准输入输出）                                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**与 MCP 的关系**：
+- MCP 解决"Agent 如何调用工具"
+- ACP 解决"Agent 如何被外部调用"以及"Agent 之间如何协作"
+
+#### 1.3.2 核心协议方法
+
+| 方法 | 方向 | 说明 |
+|-----|------|------|
+| `initialize` | Client → Server | 协议握手，交换能力信息 |
+| `session/new` | Client → Server | 创建新会话 |
+| `session/load` | Client → Server | 加载已有会话 |
+| `session/prompt` | Client → Server | 发送用户请求 |
+| `session/cancel` | Client → Server | 取消当前操作 |
+| `session/update` | Server → Client | 流式状态推送（通知） |
+| `request_permission` | Server → Client | 请求权限审批 |
+| `fs/read_text_file` | Server → Client | 读取远程文件（能力协商后） |
+| `fs/write_text_file` | Server → Client | 写入远程文件（能力协商后） |
+
+#### 1.3.3 ACP 与 MCP 关系详解
+
+```text
+┌─────────────────────────────────────────────────────────────────────┐
+│                        ACP 与 MCP 协作架构                            │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│   ┌──────────────┐         ACP 协议          ┌──────────────┐      │
+│   │              │  (JSON-RPC over stdio)    │              │      │
+│   │   ACP Client │◄────────────────────────►│  ACP Server  │      │
+│   │   (IDE/Agent)│    任务 + MCP 配置        │  (Kimi CLI)  │      │
+│   │              │◄────────────────────────►│              │      │
+│   └──────────────┘   结果 + 流式状态        └──────┬───────┘      │
+│                                                    │               │
+│                                                    │ MCP 协议       │
+│                                                    ▼               │
+│                                           ┌──────────────┐        │
+│                                           │  MCP Server  │        │
+│                                           │  (外部工具)   │        │
+│                                           └──────────────┘        │
+│                                                                     │
+│   关键洞察：                                                         │
+│   • ACP Client 通过 ACP 协议将 MCP Server 配置传递给 ACP Server     │
+│   • ACP Server 使用 MCP 协议调用实际工具                            │
+│   • ACP 是"Agent 服务化"协议，MCP 是"工具服务化"协议                │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**对比表格**：
+
+| 维度 | MCP | ACP |
+|------|-----|-----|
+| **解决什么问题** | Agent 如何调用工具 | Agent 如何被调用 / Agent 之间如何协作 |
+| **谁是服务端** | Tool Server（提供工具的进程） | Agent Server（提供 Agent 能力的进程） |
+| **谁是客户端** | Agent（使用工具） | 另一个 Agent / IDE / 外部系统 |
+| **通信内容** | 工具定义 + 工具调用 + 工具结果 | 任务描述 + 配置（含 MCP Server）+ 执行状态 |
+| **类比** | 程序员使用 IDE 的各种功能 | 项目经理给程序员派任务 |
+
 ---
 
 ## 2. 整体架构对比
@@ -166,11 +243,15 @@
 
 **✅ Verified**: 代码依据 `kimi-cli/src/kimi_cli/acp/server.py:27`
 
+**核心组件索引**：
+
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
 | `ACPServer` | 多会话管理、协议握手、模型切换 | `kimi-cli/src/kimi_cli/acp/server.py:27` |
 | `ACPSession` | 单会话处理、流式响应、权限审批 | `kimi-cli/src/kimi_cli/acp/session.py:115` |
 | `ACPKaos` | 远程文件操作、能力协商、fallback | `kimi-cli/src/kimi_cli/acp/kaos.py:144` |
+
+> 📚 **详细实现分析**：参见 [Kimi CLI ACP 集成实现](docs/kimi-cli/13-kimi-cli-acp-integration.md) 获取完整的数据结构、时序图和代码细节。
 
 #### Qwen Code：模块化事件架构
 
@@ -370,6 +451,194 @@
 
 **✅ Verified**: 代码依据 `sweagent/agent/agents.py:257`
 
+### 3.3 ACP 核心数据结构
+
+本节详细说明 ACP 协议中使用的核心数据结构，基于 `acp` SDK 的 schema 定义。
+
+#### 3.3.1 能力协商数据结构
+
+**客户端能力声明**：
+
+```python
+# acp.schema.ClientCapabilities
+class ClientCapabilities:
+    fs: FileSystemCapabilities | None      # 文件系统能力
+    terminal: TerminalCapabilities | None  # 终端能力
+    # 其他扩展能力...
+
+class FileSystemCapabilities:
+    read_text_file: bool   # 支持通过 ACP 读取远程文件
+    write_text_file: bool  # 支持通过 ACP 写入远程文件
+
+class TerminalCapabilities:
+    # 终端能力存在即表示支持
+    pass
+```
+
+**Agent 能力声明**：
+
+```python
+# acp.schema.AgentCapabilities (Kimi CLI 实现)
+class AgentCapabilities:
+    load_session: bool                    # 支持加载已有会话
+    prompt_capabilities: PromptCapabilities
+    mcp_capabilities: McpCapabilities
+    session_capabilities: SessionCapabilities
+
+class PromptCapabilities:
+    embedded_context: bool  # 支持嵌入式上下文
+    image: bool             # 支持图片输入
+    audio: bool             # 支持音频输入
+
+class McpCapabilities:
+    http: bool   # 支持 HTTP MCP Server
+    sse: bool    # 支持 SSE MCP Server
+```
+
+#### 3.3.2 会话管理数据结构
+
+**创建会话请求/响应**：
+
+```python
+# 请求
+class NewSessionRequest:
+    cwd: str                    # 工作目录
+    mcp_servers: list[MCPServer]  # MCP Server 配置列表
+
+# 响应
+class NewSessionResponse:
+    session_id: str             # 会话唯一标识
+    modes: SessionModeState     # 可用模式
+    models: SessionModelState   # 可用模型
+```
+
+**MCP Server 配置类型**（联合类型）：
+
+```python
+MCPServer = HttpMcpServer | SseMcpServer | McpServerStdio
+
+class HttpMcpServer:
+    name: str
+    url: str
+    headers: list[Header]  # Header: {name, value}
+
+class SseMcpServer:
+    name: str
+    url: str
+    headers: list[Header]
+
+class McpServerStdio:
+    name: str
+    command: str
+    args: list[str]
+    env: list[EnvItem]     # EnvItem: {name, value}
+```
+
+#### 3.3.3 内容块数据结构
+
+**ACP 输入内容块**（联合类型）：
+
+```python
+ACPContentBlock = TextContentBlock | ImageContentBlock | AudioContentBlock | ResourceContentBlock | EmbeddedResourceContentBlock
+
+class TextContentBlock:
+    type: "text"
+    text: str
+
+class ImageContentBlock:
+    type: "image"
+    mime_type: str
+    data: str  # base64 编码
+
+class AudioContentBlock:
+    type: "audio"
+    mime_type: str
+    data: str  # base64 编码
+```
+
+#### 3.3.4 流式更新数据结构
+
+**SessionUpdate 联合类型**：
+
+```python
+SessionUpdate = AgentThoughtChunk | AgentMessageChunk | ToolCallStart | ToolCallProgress | AgentPlanUpdate | AvailableCommandsUpdate
+```
+
+**Agent 思考/消息块**：
+
+```python
+class AgentThoughtChunk:
+    session_update: "agent_thought_chunk"
+    content: TextContentBlock
+
+class AgentMessageChunk:
+    session_update: "agent_message_chunk"
+    content: TextContentBlock
+```
+
+**工具调用状态更新**：
+
+```python
+class ToolCallStart:
+    session_update: "tool_call"
+    tool_call_id: str
+    title: str
+    status: "in_progress"
+    content: list[ToolCallContent]
+
+class ToolCallProgress:
+    session_update: "tool_call_update"
+    tool_call_id: str
+    title: str | None
+    status: "in_progress" | "completed" | "failed"
+    content: list[ToolCallContent] | None
+```
+
+**ToolCallContent 联合类型**：
+
+```python
+ToolCallContent = ContentToolCallContent | FileEditToolCallContent | TerminalToolCallContent
+
+class ContentToolCallContent:
+    type: "content"
+    content: TextContentBlock
+
+class FileEditToolCallContent:
+    type: "diff"
+    path: str
+    old_text: str
+    new_text: str
+
+class TerminalToolCallContent:
+    type: "terminal"
+    terminal_id: str
+```
+
+#### 3.3.5 权限审批数据结构
+
+```python
+class PermissionRequest:
+    options: list[PermissionOption]
+    session_id: str
+    tool_call_update: ToolCallUpdate
+
+class PermissionOption:
+    option_id: str           # "approve", "approve_for_session", "reject"
+    name: str                # 显示名称
+    kind: PermissionKind     # "allow_once", "allow_always", "reject_once"
+
+PermissionKind = "allow_once" | "allow_always" | "reject_once"
+
+class PermissionResponse:
+    outcome: AllowedOutcome | CancelledOutcome
+
+class AllowedOutcome:
+    option_id: str
+
+class CancelledOutcome:
+    pass  # 用户取消审批
+```
+
 ---
 
 ## 4. 关键实现对比
@@ -402,6 +671,9 @@
 ### 4.3 MCP 配置桥接对比
 
 **Kimi CLI**：
+
+Kimi CLI 通过 `acp_mcp_servers_to_mcp_config` 函数将 ACP 协议传来的 MCP Server 配置转换为内部格式，支持三种传输类型（HTTP、SSE、STDIO）。
+
 ```python
 # kimi-cli/src/kimi_cli/acp/mcp.py:13-46
 def acp_mcp_servers_to_mcp_config(mcp_servers: list[MCPServer]) -> MCPConfig:
@@ -414,6 +686,8 @@ def acp_mcp_servers_to_mcp_config(mcp_servers: list[MCPServer]) -> MCPConfig:
         case acp.schema.McpServerStdio():
             return {"transport": "stdio", ...}
 ```
+
+> 📚 **完整代码分析**：参见 [Kimi CLI MCP 配置桥接实现](docs/kimi-cli/13-kimi-cli-acp-integration.md#52-mcp-配置桥接实现) 获取 match-case 转换逻辑的详细说明。
 
 **Qwen Code**：
 ```typescript

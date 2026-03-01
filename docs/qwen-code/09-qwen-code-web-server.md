@@ -2,7 +2,7 @@
 
 ## TL;DR（结论先行）
 
-一句话定义：Qwen Code **没有独立的 Web Server 实现**，而是通过 **ACP（Agent Communication Protocol）模式** 基于 stdio 流提供结构化通信能力，作为 IDE 插件和外部集成的替代方案。
+一句话定义：Qwen Code **没有独立的 Web Server 实现**，而是通过 **ACP（Agent Client Protocol）模式** 基于 stdio 流提供结构化通信能力，作为 IDE 插件和外部集成的替代方案。
 
 Qwen Code 的核心取舍：**ACP stdio 模式**（对比 Gemini CLI 的 A2A HTTP Server、OpenCode 的 REST/WebSocket、Codex 的内嵌 Web Server）
 

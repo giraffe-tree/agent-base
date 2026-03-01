@@ -2,7 +2,7 @@
 
 ## 一句话结论
 
-**ACP（Agent Connect Protocol / Agent Communication Protocol）是一种让 Agent 之间互相通信、协作的协议。** 如果说 MCP 解决的是"Agent 如何调用外部工具"，那么 ACP 解决的是"Agent 如何与其他 Agent 协作"以及"Agent 如何被外部系统调用"。
+**ACP（Agent Client Protocol）是一种让 Agent 之间互相通信、协作的协议。** 如果说 MCP 解决的是"Agent 如何调用外部工具"，那么 ACP 解决的是"Agent 如何与其他 Agent 协作"以及"Agent 如何被外部系统调用"。
 
 ---
 
