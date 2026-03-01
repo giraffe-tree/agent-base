@@ -35,3 +35,5 @@ dist/
 *.egg-info/
 
 reviews/
+
+.idea/
