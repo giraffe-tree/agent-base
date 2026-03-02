@@ -46,6 +46,7 @@
     - [Plan and Execute 模式](docs/codex/questions/codex-plan-and-execute.md)
     - [Skill 执行超时](docs/codex/questions/codex-skill-execution-timeout.md)
     - [Subagent 实现](docs/codex/questions/codex-subagent-implementation.md)
+    - [防止 Tool 无限循环](docs/codex/questions/codex-infinite-loop-prevention.md)
 
 - **Gemini CLI**
   - [概览](docs/gemini-cli/01-gemini-cli-overview.md)
@@ -66,11 +67,11 @@
     - [并发 Tool 调用](docs/gemini-cli/questions/gemini-cli-tool-call-concurrency.md)
     - [用户编辑冲突回退](docs/gemini-cli/questions/gemini-cli-revert-user-edit-conflict.md)
     - [工具调用错误处理](docs/gemini-cli/questions/gemini-cli-tool-error-handling.md)
-    - [防止 Tool 无限循环](docs/gemini-cli/questions/gemini-cli-infinite-loop-prevention.md)
     - [上下文压缩机制](docs/gemini-cli/questions/gemini-cli-context-compaction.md)
     - [Plan and Execute 模式](docs/gemini-cli/questions/gemini-cli-plan-and-execute.md)
     - [Subagent 实现](docs/gemini-cli/questions/gemini-cli-subagent-implementation.md)
     - [为什么保留 reasoning](docs/gemini-cli/questions/gemini-cli-why-keep-reasoning.md)
+    - [防止 Tool 无限循环](docs/gemini-cli/questions/gemini-cli-infinite-loop-prevention.md)
 
 - **Kimi CLI**
   - [新手开发者入门](docs/kimi-cli/00-kimi-cli-onboarding.md)
@@ -128,6 +129,7 @@
     - [Skill 执行超时](docs/opencode/questions/opencode-skill-execution-timeout.md)
     - [Subagent 实现](docs/opencode/questions/opencode-subagent-implementation.md)
     - [为什么保留 reasoning](docs/opencode/questions/opencode-why-keep-reasoning.md)
+    - [防止 Tool 无限循环](docs/opencode/questions/opencode-infinite-loop-prevention.md)
 
 - **SWE-agent**
   - [概览](docs/swe-agent/01-swe-agent-overview.md)
