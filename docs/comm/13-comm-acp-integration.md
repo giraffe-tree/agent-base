@@ -122,45 +122,51 @@ https://agentclientprotocol.com/get-started/introduction
 │                                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────────────────────┐   │
 │  │  完整 ACP Server 实现                                                            │   │
-│  │  ┌──────────────┐    ┌──────────────┐                                           │   │
-│  │  │  Kimi CLI    │    │  Qwen Code   │                                           │   │
-│  │  │  ─────────   │    │  ─────────   │                                           │   │
-│  │  │  ACPServer   │    │  GeminiAgent │                                           │   │
-│  │  │  ACPSession  │    │  Session     │                                           │   │
-│  │  │  ACPKaos     │    │  SubAgentTracker                                        │   │
-│  │  └──────────────┘    └──────────────┘                                           │   │
-│  │         │                   │                                                   │   │
-│  │         └───────────────────┘                                                   │   │
-│  │                    │                                                            │   │
-│  │                    ▼                                                            │   │
-│  │         JSON-RPC over stdio (ACP 协议)                                          │   │
-│  │                    │                                                            │   │
-│  │         ┌──────────┴──────────┐                                                 │   │
-│  │         ▼                     ▼                                                 │   │
-│  │    ┌─────────┐           ┌─────────┐                                            │   │
-│  │    │  IDE    │           │ 父 Agent │                                           │   │
-│  │    │(VSCode) │           │(ACP调用) │                                           │   │
-│  │    └─────────┘           └─────────┘                                            │   │
+│  │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                       │   │
+│  │  │  Kimi CLI    │    │  Qwen Code   │    │  OpenCode    │                       │   │
+│  │  │  ─────────   │    │  ─────────   │    │  ─────────   │                       │   │
+│  │  │  ACPServer   │    │  AgentSide   │    │  ACP Agent   │                       │   │
+│  │  │  ACPSession  │    │  Connection  │    │  ACPSession  │                       │   │
+│  │  │  ACPKaos     │    │  GeminiAgent │    │  Manager     │                       │   │
+│  │  │              │    │  Session     │    │              │                       │   │
+│  │  │              │    │  SubAgent    │    │              │                       │   │
+│  │  │              │    │  Tracker     │    │              │                       │   │
+│  │  └──────────────┘    └──────────────┘    └──────────────┘                       │   │
+│  │         │                   │                   │                               │   │
+│  │         └───────────────────┴───────────────────┘                               │   │
+│  │                              │                                                  │   │
+│  │                              ▼                                                  │   │
+│  │                   JSON-RPC over stdio (ACP 协议)                                │   │
+│  │                              │                                                  │   │
+│  │         ┌────────────────────┼────────────────────┐                             │   │
+│  │         ▼                    ▼                    ▼                             │   │
+│  │    ┌─────────┐         ┌─────────┐          ┌─────────┐                         │   │
+│  │    │  IDE    │         │ 父 Agent │          │  IDE    │                         │   │
+│  │    │(VSCode) │         │(ACP调用) │          │(VSCode) │                         │   │
+│  │    └─────────┘         └─────────┘          └─────────┘                         │   │
 │  └─────────────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────────────────────┐   │
 │  │  ACP + 内置多 Agent 双轨                                                         │   │
 │  │  ┌────────────────────────┐    ┌────────────────────────┐                       │   │
-│  │  │    Gemini CLI          │    │    OpenCode            │                       │   │
-│  │  │    ─────────           │    │    ─────────           │                       │   │
+│  │  │    Gemini CLI          │    │                        │                       │   │
+│  │  │    ─────────           │    │                        │                       │   │
 │  │  │                        │    │                        │                       │   │
-│  │  │  ┌──────────────────┐  │    │  ┌──────────────────┐  │                       │   │
-│  │  │  │ ACP (实验性)     │  │    │  │ ACP Server       │  │                       │   │
-│  │  │  │ --experimental-  │  │    │  │ opencode acp     │  │                       │   │
-│  │  │  │   acp            │  │    │  │                  │  │                       │   │
-│  │  │  └──────────────────┘  │    │  └──────────────────┘  │                       │   │
+│  │  │  ┌──────────────────┐  │    │                        │                       │   │
+│  │  │  │ ACP (实验性)     │  │    │                        │                       │   │
+│  │  │  │ --experimental-  │  │    │                        │                       │   │
+│  │  │  │   acp            │  │    │                        │                       │   │
+│  │  │  │ AgentSide        │  │    │                        │                       │   │
+│  │  │  │ Connection       │  │    │                        │                       │   │
+│  │  │  └──────────────────┘  │    │                        │                       │   │
 │  │  │                        │    │                        │                       │   │
-│  │  │  ┌──────────────────┐  │    │  ┌──────────────────┐  │                       │   │
-│  │  │  │ SubAgent + A2A   │  │    │  │ task 工具        │  │                       │   │
-│  │  │  │ LocalAgentExecutor│  │    │  │ 内置 Agent 类型  │  │                       │   │
-│  │  │  │ RemoteAgent      │  │    │  │ build/plan/      │  │                       │   │
-│  │  │  │   Invocation     │  │    │  │ explore          │  │                       │   │
-│  │  │  └──────────────────┘  │    │  └──────────────────┘  │                       │   │
+│  │  │  ┌──────────────────┐  │    │                        │                       │   │
+│  │  │  │ SubAgent + A2A   │  │    │                        │                       │   │
+│  │  │  │ LocalAgent       │  │    │                        │                       │   │
+│  │  │  │ Executor         │  │    │                        │                       │   │
+│  │  │  │ RemoteAgent      │  │    │                        │                       │   │
+│  │  │  │ Invocation       │  │    │                        │                       │   │
+│  │  │  └──────────────────┘  │    │                        │                       │   │
 │  │  └────────────────────────┘    └────────────────────────┘                       │   │
 │  └─────────────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                         │
@@ -192,9 +198,9 @@ https://agentclientprotocol.com/get-started/introduction
 
 | 项目 | ACP 支持 | 实现状态 | 启动方式 | 协议版本 |
 |-----|---------|---------|---------|---------|
-| **Kimi CLI** | 完整实现 | 已实现（`--acp` 已弃用） | `kimi acp` | JSON-RPC 2.0 |
-| **Qwen Code** | 完整实现 | 已实现 | `qwen --acp` | JSON-RPC 2.0 |
-| **Gemini CLI** | 实验性 | Beta | `--experimental-acp` | JSON-RPC 2.0 |
+| **Kimi CLI** | 完整实现 | 已实现 | `kimi acp` (子命令) | JSON-RPC 2.0 |
+| **Qwen Code** | 完整实现 | 已实现 | `qwen --acp` / `--experimental-acp` | JSON-RPC 2.0 |
+| **Gemini CLI** | 实验性 | Beta | `--experimental-acp` + zed integration | JSON-RPC 2.0 |
 | **OpenCode** | 完整实现 | 已实现 | `opencode acp` | JSON-RPC 2.0 |
 | **Codex** | 不支持 | - | - | - |
 | **SWE-agent** | 不支持 | - | - | - |
@@ -203,10 +209,10 @@ https://agentclientprotocol.com/get-started/introduction
 
 | 项目 | 多 Agent 支持 | 实现方式 | 通信机制 |
 |-----|--------------|---------|---------|
-| **Kimi CLI** | ACP 会话级协作（外部编排） | ACP 协议 | JSON-RPC |
+| **Kimi CLI** | 会话内协作与工具事件流 | ACP 协议 | JSON-RPC |
 | **Qwen Code** | TaskTool + SubAgentTracker | 内置工具 | 事件发射器 |
 | **Gemini CLI** | SubAgent + A2A | 工具化封装 | 函数调用/A2A |
-| **OpenCode** | 内置多 Agent | `task` 工具 | 函数调用 |
+| **OpenCode** | 内置多 Agent | `task` 工具 + Session 父子关联 | 函数调用 |
 | **Codex** | 实验性进程内 | `multi_agent` flag | 共享内存 |
 | **SWE-agent** | 不支持 | RetryAgent 仅为重试 | - |
 
@@ -250,8 +256,10 @@ https://agentclientprotocol.com/get-started/introduction
 | `ACPServer` | 多会话管理、协议握手、模型切换 | `kimi-cli/src/kimi_cli/acp/server.py:27` |
 | `ACPSession` | 单会话处理、流式响应、权限审批 | `kimi-cli/src/kimi_cli/acp/session.py:115` |
 | `ACPKaos` | 远程文件操作、能力协商、fallback | `kimi-cli/src/kimi_cli/acp/kaos.py:144` |
+| `acp_main` | ACP Server 入口点 | `kimi-cli/src/kimi_cli/acp/__init__.py:1` |
+| `replace_tools` | 本地 Shell 工具替换为 ACP Terminal | `kimi-cli/src/kimi_cli/acp/tools.py:18` |
 
-> 📚 **详细实现分析**：参见 [Kimi CLI ACP 集成实现](docs/kimi-cli/13-kimi-cli-acp-integration.md) 获取完整的数据结构、时序图和代码细节。
+> 📚 **详细实现分析**：参见 [Kimi CLI ACP 集成实现](../kimi-cli/13-kimi-cli-acp-integration.md) 获取完整的数据结构、时序图和代码细节。
 
 #### Qwen Code：模块化事件架构
 
@@ -268,6 +276,7 @@ https://agentclientprotocol.com/get-started/introduction
 │  ┌───────────────────────▼─────────────────────────────┐   │
 │  │ GeminiAgent (acpAgent.ts)                           │   │
 │  │ - 多会话生命周期管理                                  │   │
+│  │ - MCP 配置集成                                       │   │
 │  └───────────────────────┬─────────────────────────────┘   │
 │                          │                                  │
 │  ┌───────────────────────▼─────────────────────────────┐   │
@@ -291,7 +300,10 @@ https://agentclientprotocol.com/get-started/introduction
 |-----|------|---------|
 | `AgentSideConnection` | JSON-RPC 协议处理，消息路由 | `qwen-code/packages/cli/src/acp-integration/acp.ts:207` |
 | `GeminiAgent` | 多会话管理、认证、配置集成 | `qwen-code/packages/cli/src/acp-integration/acpAgent.ts:1` |
+| `Session` | 会话处理、工具调用、流式更新 | `qwen-code/packages/cli/src/acp-integration/session/Session.ts:1` |
 | `SubAgentTracker` | 子 Agent 事件跟踪 | `qwen-code/packages/cli/src/acp-integration/session/SubAgentTracker.ts:1` |
+
+> 📚 **详细实现分析**：参见 [Qwen Code ACP 集成实现](../qwen-code/13-qwen-code-acp-integration.md) 获取完整的数据结构、时序图和代码细节。
 
 #### OpenCode：双轨架构
 
@@ -331,9 +343,11 @@ https://agentclientprotocol.com/get-started/introduction
 
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
-| `Agent.Info` | 定义 Agent 类型、权限配置 | `opencode/packages/opencode/src/agent/agent.ts:24` |
-| `TaskTool` | 子 Agent 调用入口 | `opencode/packages/opencode/src/tool/task.ts:27` |
-| `ACP Agent` | ACP 协议实现 | `opencode/packages/opencode/src/acp/agent.ts:52` |
+| `Agent.Info` | 定义 Agent 类型（build/plan/explore 等）、权限配置 | `opencode/packages/opencode/src/agent/agent.ts:24` |
+| `TaskTool` | 子 Agent 调用入口，创建子 Session 执行子任务 | `opencode/packages/opencode/src/tool/task.ts:27` |
+| `ACP Agent` | ACP 协议实现，处理初始化、会话管理、prompt 处理 | `opencode/packages/opencode/src/acp/agent.ts:52` |
+| `ACPSessionManager` | ACP 会话状态管理，映射到内部 Session | `opencode/packages/opencode/src/acp/session.ts:8` |
+| `AcpCommand` | CLI 入口 `opencode acp`，启动 ACP 服务端模式 | `opencode/packages/opencode/src/cli/cmd/acp.ts:12` |
 
 #### Gemini CLI：三层工具 + ACP 实验性
 
@@ -347,6 +361,7 @@ https://agentclientprotocol.com/get-started/introduction
 │  │ --experimental-acp                                  │   │
 │  │ ┌─────────────┐    ┌─────────────┐                 │   │
 │  │ │AgentSideConnection│ │GeminiAgent  │                 │   │
+│  │ │(zedIntegration.ts)│ │(zedIntegration.ts)│            │   │
 │  │ └─────────────┘    └─────────────┘                 │   │
 │  └─────────────────────────────────────────────────────┘   │
 │                          │                                  │
@@ -376,7 +391,9 @@ https://agentclientprotocol.com/get-started/introduction
 | `AgentRegistry` | Agent 发现、加载、注册 | `gemini-cli/packages/core/src/agents/registry.ts:39` |
 | `SubagentTool` | SubAgent 工具定义 | `gemini-cli/packages/core/src/agents/subagent-tool.ts:24` |
 | `LocalAgentExecutor` | 本地子 Agent 执行器 | `gemini-cli/packages/core/src/agents/local-executor.ts:75` |
+| `RemoteAgentInvocation` | 远程 Agent 调用（A2A 协议） | `gemini-cli/packages/core/src/agents/remote-invocation.ts:69` |
 | `A2AClientManager` | A2A 客户端管理 | `gemini-cli/packages/core/src/agents/a2a-client-manager.ts:45` |
+| `GeminiAgent` | ACP 模式下的 Agent 服务端实现 | `gemini-cli/packages/cli/src/zed-integration/zedIntegration.ts:83` |
 
 ### 3.2 非 ACP 架构对比
 
@@ -418,6 +435,9 @@ https://agentclientprotocol.com/get-started/introduction
 | `MultiAgentHandler` | 处理多 Agent 工具调用 | `codex/codex-rs/core/src/tools/handlers/multi_agents.rs:40` |
 | `AgentControl` | 子 Agent 生命周期管理 | `codex/codex-rs/core/src/agent/control.rs:37` |
 | `Guards` | 限制并发子 Agent 数量和嵌套深度 | `codex/codex-rs/core/src/agent/guards.rs:21` |
+| `Feature::Collab` | 功能开关，控制 multi_agent 启用 | `codex/codex-rs/core/src/features.rs:573-582` |
+
+> 📚 **详细实现分析**：参见 [Codex ACP 与多 Agent 协作机制](../codex/13-codex-acp-integration.md) 获取完整的数据结构、时序图和代码细节。
 
 #### SWE-agent：严格单 Agent
 
@@ -450,6 +470,15 @@ https://agentclientprotocol.com/get-started/introduction
 ```
 
 **✅ Verified**: 代码依据 `sweagent/agent/agents.py:257`
+
+| 组件 | 职责 | 代码位置 |
+|-----|------|---------|
+| `DefaultAgent` | 单 Agent 执行核心 | `sweagent/agent/agents.py:443` |
+| `RetryAgent` | 重试包装器，顺序实例化 | `sweagent/agent/agents.py:257` |
+| `AbstractAgent` | Agent 抽象基类 | `sweagent/agent/agents.py:224` |
+| `ShellAgent` | 人机交互模式 | `sweagent/agent/extra/shell_agent.py:13` |
+
+> 📚 **详细实现分析**：参见 [SWE-agent ACP 与多 Agent 协作机制](../swe-agent/13-swe-agent-acp-integration.md) 获取完整的架构分析和代码细节。
 
 ### 3.3 ACP 核心数据结构
 
@@ -654,15 +683,15 @@ class CancelledOutcome:
 | `session/cancel` | ✅ | ✅ | ✅ | ✅ |
 | `session/update` (流式) | ✅ | ✅ | ✅ | ✅ |
 | `request_permission` | ✅ | ✅ | ✅ | ✅ |
-| `fs/read_text_file` | ✅（能力协商后） | ✅ | ✅（依赖客户端能力） | ⚠️ 未见调用路径 |
+| `fs/read_text_file` | ✅（能力协商后） | ✅ | ✅（依赖客户端能力） | ✅ |
 | `fs/write_text_file` | ✅（能力协商后） | ✅ | ✅（依赖客户端能力） | ✅ |
 
 ### 4.2 子 Agent 创建方式对比
 
 | 项目 | 创建方式 | 代码示例 | 特点 |
 |-----|---------|---------|------|
-| **Kimi CLI** | ACP 会话创建（非子进程） | `ACPServer.new_session()` | 同一 ACP Server 进程内多会话，逻辑隔离 |
-| **Qwen Code** | TaskTool 内部 | `TaskTool` + `SubAgentTracker` | 事件跟踪，层级展示 |
+| **Kimi CLI** | ACP 会话内协作 | `ACPServer.new_session()` | 同一 ACP Server 进程内多会话，逻辑隔离 |
+| **Qwen Code** | TaskTool + SubAgentTracker | `TaskTool` + `SubAgentTracker` | 事件跟踪，层级展示 |
 | **Gemini CLI** | 工具化封装 | `delegate_to_X` 工具 | 统一工具接口 |
 | **OpenCode** | 函数调用 | `TaskTool` + `Session.create()` | 同进程，Session 父子关联 |
 | **Codex** | 线程创建 | `spawn_agent()` | 共享内存，低延迟 |
@@ -687,17 +716,44 @@ def acp_mcp_servers_to_mcp_config(mcp_servers: list[MCPServer]) -> MCPConfig:
             return {"transport": "stdio", ...}
 ```
 
-> 📚 **完整代码分析**：参见 [Kimi CLI MCP 配置桥接实现](docs/kimi-cli/13-kimi-cli-acp-integration.md#52-mcp-配置桥接实现) 获取 match-case 转换逻辑的详细说明。
+> 📚 **完整代码分析**：参见 [Kimi CLI MCP 配置桥接实现](../kimi-cli/13-kimi-cli-acp-integration.md#52-mcp-配置桥接实现) 获取 match-case 转换逻辑的详细说明。
 
 **Qwen Code**：
+
+Qwen Code 在 `newSessionConfig` 方法中合并全局 MCP 配置和会话级 MCP 配置，支持通过 ACP 协议动态传入 MCP Server 配置。
+
 ```typescript
-// qwen-code/packages/cli/src/acp-integration/acpAgent.ts
+// qwen-code/packages/cli/src/acp-integration/acpAgent.ts:273-289
 async newSessionConfig(cwd: string, mcpServers: acp.McpServer[]): Promise<Config> {
   const mergedMcpServers = { ...this.settings.merged.mcpServers };
+
   for (const { command, args, env: rawEnv, name } of mcpServers) {
+    const env: Record<string, string> = {};
+    for (const { name: envName, value } of rawEnv) {
+      env[envName] = value;
+    }
     mergedMcpServers[name] = new MCPServerConfig(command, args, env, cwd);
   }
+  // ...
 }
+```
+
+**Gemini CLI**：
+
+Gemini CLI 在 ACP 会话创建时通过 `newSession` 方法接收 MCP Server 配置，并合并到会话配置中。
+
+```typescript
+// gemini-cli/packages/cli/src/zed-integration/zedIntegration.ts
+// ACP 模式下通过 session/new 接收 MCP 配置
+```
+
+**OpenCode**：
+
+OpenCode 在 ACP 会话创建时接收 MCP Server 配置，并通过内部配置系统初始化 MCP 连接。
+
+```typescript
+// opencode/packages/opencode/src/acp/agent.ts
+// ACP 初始化时传入 MCP 配置，通过内部 Config 系统管理
 ```
 
 ---
@@ -828,27 +884,40 @@ flowchart LR
 | **Kimi CLI** | ACPSession | `kimi-cli/src/kimi_cli/acp/session.py` | 115 |
 | **Kimi CLI** | ACPKaos | `kimi-cli/src/kimi_cli/acp/kaos.py` | 144 |
 | **Kimi CLI** | MCP 配置桥接 | `kimi-cli/src/kimi_cli/acp/mcp.py` | 13 |
+| **Kimi CLI** | ACP 入口 | `kimi-cli/src/kimi_cli/acp/__init__.py` | 1 |
 | **Qwen Code** | AgentSideConnection | `qwen-code/packages/cli/src/acp-integration/acp.ts` | 207 |
 | **Qwen Code** | GeminiAgent | `qwen-code/packages/cli/src/acp-integration/acpAgent.ts` | 1 |
 | **Qwen Code** | Session | `qwen-code/packages/cli/src/acp-integration/session/Session.ts` | 1 |
 | **Qwen Code** | SubAgentTracker | `qwen-code/packages/cli/src/acp-integration/session/SubAgentTracker.ts` | 1 |
+| **Qwen Code** | ACP 配置入口 | `qwen-code/packages/cli/src/config/config.ts` | 180 |
 | **Gemini CLI** | ACP 入口 | `gemini-cli/packages/cli/src/zed-integration/zedIntegration.ts` | 61 |
+| **Gemini CLI** | GeminiAgent (ACP) | `gemini-cli/packages/cli/src/zed-integration/zedIntegration.ts` | 83 |
 | **Gemini CLI** | AgentRegistry | `gemini-cli/packages/core/src/agents/registry.ts` | 39 |
+| **Gemini CLI** | SubagentTool | `gemini-cli/packages/core/src/agents/subagent-tool.ts` | 24 |
 | **Gemini CLI** | LocalAgentExecutor | `gemini-cli/packages/core/src/agents/local-executor.ts` | 75 |
+| **Gemini CLI** | RemoteAgentInvocation | `gemini-cli/packages/core/src/agents/remote-invocation.ts` | 69 |
+| **Gemini CLI** | A2AClientManager | `gemini-cli/packages/core/src/agents/a2a-client-manager.ts` | 45 |
 | **OpenCode** | Agent 定义 | `opencode/packages/opencode/src/agent/agent.ts` | 24 |
 | **OpenCode** | TaskTool | `opencode/packages/opencode/src/tool/task.ts` | 27 |
 | **OpenCode** | ACP Agent | `opencode/packages/opencode/src/acp/agent.ts` | 52 |
+| **OpenCode** | ACPSessionManager | `opencode/packages/opencode/src/acp/session.ts` | 8 |
+| **OpenCode** | ACP CLI 入口 | `opencode/packages/opencode/src/cli/cmd/acp.ts` | 12 |
+| **OpenCode** | SessionPrompt | `opencode/packages/opencode/src/session/prompt.ts` | 311 |
 
 ### 6.2 非 ACP 多 Agent 代码位置
 
 | 项目 | 功能 | 文件 | 行号 |
 |-----|------|------|------|
 | **Codex** | MultiAgentHandler | `codex/codex-rs/core/src/tools/handlers/multi_agents.rs` | 40 |
+| **Codex** | spawn_agent 处理 | `codex/codex-rs/core/src/tools/handlers/multi_agents.rs` | 114 |
 | **Codex** | AgentControl | `codex/codex-rs/core/src/agent/control.rs` | 37 |
+| **Codex** | spawn_agent 方法 | `codex/codex-rs/core/src/agent/control.rs` | 55 |
 | **Codex** | Guards | `codex/codex-rs/core/src/agent/guards.rs` | 21 |
-| **Codex** | Feature::Collab | `codex/codex-rs/core/src/features.rs` | 573 |
+| **Codex** | Feature::Collab | `codex/codex-rs/core/src/features.rs` | 573-582 |
 | **SWE-agent** | DefaultAgent | `sweagent/agent/agents.py` | 443 |
 | **SWE-agent** | RetryAgent | `sweagent/agent/agents.py` | 257 |
+| **SWE-agent** | Agent 抽象基类 | `sweagent/agent/agents.py` | 224 |
+| **SWE-agent** | ShellAgent | `sweagent/agent/extra/shell_agent.py` | 13 |
 
 ---
 
@@ -867,4 +936,4 @@ flowchart LR
 ---
 
 *✅ Verified: 基于各项目源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-28*
+*基于版本：2026-02-08 | 最后更新：2026-03-02*
