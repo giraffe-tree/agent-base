@@ -6,6 +6,10 @@
 
 Codex 的核心取舍：**中心化连接管理 + 统一命名空间 + 原生集成**（对比 Kimi CLI 的插件化 MCP、OpenCode 的独立 MCP 进程）
 
+**新增功能（2026-03）**：
+- **插件系统**：通过 `[plugins.<name>]` 配置启用插件，插件可贡献 `skills/` 目录和 `.mcp.json` 配置的 MCP 服务器
+- **OAuth Resource 支持**：为 Streamable HTTP 传输的 MCP 服务器配置 OAuth Resource 参数（RFC 8707）
+
 ---
 
 ## 1. 为什么需要这个机制？（解决什么问题）
@@ -77,6 +81,8 @@ Codex 的核心取舍：**中心化连接管理 + 统一命名空间 + 原生集
 | `handle_mcp_tool_call` | 执行具体 MCP 工具调用逻辑 | `mcp_tool_call.rs:285` |
 | `qualify_tools` | 工具命名空间处理 | `mcp_connection_manager.rs:181` |
 | `AsyncManagedClient` | rmcp SDK 客户端包装 | `mcp_connection_manager.rs:226` |
+| **`PluginsManager`** | **插件管理，整合插件贡献的 MCP 服务器** | **`plugins.rs:73`** |
+| **`McpManager`** | **MCP 服务器配置管理（含插件来源）** | **`mcp/mod.rs:165`** |
 
 ### 2.3 核心组件交互关系
 
@@ -345,6 +351,56 @@ flowchart TD
     style R4 fill:#FFD700
 ```
 
+### 3.5 插件系统集成（新增）
+
+#### 架构定位
+
+插件系统是 Codex 的扩展机制，允许第三方通过声明式配置贡献技能和 MCP 服务器，而无需修改核心代码。
+
+#### 插件目录结构
+
+```text
+plugin-root/
+├── .codex-plugin/
+│   └── plugin.json          # 插件清单（名称、版本）
+├── skills/                  # 可选：技能目录
+│   └── search/
+│       └── SKILL.md
+└── .mcp.json               # 可选：MCP 服务器配置
+```
+
+#### 插件加载流程
+
+```mermaid
+flowchart TD
+    A[config.toml] --> B[解析 [plugins.name] 配置]
+    B --> C{插件功能是否启用?}
+    C -->|否| D[返回空结果]
+    C -->|是| E[加载插件清单]
+    E --> F[读取 .mcp.json]
+    F --> G[归一化 MCP 配置]
+    G --> H[合并到 effective_servers]
+
+    style C fill:#e1f5e1
+```
+
+#### 配置优先级规则
+
+**核心原则：用户配置优先于插件配置**
+
+```rust
+// mcp/mod.rs:193-196
+for (name, plugin_server) in loaded_plugins.effective_mcp_servers() {
+    servers.entry(name).or_insert(plugin_server);  // 仅当用户未配置时才插入
+}
+```
+
+| 配置来源 | 优先级 | 说明 |
+|---------|-------|------|
+| 用户 codex.yaml | 最高 | 显式配置的 mcp_servers |
+| Codex Apps MCP | 中 | connectors_enabled 时自动添加 |
+| 插件 .mcp.json | 低 | 仅当名称未被占用时生效 |
+
 ---
 
 ## 4. 端到端数据流转
@@ -443,7 +499,7 @@ flowchart LR
 ### 5.1 核心数据结构
 
 ```rust
-// codex-rs/core/src/config/types.rs:128-155
+// codex-rs/core/src/config/types.rs:88-106
 pub struct McpServerConfig {
     #[serde(flatten)]
     pub transport: McpServerTransportConfig,
@@ -453,6 +509,9 @@ pub struct McpServerConfig {
     pub tool_timeout_sec: Option<Duration>,
     pub enabled_tools: Option<Vec<String>>,
     pub disabled_tools: Option<Vec<String>>,
+    pub scopes: Option<Vec<String>>,
+    /// Optional OAuth resource parameter (RFC 8707)
+    pub oauth_resource: Option<String>,
 }
 
 pub enum McpServerTransportConfig {
@@ -469,6 +528,8 @@ pub enum McpServerTransportConfig {
 | `enabled_tools` | `Option<Vec<String>>` | 允许列表（白名单） |
 | `disabled_tools` | `Option<Vec<String>>` | 禁止列表（黑名单） |
 | `tool_timeout_sec` | `Option<Duration>` | 工具调用超时 |
+| `scopes` | `Option<Vec<String>>` | OAuth 授权范围 |
+| `oauth_resource` | `Option<String>` | **OAuth Resource 参数（RFC 8707）** |
 
 ### 5.2 主链路代码
 
@@ -534,6 +595,125 @@ dispatch_tool_call()          [tools/router.rs:372]
       -> ResponseInputItem::McpToolCallOutput
 ```
 
+### 5.4 插件系统实现
+
+```rust
+// codex-rs/core/src/plugins.rs:73-131
+pub struct PluginsManager {
+    cache_by_cwd: RwLock<HashMap<PathBuf, PluginLoadOutcome>>,
+}
+
+impl PluginsManager {
+    pub fn plugins_for_config(&self, config: &Config) -> PluginLoadOutcome {
+        self.plugins_for_layer_stack(&config.cwd, &config.config_layer_stack, false)
+    }
+
+    pub fn plugins_for_layer_stack(
+        &self,
+        cwd: &Path,
+        config_layer_stack: &ConfigLayerStack,
+        force_reload: bool,
+    ) -> PluginLoadOutcome {
+        // 检查插件功能是否启用
+        if !plugins_feature_enabled_from_stack(config_layer_stack) {
+            return PluginLoadOutcome::default();
+        }
+
+        // 缓存检查
+        if !force_reload && let Some(outcome) = self.cached_outcome_for_cwd(cwd) {
+            return outcome;
+        }
+
+        // 从配置层加载插件
+        let outcome = load_plugins_from_layer_stack(config_layer_stack);
+        // 缓存结果...
+        outcome
+    }
+}
+
+// PluginLoadOutcome 提供有效贡献
+impl PluginLoadOutcome {
+    pub fn effective_mcp_servers(&self) -> HashMap<String, McpServerConfig> {
+        let mut mcp_servers = HashMap::new();
+        for plugin in self.plugins.iter().filter(|p| p.is_active()) {
+            for (name, config) in &plugin.mcp_servers {
+                mcp_servers.entry(name.clone()).or_insert_with(|| config.clone());
+            }
+        }
+        mcp_servers
+    }
+}
+```
+
+### 5.5 OAuth Resource 支持
+
+```rust
+// codex-rs/rmcp-client/src/perform_oauth_login.rs:43-73
+pub async fn perform_oauth_login(
+    server_name: &str,
+    server_url: &str,
+    store_mode: OAuthCredentialsStoreMode,
+    http_headers: Option<HashMap<String, String>>,
+    env_http_headers: Option<HashMap<String, String>>,
+    scopes: &[String],
+    oauth_resource: Option<&str>,  // RFC 8707 resource parameter
+    callback_port: Option<u16>,
+    callback_url: Option<&str>,
+) -> Result<()> {
+    // ... OAuth 流程初始化 ...
+
+    // 构建授权 URL，附加 resource 参数
+    let auth_url = append_query_param(
+        &oauth_state.get_authorization_url().await?,
+        "resource",
+        oauth_resource,  // 如: "https://api.example.com"
+    );
+
+    // ... 继续 OAuth 流程 ...
+}
+```
+
+**设计意图**：OAuth Resource 参数（RFC 8707）允许客户端指定要访问的资源，授权服务器可以据此返回针对性的访问令牌。这对于支持多租户的 MCP 服务器尤为重要。
+
+### 5.6 配置示例
+
+#### 插件配置（config.toml）
+
+```toml
+[features]
+plugins = true  # 启用插件功能
+
+[plugins.my-plugin]
+path = "/path/to/plugin"
+enabled = true
+```
+
+#### 插件 .mcp.json 示例
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "type": "http",
+      "url": "https://api.github.com/mcp",
+      "oauth": {
+        "clientId": "github-client-id"
+      }
+    }
+  }
+}
+```
+
+#### OAuth Resource 配置
+
+```toml
+[mcp_servers.enterprise-api]
+type = "http"
+url = "https://api.enterprise.com/mcp"
+oauth_resource = "https://api.enterprise.com/resource"  # RFC 8707
+scopes = ["read", "write"]
+```
+
 ---
 
 ## 6. 设计意图与 Trade-off
@@ -567,10 +747,16 @@ dispatch_tool_call()          [tools/router.rs:372]
 
 | 项目 | 核心差异 | 适用场景 |
 |-----|---------|---------|
-| Codex | 原生集成 + 中心化连接管理 | 需要稳定高性能的企业场景 |
+| Codex | 原生集成 + 中心化连接管理 + **声明式插件扩展** | 需要稳定高性能的企业场景 |
 | Kimi CLI | 插件化 MCP | 灵活扩展，第三方工具生态 |
 | OpenCode | 独立 MCP 进程 | 进程隔离，安全要求高 |
 | Gemini CLI | 内置工具为主，MCP 为辅 | 官方工具优先的场景 |
+
+**Codex 插件系统特点**：
+- **声明式配置**：通过 `.mcp.json` 和 `plugin.json` 声明贡献，无需编写代码
+- **配置优先级**：用户配置 > 插件配置，避免冲突
+- **功能开关**：通过 `features.plugins` 控制，可随时禁用
+- **缓存机制**：按工作目录缓存插件加载结果，提升性能
 
 ---
 
@@ -585,6 +771,9 @@ dispatch_tool_call()          [tools/router.rs:372]
 | 工具被禁用 | 在 disabled_tools 列表中 | `config/types.rs:138` |
 | 调用超时 | tool_timeout_sec 超时 | `mcp_connection_manager.rs` |
 | 命名冲突 | 不同服务器同名工具 | `mcp_connection_manager.rs:181` |
+| **插件功能未启用** | **features.plugins = false** | **`plugins.rs:94`** |
+| **插件加载失败** | **缺少 plugin.json 或格式错误** | **`plugins.rs:250`** |
+| **插件 MCP 配置错误** | **.mcp.json 解析失败** | **`plugins.rs:328`** |
 
 ### 7.2 超时/资源限制
 
@@ -608,6 +797,7 @@ const MAX_TOOL_NAME_LENGTH: usize = 64;  // OpenAI API 限制
 | 参数解析失败 | 返回格式错误 | `mcp_tool_call.rs:294` |
 | 审批拒绝 | 返回拒绝原因 | `mcp_tool_call.rs:311` |
 | 服务器断开 | 自动重连或标记失效 | `mcp_connection_manager.rs` |
+| **OAuth Resource 无效** | **授权请求不包含 resource 参数** | **`perform_oauth_login.rs:348`** |
 
 ---
 
@@ -615,13 +805,17 @@ const MAX_TOOL_NAME_LENGTH: usize = 64;  // OpenAI API 限制
 
 | 功能 | 文件 | 行号 | 说明 |
 |-----|------|------|------|
-| 配置 | `config/types.rs` | 128 | McpServerConfig 结构 |
+| 配置 | `config/types.rs` | 88 | McpServerConfig 结构 |
 | 连接管理 | `mcp_connection_manager.rs` | 225 | McpConnectionManager |
 | 工具命名 | `mcp_connection_manager.rs` | 181 | qualify_tools 函数 |
 | Handler | `tools/handlers/mcp.rs` | 248 | McpHandler 结构 |
 | 调用执行 | `mcp_tool_call.rs` | 285 | handle_mcp_tool_call |
 | 审批控制 | `mcp_tool_call.rs` | 297 | maybe_request_mcp_tool_approval |
 | 工具解析 | `session/mod.rs` | - | parse_mcp_tool_name |
+| **插件管理** | **`plugins.rs`** | **73** | **PluginsManager 结构** |
+| **插件加载** | **`plugins.rs`** | **175** | **load_plugins_from_layer_stack** |
+| **MCP 配置整合** | **`mcp/mod.rs`** | **165** | **McpManager 结构** |
+| **OAuth Resource** | **`perform_oauth_login.rs`** | **50** | **perform_oauth_login 函数** |
 
 ---
 
@@ -633,5 +827,5 @@ const MAX_TOOL_NAME_LENGTH: usize = 64;  // OpenAI API 限制
 
 ---
 
-*✅ Verified: 基于 codex/codex-rs/core/src/mcp*.rs 源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*✅ Verified: 基于 codex/codex-rs/core/src/mcp*.rs, plugins.rs, perform_oauth_login.rs 源码分析*
+*基于版本：2026-03-01 (d94f0b6) | 最后更新：2026-03-02*

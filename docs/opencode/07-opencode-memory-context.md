@@ -2,9 +2,9 @@
 
 ## TL;DR（结论先行）
 
-一句话定义：OpenCode 的 Memory Context 采用"**三层层级 + SQLite 持久化 + Event Bus 响应式架构**"的设计，通过 Session → Message → Part 的三级结构组织对话数据，使用 SQLite + Drizzle ORM 进行类型安全的持久化，并基于 Event Bus 实现响应式的流式处理。
+一句话定义：OpenCode 的 Memory Context 采用"**三层层级 + SQLite 持久化 + Event Bus 响应式架构 + WorkspaceContext 多工作空间**"的设计，通过 Session → Message → Part 的三级结构组织对话数据，使用 SQLite + Drizzle ORM 进行类型安全的持久化，基于 Event Bus 实现响应式的流式处理，并通过 **WorkspaceContext** 实现多工作空间隔离。
 
-OpenCode 的核心取舍：**关系型数据库 + 反范化设计 + Prune 压缩**（对比 Kimi CLI 的 JSONL + Checkpoint、Gemini CLI 的分层 GEMINI.md、Codex 的惰性压缩）
+OpenCode 的核心取舍：**关系型数据库 + 反范化设计 + Prune 压缩 + AsyncLocalStorage 上下文传播**（对比 Kimi CLI 的 JSONL + Checkpoint、Gemini CLI 的分层 GEMINI.md、Codex 的惰性压缩）
 
 ---
 
@@ -68,7 +68,13 @@ OpenCode 的核心取舍：**关系型数据库 + 反范化设计 + Prune 压缩
 ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
 │ Drizzle ORM  │ │ Event Bus    │ │ AsyncLocal   │
 │ SQLite       │ │ 事件总线     │ │ Storage      │
-└──────────────┘ └──────────────┘ └──────────────┘
+└──────────────┘ └──────────────┘ └──────┬───────┘
+                                         │
+                                         ▼
+                              ┌──────────────────────┐
+                              │ **WorkspaceContext** │
+                              │ 多工作空间上下文传播 │
+                              └──────────────────────┘
 ```
 
 ### 2.2 核心组件职责
@@ -76,14 +82,15 @@ OpenCode 的核心取舍：**关系型数据库 + 反范化设计 + Prune 压缩
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
 | `SessionTable` | 会话表定义，支持分支结构 | `packages/opencode/src/session/session.sql.ts:11` |
-| `MessageTable` | 消息表定义，存储角色和元数据 | `packages/opencode/src/session/session.sql.ts:37` |
-| `PartTable` | 内容片段表，反范化存储 session_id | `packages/opencode/src/session/session.sql.ts:50` |
+| `MessageTable` | 消息表定义，存储角色和元数据 | `packages/opencode/src/session/session.sql.ts:42` |
+| `PartTable` | 内容片段表，反范化存储 session_id | `packages/opencode/src/session/session.sql.ts:55` |
 | `MessageV2.Part` | Part 类型系统（Zod Schema） | `packages/opencode/src/session/message-v2.ts:76` |
 | `MessageV2.stream` | 流式读取消息 | `packages/opencode/src/session/message-v2.ts:716` |
 | `Session.create` | 创建会话 | `packages/opencode/src/session/index.ts:212` |
 | `Session.fork` | 创建会话分支 | `packages/opencode/src/session/index.ts:230` |
 | `SessionCompaction` | 上下文压缩 | `packages/opencode/src/session/compaction.ts:18` |
 | `Bus.publish` | 发布事件 | `packages/opencode/src/bus/index.ts:41` |
+| **`WorkspaceContext`** | **多工作空间上下文传播** | **`packages/opencode/src/control-plane/workspace-context.ts:9`** |
 
 ### 2.3 核心组件交互关系
 
@@ -140,9 +147,11 @@ sequenceDiagram
 │  Session 表                                                  │
 │  ├── id (PK)                                                │
 │  ├── project_id (FK)                                        │
+│  ├── workspace_id (FK, 多工作空间支持)                       │
 │  ├── parent_id (自引用，支持分支)                            │
 │  ├── title, version, directory                              │
 │  ├── summary_additions/deletions/files (统计信息)            │
+│  ├── summary_diffs (JSON)                                    │
 │  ├── revert (回滚信息 JSON)                                  │
 │  ├── permission (权限规则 JSON)                              │
 │  └── time_created/updated/compacting/archived               │
@@ -171,7 +180,7 @@ sequenceDiagram
 #### 关键代码
 
 ```typescript
-// packages/opencode/src/session/session.sql.ts:11-35
+// packages/opencode/src/session/session.sql.ts:11-40
 export const SessionTable = sqliteTable(
   "session",
   {
@@ -179,6 +188,7 @@ export const SessionTable = sqliteTable(
     project_id: text()
       .notNull()
       .references(() => ProjectTable.id, { onDelete: "cascade" }),
+    workspace_id: text(),  // 多工作空间支持
     parent_id: text(),  // 支持会话分支
     // ... 其他字段
     revert: text({ mode: "json" }).$type<{ messageID: string; partID?: string; snapshot?: string; diff?: string }>(),
@@ -186,7 +196,11 @@ export const SessionTable = sqliteTable(
     time_compacting: integer(),
     time_archived: integer(),
   },
-  (table) => [index("session_project_idx").on(table.project_id), index("session_parent_idx").on(table.parent_id)],
+  (table) => [
+    index("session_project_idx").on(table.project_id),
+    index("session_workspace_idx").on(table.workspace_id),  // 工作空间索引
+    index("session_parent_idx").on(table.parent_id),
+  ],
 )
 ```
 
@@ -194,6 +208,7 @@ export const SessionTable = sqliteTable(
 1. **反范化设计**：Part 表冗余存储 `session_id`，避免 JOIN 查询
 2. **JSON 字段**：灵活存储结构化数据（revert、permission、diffs）
 3. **索引优化**：project_id、parent_id、session_id 均有索引
+4. **多工作空间**：`workspace_id` 支持多工作空间隔离，配合 `session_workspace_idx` 索引优化查询
 
 ---
 
@@ -281,7 +296,103 @@ export const ToolState = z.discriminatedUnion("status", [
 
 ---
 
-### 3.3 组件间协作时序
+### 3.3 WorkspaceContext 多工作空间支持
+
+#### 职责定位
+
+WorkspaceContext 提供异步上下文传播机制，使 workspaceID 能够在异步调用链中自动传递，无需手动透传参数。这是实现多工作空间隔离的核心基础设施。
+
+#### 架构设计
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  WorkspaceContext                                            │
+│  基于 AsyncLocalStorage 实现                                 │
+├─────────────────────────────────────────────────────────────┤
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  provide({ workspaceID, fn })                        │   │
+│  │  └── 在指定上下文中执行函数                          │   │
+│  └─────────────────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  workspaceID (getter)                                │   │
+│  │  └── 获取当前上下文的 workspaceID                    │   │
+│  └─────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Session.createNext()                                       │
+│  └── workspaceID: WorkspaceContext.workspaceID  // 自动捕获 │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Session.list()                                             │
+│  └── 自动过滤当前 workspaceID 的会话                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 关键代码
+
+```typescript
+// packages/opencode/src/control-plane/workspace-context.ts:1-23
+import { Context } from "../util/context"
+
+interface Context {
+  workspaceID?: string
+}
+
+const context = Context.create<Context>("workspace")
+
+export const WorkspaceContext = {
+  async provide<R>(input: { workspaceID?: string; fn: () => R }): Promise<R> {
+    return context.provide({ workspaceID: input.workspaceID }, async () => {
+      return input.fn()
+    })
+  },
+
+  get workspaceID() {
+    try {
+      return context.use().workspaceID
+    } catch (e) {
+      return undefined
+    }
+  },
+}
+```
+
+#### 使用模式
+
+```typescript
+// packages/opencode/src/session/index.ts:304
+export async function createNext(input: { ... }) {
+  const result: Info = {
+    ...
+    workspaceID: WorkspaceContext.workspaceID,  // 自动从上下文获取
+    ...
+  }
+  ...
+}
+
+// packages/opencode/src/session/index.ts:544-546
+export function* list(input?: { ... }) {
+  ...
+  if (WorkspaceContext.workspaceID) {
+    conditions.push(eq(SessionTable.workspace_id, WorkspaceContext.workspaceID))
+  }
+  ...
+}
+```
+
+**设计要点**：
+1. **隐式传播**：利用 AsyncLocalStorage 实现上下文自动透传，避免层层传递参数
+2. **容错设计**：`workspaceID` getter 在上下文不存在时返回 `undefined` 而非抛出错误
+3. **会话隔离**：创建会话时自动捕获当前 workspaceID，查询时自动过滤
+4. **向后兼容**：未设置 workspaceID 时行为与之前一致
+
+---
+
+### 3.4 组件间协作时序
 
 展示 Session、Message、Part 如何协作完成一次完整的消息创建流程。
 
@@ -334,7 +445,7 @@ sequenceDiagram
 
 ---
 
-### 3.4 关键数据路径
+### 3.5 关键数据路径
 
 #### 主路径（正常流程）
 
@@ -496,12 +607,13 @@ flowchart TD
 ### 5.1 核心数据结构
 
 ```typescript
-// packages/opencode/src/session/session.sql.ts:11-35
+// packages/opencode/src/session/session.sql.ts:11-40
 export const SessionTable = sqliteTable(
   "session",
   {
     id: text().primaryKey(),
     project_id: text().notNull().references(() => ProjectTable.id, { onDelete: "cascade" }),
+    workspace_id: text(),  // 多工作空间支持
     parent_id: text(),  // 支持分支
     slug: text().notNull(),
     directory: text().notNull(),
@@ -519,6 +631,7 @@ export const SessionTable = sqliteTable(
   },
   (table) => [
     index("session_project_idx").on(table.project_id),
+    index("session_workspace_idx").on(table.workspace_id),  // 工作空间索引
     index("session_parent_idx").on(table.parent_id),
   ],
 )
@@ -527,6 +640,7 @@ export const SessionTable = sqliteTable(
 **字段说明**：
 | 字段 | 类型 | 用途 |
 |-----|------|------|
+| `workspace_id` | `string?` | 多工作空间隔离标识 |
 | `parent_id` | `string?` | 支持会话分支，指向父会话 |
 | `revert` | `JSON` | 存储回滚点信息（messageID, snapshot, diff） |
 | `permission` | `JSON` | 存储权限规则 |
@@ -623,6 +737,7 @@ MessageV2.stream()          [packages/opencode/src/session/message-v2.ts:716]
 | 反范化 | Part 表冗余 session_id | 完全范化 | 优化查询性能，但增加存储冗余 |
 | 压缩策略 | Prune + Compaction | 截断 (Codex)、摘要 (Kimi) | 保留关键信息，但实现复杂 |
 | 响应式 | Event Bus | 轮询、回调 | 实时同步，但增加系统复杂度 |
+| **多工作空间** | **WorkspaceContext + AsyncLocalStorage** | **手动透传参数** | **隐式上下文传播简化 API，但增加理解成本** |
 
 ### 6.2 为什么这样设计？
 
@@ -721,19 +836,21 @@ export async function isOverflow(input: { tokens: MessageV2.Assistant["tokens"];
 
 | 功能 | 文件 | 行号 | 说明 |
 |-----|------|------|------|
-| Session 表定义 | `packages/opencode/src/session/session.sql.ts` | 11-35 | SessionTable Schema |
-| Message 表定义 | `packages/opencode/src/session/session.sql.ts` | 37-48 | MessageTable Schema |
-| Part 表定义 | `packages/opencode/src/session/session.sql.ts` | 50-62 | PartTable Schema |
+| Session 表定义 | `packages/opencode/src/session/session.sql.ts` | 11-40 | SessionTable Schema (含 workspace_id) |
+| Message 表定义 | `packages/opencode/src/session/session.sql.ts` | 42-53 | MessageTable Schema |
+| Part 表定义 | `packages/opencode/src/session/session.sql.ts` | 55-67 | PartTable Schema |
 | Part 类型系统 | `packages/opencode/src/session/message-v2.ts` | 76-389 | Zod Schema 定义 |
 | 流式读取 | `packages/opencode/src/session/message-v2.ts` | 716-767 | stream() Generator |
 | 消息转换 | `packages/opencode/src/session/message-v2.ts` | 491-714 | toModelMessages() |
-| 创建会话 | `packages/opencode/src/session/index.ts` | 212-228 | Session.create() |
+| 创建会话 | `packages/opencode/src/session/index.ts` | 291-331 | Session.createNext() |
 | Fork 会话 | `packages/opencode/src/session/index.ts` | 230-270 | Session.fork() |
 | 更新消息 | `packages/opencode/src/session/index.ts` | 670-690 | Session.updateMessage() |
 | 更新 Part | `packages/opencode/src/session/index.ts` | 735-756 | Session.updatePart() |
+| 会话列表 | `packages/opencode/src/session/index.ts` | 533-575 | Session.list() (含 workspace 过滤) |
 | 压缩检查 | `packages/opencode/src/session/compaction.ts` | 32-48 | isOverflow() |
 | Prune 实现 | `packages/opencode/src/session/compaction.ts` | 58-99 | prune() |
 | 压缩处理 | `packages/opencode/src/session/compaction.ts` | 101-229 | process() |
+| **WorkspaceContext** | **`packages/opencode/src/control-plane/workspace-context.ts`** | **1-23** | **多工作空间上下文** |
 | 事件发布 | `packages/opencode/src/bus/index.ts` | 41-64 | Bus.publish() |
 | 事件定义 | `packages/opencode/src/bus/bus-event.ts` | 12-19 | BusEvent.define() |
 | AsyncLocalStorage | `packages/opencode/src/util/context.ts` | 10-25 | Context.create() |
@@ -749,4 +866,7 @@ export async function isOverflow(input: { tokens: MessageV2.Assistant["tokens"];
 ---
 
 *✅ Verified: 基于 opencode/packages/opencode/src/session/*.ts 源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-02*
+
+**更新记录**：
+- 2026-03-02: 新增 WorkspaceContext 多工作空间支持文档 (commit cec16df, 3ee1653)

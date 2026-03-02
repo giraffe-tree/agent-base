@@ -2,7 +2,7 @@
 
 ## TL;DR（结论先行）
 
-一句话定义：Kimi CLI 的 MCP 集成采用"**ACP 协议桥接 + fastmcp 执行引擎**"的设计，通过 ACP (Agent Client Protocol) 获取 MCP 服务器配置并转换为标准 MCP 配置，由 `fastmcp` 库负责实际的工具调用执行。
+一句话定义：Kimi CLI 的 MCP 集成采用"**ACP 协议桥接 + fastmcp 执行引擎**"的设计，通过 ACP (Agent Client Protocol) 获取 MCP 服务器配置并转换为标准 MCP 配置，由 `fastmcp` 库负责实际的工具调用执行。Web 模式下支持从全局 `mcp.json` 自动加载配置，并具备错误降级机制。
 
 Kimi CLI 的核心取舍：**协议层桥接 + 第三方库执行**（对比 Codex 的原生 Rust 实现、Gemini CLI 的自研 McpClient、OpenCode 的 AI SDK 原生集成）
 
@@ -82,6 +82,7 @@ Kimi CLI 的核心取舍：**协议层桥接 + 第三方库执行**（对比 Cod
 | `MCPServerInfo` | MCP 服务器连接状态和客户端管理 | `src/kimi_cli/soul/toolset.py:349` |
 | `MCPTool` | MCP 工具的包装类，实现审批和调用 | `src/kimi_cli/soul/toolset.py:355` |
 | `mcp add/remove/list` | CLI 命令管理 MCP 服务器配置 | `src/kimi_cli/cli/mcp.py:83` |
+| **`run_worker`** | **Web 模式下自动加载全局 MCP 配置** | **`src/kimi_cli/web/runner/worker.py:26`** |
 
 ### 2.3 核心组件交互关系
 
@@ -499,6 +500,83 @@ flowchart LR
 
 ---
 
+### 3.6 Web 模式 MCP 自动加载
+
+#### 职责定位
+
+Web 模式下，Kimi CLI 通过 `run_worker` 函数自动加载全局 MCP 配置文件 (`~/.kimi/mcp.json`)，无需用户手动指定配置。该机制包含错误处理和降级策略，确保即使 MCP 配置无效也能正常启动会话。
+
+#### 内部数据流
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  输入层                                                      │
+│  └── ~/.kimi/mcp.json (全局 MCP 配置文件)                   │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  处理层                                                      │
+│  ├── 检查配置文件是否存在                                    │
+│  ├── 解析 JSON (带错误处理)                                  │
+│  │   └── JSONDecodeError → 记录警告日志，继续使用空配置      │
+│  └── 创建 KimiCLI 实例                                       │
+│      ├── MCPConfigError → 记录警告日志，降级为无 MCP 启动    │
+│      └── 成功 → 正常启动带 MCP 的会话                        │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  输出层                                                      │
+│  ├── KimiCLI 实例 (带 MCP 或无 MCP)                         │
+│  └── 日志记录 (配置错误警告)                                 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 关键代码
+
+```python
+# src/kimi_cli/web/runner/worker.py:36-58
+# Load default MCP config file if it exists
+default_mcp_file = get_global_mcp_config_file()
+mcp_configs: list[dict[str, Any]] = []
+if default_mcp_file.exists():
+    raw = default_mcp_file.read_text(encoding="utf-8")
+    try:
+        mcp_configs = [json.loads(raw)]
+    except json.JSONDecodeError:
+        logger.warning(
+            "Invalid JSON in MCP config file: {path}",
+            path=default_mcp_file,
+        )
+
+# Create KimiCLI instance with MCP configuration
+try:
+    kimi_cli = await KimiCLI.create(session, mcp_configs=mcp_configs or None)
+except MCPConfigError as exc:
+    logger.warning(
+        "Invalid MCP config in {path}: {error}. Starting without MCP.",
+        path=default_mcp_file,
+        error=exc,
+    )
+    kimi_cli = await KimiCLI.create(session, mcp_configs=None)
+```
+
+**设计要点**：
+
+1. **自动发现**：通过 `get_global_mcp_config_file()` 自动定位全局配置文件路径
+2. **错误隔离**：JSON 解析错误不会阻止会话启动，仅记录警告日志
+3. **配置验证**：`MCPConfigError` 捕获配置验证失败，自动降级为无 MCP 模式启动
+4. **优雅降级**：无论配置错误还是验证失败，都能保证会话正常启动
+
+#### 错误处理策略
+
+| 错误类型 | 处理策略 | 结果 |
+|---------|---------|------|
+| 配置文件不存在 | 跳过加载，使用空配置 | 正常启动，无 MCP |
+| JSON 解析失败 | 记录警告日志，使用空配置 | 正常启动，无 MCP |
+| 配置验证失败 (MCPConfigError) | 记录警告日志，降级启动 | 正常启动，无 MCP |
+
+---
+
 ## 4. 端到端数据流转
 
 ### 4.1 正常流程（详细版）
@@ -858,6 +936,8 @@ flowchart TD
 | OAuth 未授权 | token 不存在 | `src/kimi_cli/soul/toolset.py:277` |
 | 调用超时 | 超过 tool_call_timeout_ms | `src/kimi_cli/soul/toolset.py:390` |
 | 审批拒绝 | 用户拒绝工具调用 | `src/kimi_cli/soul/toolset.py:382` |
+| **Web 模式 JSON 解析失败** | **全局 mcp.json 格式无效** | **`src/kimi_cli/web/runner/worker.py:43`** |
+| **Web 模式配置验证失败** | **MCPConfigError 抛出** | **`src/kimi_cli/web/runner/worker.py:52`** |
 
 ### 7.2 超时/资源限制
 
@@ -885,6 +965,8 @@ result = await client.call_tool(
 | 调用超时 | 返回 ToolError，提示用户检查超时配置 | `src/kimi_cli/soul/toolset.py:397` |
 | 审批拒绝 | 返回 ToolRejectedError | `src/kimi_cli/soul/toolset.py:383` |
 | 资源清理 | cleanup() 取消任务并关闭客户端 | `src/kimi_cli/soul/toolset.py:338` |
+| **Web 模式 JSON 错误** | **记录警告日志，降级为无 MCP 启动** | **`src/kimi_cli/web/runner/worker.py:44`** |
+| **Web 模式配置错误** | **记录警告日志，降级为无 MCP 启动** | **`src/kimi_cli/web/runner/worker.py:53`** |
 
 ---
 
@@ -911,6 +993,9 @@ result = await client.call_tool(
 | mcp auth | `src/kimi_cli/cli/mcp.py` | 257 | mcp_auth 命令 |
 | ACP 会话创建 | `src/kimi_cli/acp/server.py` | 108 | ACPServer.new_session |
 | ACP 配置转换调用 | `src/kimi_cli/acp/server.py` | 117 | acp_mcp_servers_to_mcp_config |
+| **Web Worker 入口** | **`src/kimi_cli/web/runner/worker.py`** | **26** | **run_worker 自动加载 MCP** |
+| **Web 模式配置加载** | **`src/kimi_cli/web/runner/worker.py`** | **37** | **自动读取全局 mcp.json** |
+| **Web 模式错误降级** | **`src/kimi_cli/web/runner/worker.py`** | **52** | **MCPConfigError 降级处理** |
 
 ---
 
@@ -928,5 +1013,5 @@ result = await client.call_tool(
 
 ---
 
-*✅ Verified: 基于 kimi-cli/src/kimi_cli/acp/mcp.py、kimi-cli/src/kimi_cli/soul/toolset.py、kimi-cli/src/kimi_cli/cli/mcp.py 源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*✅ Verified: 基于 kimi-cli/src/kimi_cli/acp/mcp.py、kimi-cli/src/kimi_cli/soul/toolset.py、kimi-cli/src/kimi_cli/cli/mcp.py、kimi-cli/src/kimi_cli/web/runner/worker.py 源码分析*
+*基于版本：2026-02-08 | 最后更新：2026-03-02*

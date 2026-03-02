@@ -7,6 +7,8 @@
 Codex 的核心取舍：**事件驱动的异步流式处理 + Task 化生命周期管理**
 （对比 Kimi CLI 的命令式 while 循环 + Checkpoint 回滚、Gemini CLI 的递归 continuation）
 
+**新增能力**：多代理协作场景下的**跨线程审批 UI**（子代理的审批请求通过 `ApprovalOverlay` 和 `PendingThreadApprovals` 视觉指示器处理），以及 **Realtime API 语音交互支持**（`RealtimeConversationManager` 管理 WebSocket 连接和音频流传输）
+
 ---
 
 ## 1. 为什么需要这个机制？（解决什么问题）
@@ -79,6 +81,8 @@ Codex 进一步解决的问题：
 | `try_run_sampling_request` | 流式响应处理，工具并发控制 | `core/src/codex.rs` |
 | `ToolCallRuntime` | 工具调用运行时，管理并发与取消 | `core/src/tools/runtime.rs` |
 | `ToolRouter` | 工具路由，解析和分发工具调用 | `core/src/tools/router.rs` |
+| **RealtimeConversationManager** | **Realtime API 管理，支持语音交互** | **`core/src/realtime_conversation.rs`** |
+| **ApprovalOverlay** | **TUI 审批弹窗，支持跨线程子代理审批** | **`tui/src/bottom_pane/approval_overlay.rs`** |
 
 ### 2.3 核心组件交互关系
 
@@ -458,6 +462,166 @@ flowchart TD
     style Compact fill:#FFD700
     style End fill:#90EE90
 ```
+
+---
+
+### 3.5 多代理支持与跨线程审批（Multi-Agent & Cross-Thread Approval）
+
+#### 职责定位
+
+Codex 支持多代理协作场景，其中主代理可以创建子代理（Sub-agent）来并行处理任务。当子代理需要用户审批时（如执行命令、应用补丁），TUI 提供了专门的跨线程审批机制。
+
+#### 架构图
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│ 主代理线程 (Primary Thread)                                   │
+│  ├── 用户输入处理                                             │
+│  ├── spawn_agent() 创建子代理                                 │
+│  └── 继续处理其他任务                                         │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ 创建
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 子代理线程 (Sub-agent Thread)                                 │
+│  ├── 独立执行 Task                                           │
+│  ├── 需要审批时发送 ExecApprovalRequest                      │
+│  └── 等待用户决策                                            │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ 跨线程事件
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│ TUI 层 - 跨线程审批处理                                       │
+│  ├── ApprovalOverlay 弹窗显示                                │
+│  ├── thread_label 标识线程来源                                │
+│  └── PendingThreadApprovals 视觉指示器                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 跨线程审批流程
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Main as 主代理线程
+    participant Sub as 子代理线程
+    participant TUI as TUI 层
+    participant User as 用户
+
+    Main->>Sub: 1. spawn_agent() 创建子代理
+    Sub->>Sub: 2. 独立执行任务
+    Sub->>Sub: 3. 需要执行命令（需审批）
+    Sub->>TUI: 4. ExecApprovalRequest 事件
+    Note over TUI: thread_label 标识来源
+    TUI->>TUI: 5. 显示 PendingThreadApprovals 指示器
+    TUI->>User: 6. 显示 ApprovalOverlay 弹窗
+    User->>TUI: 7. 做出审批决策
+    TUI->>Sub: 8. 发送 Op::ExecApproval
+    Sub->>Sub: 9. 继续执行
+
+    alt 用户当前在其他线程
+        TUI->>TUI: 显示 "! Approval needed in <thread>"
+        TUI->>User: 提示使用 /agent 切换线程
+    end
+```
+
+#### 关键组件
+
+| 组件 | 职责 | 代码位置 |
+|-----|------|---------|
+| `ApprovalRequest` | 审批请求数据结构，支持 Exec/ApplyPatch/McpElicitation | `tui/src/bottom_pane/approval_overlay.rs:43` |
+| `ApprovalOverlay` | 模态弹窗，处理用户审批交互 | `tui/src/bottom_pane/approval_overlay.rs:90` |
+| `thread_label` | 生成线程标识（如 "Main [default]"） | `tui/src/app.rs:968` |
+| `PendingThreadApprovals` | 非活动线程的待审批视觉指示器 | `tui/src/bottom_pane/pending_thread_approvals.rs:12` |
+| `has_pending_thread_approvals` | 检查线程是否有待审批请求 | `tui/src/app.rs:1088` |
+
+#### 跨线程提示机制
+
+当子代理需要审批但用户当前不在该线程时，TUI 会显示视觉指示器：
+
+```rust
+// codex/codex-rs/tui/src/bottom_pane/pending_thread_approvals.rs:46
+for thread in self.threads.iter().take(3) {
+    let wrapped = adaptive_wrap_lines(
+        std::iter::once(Line::from(format!("Approval needed in {thread}"))),
+        RtOptions::new(width as usize)
+            .initial_indent(Line::from(vec!["  ".into(), "!".red().bold(), " ".into()]))
+            .subsequent_indent(Line::from("    ")),
+    );
+    lines.extend(wrapped);
+}
+// 显示提示: /agent to switch threads
+```
+
+**设计意图**：
+1. **非阻塞体验**：子代理的审批请求不会阻塞主代理的工作
+2. **上下文感知**：通过 `thread_label` 明确标识审批请求的来源线程
+3. **视觉提示**：使用红色 `!` 图标和 `/agent` 命令提示引导用户切换线程
+4. **队列管理**：`ApprovalOverlay` 支持多个审批请求的队列处理
+
+---
+
+### 3.6 实时对话支持（Realtime Conversation）
+
+#### 职责定位
+
+Codex 支持 Realtime API 进行语音交互，`RealtimeConversationManager` 负责管理 WebSocket 连接、音频流传输和实时事件处理。
+
+#### 架构图
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│ RealtimeConversationManager                                  │
+│  ├── WebSocket 连接管理                                      │
+│  ├── 音频输入队列 (audio_tx)                                  │
+│  ├── 文本输入队列 (text_tx)                                   │
+│  └── 实时事件分发                                            │
+└───────────────────────┬─────────────────────────────────────┘
+                        │
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│ 音频输入      │ │ 文本输入      │ │ 实时事件输出  │
+│ 麦克风       │ │ 用户输入      │ │ UI 更新      │
+└──────────────┘ └──────────────┘ └──────────────┘
+```
+
+#### 关键接口
+
+| 接口 | 输入 | 输出 | 说明 | 代码位置 |
+|-----|------|------|------|---------|
+| `start()` | API 配置、prompt | Event 接收通道 | 启动实时对话 | `core/src/realtime_conversation.rs:70` |
+| `audio_in()` | RealtimeAudioFrame | Result | 输入音频帧 | `core/src/realtime_conversation.rs:119` |
+| `text_in()` | String | Result | 输入文本 | `core/src/realtime_conversation.rs:143` |
+| `shutdown()` | - | Result | 关闭连接 | `core/src/realtime_conversation.rs:162` |
+
+#### 事件处理流程
+
+```mermaid
+flowchart TD
+    A[用户启动实时对话] --> B[RealtimeConversationManager::start]
+    B --> C[建立 WebSocket 连接]
+    C --> D[spawn_realtime_input_task]
+
+    D --> E{tokio::select!}
+    E -->|text_rx| F[发送文本到 API]
+    E -->|audio_rx| G[发送音频到 API]
+    E -->|events| H[处理实时事件]
+
+    H --> I{事件类型}
+    I -->|ConversationItemAdded| J[提取文本内容]
+    I -->|Error| K[关闭连接]
+    I -->|其他| L[转发到 UI]
+
+    J --> M[route_realtime_text_input]
+    M --> N[注入到当前会话]
+```
+
+**设计意图**：
+1. **双模输入**：同时支持音频和文本输入，适应不同场景
+2. **流式处理**：使用 `tokio::select!` 并发处理多个输入源
+3. **会话集成**：实时对话的文本输出可路由到当前会话作为输入
+4. **生命周期管理**：支持优雅关闭和资源清理
 
 ---
 
@@ -875,6 +1039,10 @@ let retry_config = RetryConfig {
 | Task 管理 | `core/src/tasks/regular.rs` | 156 | `RegularTask::run()` |
 | Compaction | `core/src/codex.rs` | 2345 | `run_auto_compact()` |
 | 取消机制 | `core/src/cancellation.rs` | 45 | `CancellationToken` |
+| **Realtime 对话** | **`core/src/realtime_conversation.rs`** | **43** | **`RealtimeConversationManager`** |
+| **审批弹窗** | **`tui/src/bottom_pane/approval_overlay.rs`** | **90** | **`ApprovalOverlay`** |
+| **跨线程审批指示器** | **`tui/src/bottom_pane/pending_thread_approvals.rs`** | **12** | **`PendingThreadApprovals`** |
+| **子代理创建** | **`core/src/tools/handlers/multi_agents.rs`** | **92** | **`spawn_agent()`** |
 
 ---
 
@@ -888,4 +1056,8 @@ let retry_config = RetryConfig {
 ---
 
 *✅ Verified: 基于 codex/codex-rs/core/src/codex.rs:1204 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-02*
+
+**更新记录**：
+- 2026-03-02: 新增多代理支持与跨线程审批文档（Sub-agent Approval in TUI）
+- 2026-03-02: 新增 Realtime Conversation 实时对话支持文档

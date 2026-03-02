@@ -75,6 +75,9 @@ Gemini CLI 的核心取舍：**递归 continuation 驱动 + Scheduler 状态机*
 | `Turn` | 单轮模型流解析器，转换原始流为标准事件 | `packages/core/src/core/turn.ts:239` |
 | `Scheduler` | 工具执行状态机，管理工具生命周期 | `packages/core/src/scheduler/scheduler.ts:90` |
 | `SchedulerStateManager` | 工具调用状态管理，维护状态流转 | `packages/core/src/scheduler/state-manager.ts:43` |
+| **Kind.Agent 分类** | **子代理工具分类，支持并行执行** | **`packages/core/src/tools/tools.ts:835`** |
+| **Tail Tool Calls** | **工具链式调用机制，支持 AfterTool 触发后续工具** | **`packages/core/src/scheduler/scheduler.ts:676-731`** |
+| **Browser Agent** | **实验性浏览器代理，隔离 MCP 客户端** | **`packages/core/src/agents/browser/browserAgentFactory.ts:44`** |
 
 ### 2.3 核心组件交互关系
 
@@ -110,6 +113,10 @@ sequenceDiagram
         UI->>Scheduler: 10. scheduleToolCalls(requests)
         Scheduler->>Scheduler: 11. 状态机流转
         Note right of Scheduler: Validating → Scheduled → Executing → Success/Error
+        alt Tail Tool Call 触发
+            Scheduler->>Scheduler: 11a. replaceActiveCallWithTailCall()
+            Note right of Scheduler: 链式执行下一个工具
+        end
         Scheduler-->>UI: 12. 工具完成回调
         UI->>UI: 13. handleCompletedTools()
         UI->>Client: 14. submitQuery(responseParts, isContinuation=true)
@@ -333,7 +340,278 @@ sequenceDiagram
 
 ---
 
-### 3.4 关键数据路径
+### 3.4 新特性：Kind.Agent 分类与并行执行
+
+#### 设计背景
+
+子代理工具（Subagent Tool）原先使用 `Kind.Think` 分类，导致其无法与其他只读工具并行执行。为了提升多代理协作的效率，引入了新的 `Kind.Agent` 分类。
+
+#### 核心实现
+
+**Kind 枚举扩展** (`packages/core/src/tools/tools.ts:827-841`):
+
+```typescript
+export enum Kind {
+  Read = 'read',
+  Edit = 'edit',
+  Delete = 'delete',
+  Move = 'move',
+  Search = 'search',
+  Execute = 'execute',
+  Think = 'think',
+  Agent = 'agent',        // 新增：子代理工具分类
+  Fetch = 'fetch',
+  Communicate = 'communicate',
+  Plan = 'plan',
+  SwitchMode = 'switch_mode',  // 新增：模式切换工具
+  Other = 'other',
+}
+```
+
+**子代理工具分类** (`packages/core/src/agents/subagent-tool.ts:50`):
+
+```typescript
+export class SubagentTool extends BaseDeclarativeTool<AgentInputs, ToolResult> {
+  constructor(...) {
+    super(
+      definition.name,
+      definition.displayName ?? definition.name,
+      definition.description,
+      Kind.Agent,        // 使用 Kind.Agent 替代 Kind.Think
+      inputSchema,
+      messageBus,
+      /* isOutputMarkdown */ true,
+      /* canUpdateOutput */ true,
+    );
+  }
+}
+```
+
+**并行执行判断** (`packages/core/src/scheduler/scheduler.ts:520-523`):
+
+```typescript
+private _isParallelizable(tool?: AnyDeclarativeTool): boolean {
+  if (!tool) return false;
+  return tool.isReadOnly || tool.kind === Kind.Agent;  // Agent 类型可并行
+}
+```
+
+#### 设计意图
+
+1. **并行性能优化**：`Kind.Agent` 工具现在可以与只读工具（`Kind.Read`, `Kind.Search` 等）并行执行，减少多代理任务的总执行时间
+2. **语义清晰化**：`Kind.Think` 用于内部思考工具，`Kind.Agent` 专门用于子代理调用，职责分离更明确
+3. **调度器兼容**：Scheduler 的 `_isParallelizable()` 方法同时识别 `isReadOnly` 和 `Kind.Agent`，无需修改现有调度逻辑
+
+---
+
+### 3.5 新特性：Tail Tool Calls（工具链式调用）
+
+#### 设计背景
+
+Tail Tool Calls 允许一个工具在执行完成后，自动触发另一个工具的调用。这在 AfterTool Hook 场景中特别有用，例如：
+- 工具执行后需要自动触发确认流程
+- 需要链式执行多个相关工具
+- 根据执行结果动态决定下一个工具
+
+#### 核心实现
+
+**ToolResult 扩展** (`packages/core/src/tools/tools.ts:589-596`):
+
+```typescript
+export interface ToolResult {
+  // ... 其他字段
+
+  /**
+   * Optional request to execute another tool immediately after this one.
+   * The result of this tail call will replace the original tool's response.
+   */
+  tailToolCallRequest?: {
+    name: string;
+    args: Record<string, unknown>;
+  };
+}
+```
+
+**Tail Call 执行逻辑** (`packages/core/src/scheduler/scheduler.ts:676-731`):
+
+```typescript
+if (
+  (result.status === CoreToolCallStatus.Success ||
+    result.status === CoreToolCallStatus.Error) &&
+  result.tailToolCallRequest
+) {
+  // 记录中间工具调用（被替换前的原始调用）
+  const intermediateCall: SuccessfulToolCall | ErroredToolCall = {
+    request: activeCall.request,
+    tool: activeCall.tool,
+    invocation: activeCall.invocation,
+    status: result.status,
+    response: result.response,
+    durationMs: activeCall.startTime
+      ? Date.now() - activeCall.startTime
+      : undefined,
+    outcome: activeCall.outcome,
+    schedulerId: this.schedulerId,
+  };
+  logToolCall(this.config, new ToolCallEvent(intermediateCall));
+
+  // 构建新的 Tail Call 请求
+  const tailRequest = result.tailToolCallRequest;
+  const originalCallId = result.request.callId;
+  const newRequest: ToolCallRequestInfo = {
+    callId: originalCallId,  // 复用原 callId
+    name: tailRequest.name,
+    args: tailRequest.args,
+    originalRequestName,
+    isClientInitiated: result.request.isClientInitiated,
+    prompt_id: result.request.prompt_id,
+    schedulerId: this.schedulerId,
+  };
+
+  // 创建并排队新的工具调用
+  const newTool = this.config.getToolRegistry().getTool(tailRequest.name);
+  if (!newTool) {
+    const errorCall = this._createToolNotFoundErroredToolCall(...);
+    this.state.replaceActiveCallWithTailCall(callId, errorCall);
+  } else {
+    const validatingCall = this._validateAndCreateToolCall(...);
+    this.state.replaceActiveCallWithTailCall(callId, validatingCall);
+  }
+
+  // 循环继续，队列中的新调用将在下一轮被处理
+  return true;
+}
+```
+
+**状态管理替换** (`packages/core/src/scheduler/state-manager.ts:190-201`):
+
+```typescript
+/**
+ * Replaces the currently active call with a new call, placing the new call
+ * at the front of the queue to be processed immediately in the next tick.
+ * Used for Tail Calls to chain execution without finalizing the original call.
+ */
+replaceActiveCallWithTailCall(callId: string, nextCall: ToolCall): void {
+  if (this.activeCalls.has(callId)) {
+    this.activeCalls.delete(callId);
+    this.queue.unshift(nextCall);  // 插入队列头部，优先执行
+    this.emitUpdate();
+  }
+}
+```
+
+#### 设计意图
+
+1. **响应替换机制**：Tail Call 的结果会替换原始工具的响应回注给模型，保持对话连贯性
+2. **调用链透明**：中间调用会被记录到日志，便于调试和审计
+3. **队列优先**：通过 `unshift()` 将 Tail Call 插入队列头部，确保立即执行
+4. **ID 复用**：复用原始 callId，保持调用链的追踪一致性
+
+---
+
+### 3.6 新特性：Browser Agent（实验性浏览器代理）
+
+#### 设计背景
+
+Browser Agent 是一个实验性的子代理，专门用于浏览器自动化任务。它通过隔离的 MCP 客户端与浏览器交互，支持截图分析和页面操作。
+
+#### 核心实现
+
+**Browser Agent 工厂** (`packages/core/src/agents/browser/browserAgentFactory.ts:44-143`):
+
+```typescript
+export async function createBrowserAgentDefinition(
+  config: Config,
+  messageBus: MessageBus,
+  printOutput?: (msg: string) => void,
+): Promise<{
+  definition: LocalAgentDefinition<typeof BrowserTaskResultSchema>;
+  browserManager: BrowserManager;
+}> {
+  // 创建并初始化浏览器管理器（带隔离的 MCP 客户端）
+  const browserManager = new BrowserManager(config);
+  await browserManager.ensureConnection();
+
+  // 从 MCP 工具创建声明式工具
+  const mcpTools = await createMcpDeclarativeTools(browserManager, messageBus);
+  const availableToolNames = mcpTools.map((t) => t.name);
+
+  // 验证必需的语义工具
+  const requiredSemanticTools = ['click', 'fill', 'navigate_page', 'take_snapshot'];
+  const missingSemanticTools = requiredSemanticTools.filter(
+    (t) => !availableToolNames.includes(t),
+  );
+
+  // 检查视觉能力是否可用
+  const visionDisabledReason = getVisionDisabledReason();
+  if (visionDisabledReason) {
+    debugLogger.log(`Vision disabled: ${visionDisabledReason}`);
+  } else {
+    allTools.push(createAnalyzeScreenshotTool(browserManager, config, messageBus));
+  }
+
+  // 创建配置好的 Agent 定义
+  const baseDefinition = BrowserAgentDefinition(config, !visionDisabledReason);
+  const definition: LocalAgentDefinition<typeof BrowserTaskResultSchema> = {
+    ...baseDefinition,
+    toolConfig: { tools: allTools },
+  };
+
+  return { definition, browserManager };
+}
+```
+
+**Generalist Agent** (`packages/core/src/agents/generalist-agent.ts:20-68`):
+
+```typescript
+export const GeneralistAgent = (
+  config: Config,
+): LocalAgentDefinition<typeof GeneralistAgentSchema> => ({
+  kind: 'local',
+  name: 'generalist',
+  displayName: 'Generalist Agent',
+  description: 'A general-purpose AI agent with access to all tools...',
+  inputConfig: {
+    inputSchema: {
+      type: 'object',
+      properties: {
+        request: {
+          type: 'string',
+          description: 'The task or question for the generalist agent.',
+        },
+      },
+      required: ['request'],
+    },
+  },
+  modelConfig: { model: 'inherit' },
+  get toolConfig() {
+    const tools = config.getToolRegistry().getAllToolNames();
+    return { tools };
+  },
+  runConfig: {
+    maxTimeMinutes: 10,
+    maxTurns: 20,
+  },
+});
+```
+
+#### 设计意图
+
+1. **MCP 隔离**：Browser Agent 使用独立的 MCP 客户端，工具不注册到主 Agent 的 ToolRegistry，避免污染
+2. **能力检测**：运行时检测视觉模型配置和工具可用性，动态启用/禁用截图分析功能
+3. **工具验证**：检查必需的语义工具（click, fill, navigate_page 等），确保浏览器操作能力完整
+4. **通用代理**：Generalist Agent 提供通用的子代理能力，适用于批处理、高输出量等场景
+
+#### 适用场景
+
+| 代理类型 | 适用场景 | 限制 |
+|---------|---------|------|
+| Browser Agent | 网页自动化、截图分析、表单填写 | 需要 chrome-devtools-mcp，视觉功能依赖特定认证类型 |
+| Generalist Agent | 批量重构、高输出命令、探索性任务 | maxTurns=20, maxTimeMinutes=10 |
+
+---
+
+### 3.7 关键数据路径
 
 #### 主路径（正常流程）
 
@@ -820,6 +1098,9 @@ gitGraph
 | **循环结构** | 递归 continuation (`yield* sendMessageStream`) | while 循环 (`_agent_loop`) | Actor 消息循环 |
 | **状态管理** | 调用栈隐式传递 + Scheduler 状态机 | Checkpoint 文件持久化 | Actor 状态 + 消息邮箱 |
 | **工具执行** | Scheduler 状态机（Validating → Scheduled → Executing） | 直接执行 + 并发控制 | 沙箱进程隔离执行 |
+| **子代理分类** | **Kind.Agent 支持并行执行** | 子代理作为普通工具 | 通过 Actor 消息委托 |
+| **工具链式调用** | **Tail Tool Calls（AfterTool 触发）** | 不支持 | 不支持 |
+| **浏览器代理** | **实验性 Browser Agent + MCP 隔离** | 不支持 | 内置浏览器工具 |
 | **继续条件** | `isContinuation=true` 递归调用 | while 循环条件判断 | 消息驱动继续 |
 | **终止条件** | MAX_TURNS (100)、maxSessionTurns、用户中断、loop detection | max_steps_per_turn、用户中断 | 类似 |
 | **异常恢复** | InvalidStream 续跑（注入提示词） | Checkpoint 回滚 | 沙箱重启 |
@@ -899,9 +1180,16 @@ if (this.config.getMaxSessionTurns() > 0 &&
 | Turn 层 | `packages/core/src/core/turn.ts` | 253 | Turn.run 方法 |
 | Scheduler | `packages/core/src/scheduler/scheduler.ts` | 169 | schedule 方法 |
 | 状态管理 | `packages/core/src/scheduler/state-manager.ts` | 43 | SchedulerStateManager 类 |
+| **Tail Call 替换** | `packages/core/src/scheduler/state-manager.ts` | 190 | replaceActiveCallWithTailCall 方法 |
+| **Tail Call 执行** | `packages/core/src/scheduler/scheduler.ts` | 676 | Tail Tool Call 处理逻辑 |
 | 工具完成回调 | `packages/cli/src/ui/hooks/useGeminiStream.ts` | 1479 | handleCompletedTools 函数 |
 | 状态定义 | `packages/core/src/scheduler/types.ts` | 25 | CoreToolCallStatus 枚举 |
 | 事件定义 | `packages/core/src/core/turn.ts` | 53 | GeminiEventType 枚举 |
+| **Kind 枚举** | `packages/core/src/tools/tools.ts` | 827 | Kind.Agent 等新分类 |
+| **子代理工具** | `packages/core/src/agents/subagent-tool.ts` | 50 | Kind.Agent 使用 |
+| **并行判断** | `packages/core/src/scheduler/scheduler.ts` | 520 | _isParallelizable 方法 |
+| **Browser Agent** | `packages/core/src/agents/browser/browserAgentFactory.ts` | 44 | 浏览器代理工厂 |
+| **Generalist Agent** | `packages/core/src/agents/generalist-agent.ts` | 20 | 通用子代理定义 |
 | Loop 检测 | `packages/core/src/services/loopDetectionService.ts` | - | LoopDetectionService 类 |
 
 ---
@@ -1054,4 +1342,10 @@ if (this.config.getMaxSessionTurns() > 0 &&
 ---
 
 *✅ Verified: 基于 gemini-cli/packages/core/src/core/client.ts、turn.ts、scheduler/scheduler.ts 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-02*
+
+**更新内容（2026-03-02）**：
+- 新增 Kind.Agent 分类与并行执行机制（Section 3.4）
+- 新增 Tail Tool Calls 工具链式调用（Section 3.5）
+- 新增 Browser Agent 实验性浏览器代理（Section 3.6）
+- 更新跨项目对比表格，增加子代理分类、工具链式调用、浏览器代理维度

@@ -2,9 +2,9 @@
 
 ## TL;DR（结论先行）
 
-一句话定义：Codex 的 Memory Context 是**双层存储 + 惰性压缩**的对话历史管理方案，在内存中维护完整历史，通过字节启发式估算 Token 使用量，接近上下文窗口限制时触发 LLM 驱动的摘要压缩。
+一句话定义：Codex 的 Memory Context 是**双层存储 + 惰性压缩 + 可配置记忆系统**的对话历史管理方案，在内存中维护完整历史，通过字节启发式估算 Token 使用量，接近上下文窗口限制时触发 LLM 驱动的摘要压缩；同时支持跨会话的长期记忆（Memories），通过两阶段提取（Phase 1 原始记忆生成 + Phase 2 合并整理）实现知识的持久化与渐进式遗忘。
 
-Codex 的核心取舍：**内存完整存储 + 惰性压缩**（对比 Gemini CLI 的分层记忆、Kimi CLI 的 Checkpoint 回滚）
+Codex 的核心取舍：**内存完整存储 + 惰性压缩 + 可选长期记忆**（对比 Gemini CLI 的分层记忆、Kimi CLI 的 Checkpoint 回滚）
 
 ---
 
@@ -79,6 +79,9 @@ Codex 的核心取舍：**内存完整存储 + 惰性压缩**（对比 Gemini CL
 | `compact` | 上下文压缩任务执行 | `compact.rs:64` |
 | `truncate` | Token 估算与截断策略 | `truncate.rs` |
 | `RolloutRecorder` | 持久化存储（JSON Lines） | `protocol/src/protocol.rs` |
+| **MemoriesConfig** | **记忆系统配置（启用/禁用、Phase 2 模型等）** | **`config/types.rs:396`** |
+| **Phase 1** | **原始记忆提取（单线程摘要生成）** | **`memories/phase_one.rs`** |
+| **Phase 2** | **记忆合并整理（跨线程知识整合）** | **`memories/phase2.rs:43`** |
 
 ### 2.3 核心组件交互关系
 
@@ -375,6 +378,202 @@ flowchart TD
 
 ---
 
+### 3.5 记忆系统配置（MemoriesConfig）
+
+#### 职责定位
+
+MemoriesConfig 控制 Codex 长期记忆系统的行为，允许用户通过配置文件启用/禁用记忆功能，并调整记忆提取和合并的参数。
+
+#### 配置结构
+
+```rust
+// codex-rs/core/src/config/types.rs:396-406
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoriesConfig {
+    pub generate_memories: bool,      // 是否生成新记忆
+    pub use_memories: bool,           // 是否在 Prompt 中使用记忆
+    pub max_raw_memories_for_global: usize,  // Phase 2 最大原始记忆数
+    pub max_unused_days: i64,         // 记忆最大未使用天数
+    pub max_rollout_age_days: i64,    // 最大 rollout 年龄
+    pub max_rollouts_per_startup: usize,
+    pub min_rollout_idle_hours: i64,
+    pub phase_1_model: Option<String>, // Phase 1 提取模型
+    pub phase_2_model: Option<String>, // Phase 2 合并模型
+}
+```
+
+#### 配置项说明
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|-------|------|--------|------|
+| `generate_memories` | bool | true | 新线程是否存储记忆到 state DB |
+| **use_memories** | **bool** | **true** | **是否在开发者提示词中注入记忆使用说明** |
+| `max_raw_memories_for_global` | usize | 256 | Phase 2 合并时保留的最大原始记忆数 |
+| `max_unused_days` | i64 | 30 | 超过此天数未使用的记忆不参与 Phase 2 |
+| `max_rollout_age_days` | i64 | 30 | 用于记忆的 rollout 最大年龄 |
+| `min_rollout_idle_hours` | i64 | 6 | 生成记忆前的最小空闲时间 |
+| `phase_1_model` | Option<String> | None | Phase 1 提取使用的模型 |
+| `phase_2_model` | Option<String> | None | Phase 2 合并使用的模型 |
+
+#### 配置示例（config.toml）
+
+```toml
+[memories]
+generate_memories = true
+use_memories = true
+max_raw_memories_for_global = 256
+max_unused_days = 30
+min_rollout_idle_hours = 6
+phase_2_model = "o3-mini"
+```
+
+#### use_memories 的作用
+
+当 `use_memories = false` 时，Codex 会跳过记忆使用说明的注入（`codex.rs:2989-2994`）：
+
+```rust
+// codex-rs/core/src/codex.rs:2989-2994
+if turn_context.features.enabled(Feature::MemoryTool)
+    && turn_context.config.memories.use_memories
+    && let Some(memory_prompt) =
+        build_memory_tool_developer_instructions(&turn_context.config.codex_home).await
+{
+    developer_sections.push(memory_prompt);
+}
+```
+
+**设计意图**：允许用户完全禁用记忆功能，避免记忆内容影响当前对话，同时保留已生成的记忆文件供后续启用时使用。
+
+---
+
+### 3.6 记忆遗忘机制（Memory Forgetting）
+
+#### 职责定位
+
+Codex 的记忆系统支持基于差异（diff-based）的遗忘机制，在 Phase 2（合并阶段）通过对比当前选择与前一次成功的选择，识别需要移除的记忆条目。
+
+#### 核心数据结构
+
+```rust
+// codex-rs/state/src/model/memories.rs:32-38
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Phase2InputSelection {
+    pub selected: Vec<Stage1Output>,         // 当前选中的记忆
+    pub previous_selected: Vec<Stage1Output>, // 前一次选中的记忆
+    pub retained_thread_ids: Vec<ThreadId>,  // 保留的线程 ID
+    pub removed: Vec<Stage1OutputRef>,       // 需要移除的记忆引用
+}
+```
+
+#### 遗忘判定逻辑
+
+```rust
+// codex-rs/state/src/runtime/memories.rs:294-422
+pub async fn get_phase2_input_selection(
+    &self,
+    n: usize,
+    max_unused_days: i64,
+) -> anyhow::Result<Phase2InputSelection> {
+    // 1. 查询当前符合条件的记忆（按使用频率和时间排序）
+    let current_rows = sqlx::query(...)
+
+    // 2. 查询前一次 Phase 2 成功时选中的记忆
+    let previous_rows = sqlx::query(...)
+
+    // 3. 计算 retained_thread_ids（当前仍在前 N 的线程）
+    let retained_thread_ids = ...
+
+    // 4. 计算 removed（之前选中但现在不在前 N 的线程）
+    let mut removed = Vec::new();
+    for row in &previous_rows {
+        let thread_id: String = row.try_get("thread_id")?;
+        if current_thread_ids.contains(thread_id.as_str()) {
+            continue;  // 仍被选中，保留
+        }
+        removed.push(stage1_output_ref_from_parts(...));  // 标记为移除
+    }
+
+    Ok(Phase2InputSelection {
+        selected,
+        previous_selected,
+        retained_thread_ids,
+        removed,
+    })
+}
+```
+
+#### 合并提示词中的遗忘指令
+
+合并代理（Consolidation Agent）通过提示词模板接收差异信息：
+
+```markdown
+<!-- codex-rs/core/templates/memories/consolidation.md:124-143 -->
+
+Incremental thread diff snapshot (computed before the current artifact sync rewrites local files):
+
+**Diff since last consolidation:**
+{{ phase2_input_selection }}
+
+Incremental update and forgetting mechanism:
+- Use the diff provided
+- For each added thread id, search it in `raw_memories.md`...
+- For each removed thread id, search it in `MEMORY.md` and delete only the memory supported by that thread
+```
+
+#### 差异渲染格式
+
+```rust
+// codex-rs/core/src/memories/prompts.rs:56-90
+fn render_phase2_input_selection(selection: &Phase2InputSelection) -> String {
+    let retained = selection.retained_thread_ids.len();
+    let added = selection.selected.len().saturating_sub(retained);
+
+    format!(
+        "- selected inputs this run: {}\n\
+         - newly added since the last successful Phase 2 run: {added}\n\
+         - retained from the last successful Phase 2 run: {retained}\n\
+         - removed from the last successful Phase 2 run: {}\n\
+         ...",
+        selection.selected.len(),
+        selection.removed.len(),
+    )
+}
+```
+
+#### 遗忘执行流程
+
+```mermaid
+sequenceDiagram
+    participant P2 as Phase 2 Agent
+    participant DB as State DB
+    participant FS as File System
+
+    P2->>DB: get_phase2_input_selection(n, max_unused_days)
+    DB-->>P2: Phase2InputSelection {selected, previous_selected, retained, removed}
+
+    P2->>P2: 读取 raw_memories.md 和 MEMORY.md
+
+    loop 处理每个 removed thread_id
+        P2->>P2: 在 MEMORY.md 中搜索该 thread_id
+        P2->>P2: 删除仅由该 thread 支持的记忆块
+        P2->>P2: 保留其他 threads 支持的内容
+    end
+
+    loop 处理每个 added thread_id
+        P2->>FS: 读取对应的 rollout_summaries/*.md
+        P2->>P2: 提取新知识并整合到 MEMORY.md
+    end
+
+    P2->>FS: 更新 memory_summary.md
+```
+
+**设计意图**：
+1. **渐进式遗忘**：基于使用频率和时间自动淘汰旧记忆，避免记忆库无限增长
+2. **精确清理**：通过 thread_id 精确追踪每条记忆的来源，仅删除真正"孤儿"的内容
+3. **保留共享内容**：如果一条记忆由多个 threads 支持，仅删除对特定 thread 的引用，保留其他内容
+
+---
+
 ## 4. 端到端数据流转
 
 ### 4.1 正常流程（详细版）
@@ -561,6 +760,7 @@ Agent Loop::run_turn()
 | 压缩策略 | 惰性压缩（触发式） | 实时压缩 (Gemini) | 减少压缩频率，但可能突增 |
 | 压缩粒度 | 整段历史摘要 | 逐条摘要 / 分层记忆 | 简单有效，但粒度粗 |
 | 持久化 | JSON Lines | 数据库 / 二进制 | 可读性好，但体积大 |
+| **长期记忆** | **两阶段提取 + Diff 遗忘** | **实时分层 (Gemini)** | **后台异步处理，渐进式清理** |
 
 ### 6.2 为什么这样设计？
 
@@ -582,7 +782,7 @@ Agent Loop::run_turn()
 
 | 项目 | 核心差异 | 适用场景 |
 |-----|---------|---------|
-| Codex | 惰性压缩 + 字节估算 | 通用场景，平衡性能与精度 |
+| Codex | 惰性压缩 + 字节估算 + 可选长期记忆 | 通用场景，平衡性能与精度；需要跨会话知识积累 |
 | Gemini CLI | 分层记忆 (Working/Short/Long) | 需要精细记忆管理的场景 |
 | Kimi CLI | Checkpoint 回滚 | 需要精确状态恢复的场景 |
 | OpenCode | 简单截断 | 资源受限的场景 |
@@ -632,6 +832,16 @@ impl TruncationPolicy {
 | 孤儿 output | 移除孤立项 | `normalize.rs` |
 | 图片不支持 | 从消息中移除 | `normalize.rs` |
 
+### 7.4 记忆系统边界情况
+
+| 边界情况 | 处理策略 | 代码位置 |
+|---------|---------|---------|
+| **记忆功能禁用** | `use_memories = false` 时跳过记忆提示注入 | `codex.rs:2989` |
+| **Phase 2 无输入** | `raw_memories.is_empty()` 时直接标记成功 | `phase2.rs:115-127` |
+| **记忆提取失败** | 标记 job 失败并记录错误原因 | `phase2.rs:59-68` |
+| **合并代理失败** | 心跳丢失时标记失败并关闭代理 | `phase2.rs:370-384` |
+| **记忆过期** | 超过 `max_unused_days` 的记忆不参与 Phase 2 | `memories.rs:320` |
+
 ---
 
 ## 8. 关键代码索引
@@ -645,6 +855,13 @@ impl TruncationPolicy {
 | 截断 | `truncate.rs` | - | TruncationPolicy |
 | 持久化 | `protocol/src/protocol.rs` | - | RolloutItem |
 | Token 计算 | `truncate.rs` | - | approx_token_count |
+| **记忆配置** | **`config/types.rs`** | **396** | **MemoriesConfig 定义** |
+| **use_memories 使用** | **`codex.rs`** | **2989** | **记忆提示注入控制** |
+| **Phase 2 执行** | **`memories/phase2.rs`** | **43** | **记忆合并主流程** |
+| **差异选择** | **`state/src/runtime/memories.rs`** | **312** | **Phase2InputSelection 查询** |
+| **差异数据结构** | **`state/src/model/memories.rs`** | **32** | **Phase2InputSelection 定义** |
+| **合并提示词** | **`templates/memories/consolidation.md`** | **124** | **遗忘指令模板** |
+| **差异渲染** | **`memories/prompts.rs`** | **56** | **render_phase2_input_selection** |
 
 ---
 
@@ -656,5 +873,5 @@ impl TruncationPolicy {
 
 ---
 
-*✅ Verified: 基于 codex/codex-rs/core/src/context_manager/ 源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*✅ Verified: 基于 codex/codex-rs/core/src/context_manager/ 和 memories/ 源码分析*
+*基于版本：2026-02-08 | 最后更新：2026-03-02（新增 use_memories 配置和记忆遗忘机制）*

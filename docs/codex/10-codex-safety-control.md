@@ -6,6 +6,11 @@
 
 Codex 的核心取舍：**中心化策略注入 + 显式审批门控**（对比 Gemini CLI 的静态分析、Kimi CLI 的自动确认超时）
 
+**近期重要更新**：
+- **Shell 提权安全重构**：zsh-fork 从 zsh_exec_bridge 迁移至 shell-escalation，采用 FD-based 通信机制，比 Unix Domain Socket 更防篡改
+- **host_executable() 规则**：执行策略新增 basename-aware 匹配，允许规则如 `['git']` 匹配 `/usr/bin/git`
+- **网络审批持久化**：网络策略审批结果现在持久化存储在 execpolicy 中，跨会话保持一致
+
 ---
 
 ## 1. 为什么需要这个机制？（解决什么问题）
@@ -75,6 +80,9 @@ MCP 调用 → 作用域验证 → 授权检查 → 受控执行 → 返回
 | `SafetyChecker` | 补丁安全评估 | `core/src/safety.rs:54` |
 | `ExecPolicy` | 执行策略检查 | `core/src/exec_policy.rs:113` |
 | `SandboxOrchestrator` | 沙箱权限编排 | `core/src/tools/sandboxing.rs:178` |
+| **EscalateServer** | **Shell 提权服务器（FD-based）** | `shell-escalation/src/unix/escalate_server.rs:103` |
+| **Policy** | **执行策略引擎（含 host_executable 匹配）** | `execpolicy/src/policy.rs:39` |
+| **NetworkPolicyAmendment** | **网络策略审批持久化** | `execpolicy/src/amend.rs:86` |
 
 ### 2.3 核心组件交互关系
 
@@ -283,7 +291,264 @@ pub(crate) fn prepare_host_proxy_route_spec() -> io::Result<String> {
 }
 ```
 
-### 3.5 组件间协作时序
+### 3.5 Shell 提权安全重构（FD-based）
+
+#### 架构演进
+
+**旧架构（zsh_exec_bridge）**：
+```text
+┌─────────────┐     Unix Domain Socket     ┌─────────────┐
+│  zsh-fork   │ ◄────────────────────────► │   Bridge    │
+│   Shell     │      （可被中间人攻击）      │   Server    │
+└─────────────┘                            └─────────────┘
+```
+
+**新架构（shell-escalation FD-based）**：
+```text
+┌─────────────┐     Socket FD (继承)       ┌─────────────┐
+│  zsh-fork   │ ◄────────────────────────► │EscalateServer│
+│   Shell     │   文件描述符直接传递         │  （内核级）   │
+└─────────────┘   无网络路径，防篡改         └─────────────┘
+```
+
+#### 设计意图
+
+1. **防篡改通信**：FD-based 方案通过 `socketpair()` 创建的内核级通道传递文件描述符，无法被外部进程拦截
+2. **移除中间层**：完全删除 `zsh_exec_bridge` 模块，简化架构并减少攻击面
+3. **统一提权协议**：使用 `shell-escalation` crate 提供的标准化提权协议
+
+#### 关键代码
+
+```rust
+// shell-escalation/src/unix/escalate_server.rs:103-147
+
+pub async fn exec(
+    &self,
+    params: ExecParams,
+    cancel_rx: CancellationToken,
+    command_executor: Arc<dyn ShellCommandExecutor>,
+) -> anyhow::Result<ExecResult> {
+    // 创建 socket pair，FD 直接继承
+    let (escalate_server, escalate_client) = AsyncDatagramSocket::pair()?;
+    let client_socket = escalate_client.into_inner();
+    // 只有客户端 endpoint 应该跨越 exec 进入 wrapper 进程
+    client_socket.set_cloexec(false)?;
+
+    let escalate_task = tokio::spawn(escalate_task(
+        escalate_server,
+        Arc::clone(&self.policy),
+        Arc::clone(&command_executor),
+    ));
+
+    // 通过环境变量传递 FD 编号
+    let mut env = std::env::vars().collect::<HashMap<String, String>>();
+    env.insert(
+        ESCALATE_SOCKET_ENV_VAR.to_string(),
+        client_socket.as_raw_fd().to_string(),
+    );
+    // ... 执行命令
+}
+```
+
+```rust
+// core/src/tools/runtimes/shell/unix_escalation.rs:160-172
+
+// CoreShellActionProvider 实现 EscalationPolicy trait
+let escalation_policy = CoreShellActionProvider {
+    policy: Arc::clone(&exec_policy),
+    session: Arc::clone(&ctx.session),
+    turn: Arc::clone(&ctx.turn),
+    call_id: ctx.call_id.clone(),
+    approval_policy: ctx.turn.approval_policy.value(),
+    // ...
+};
+
+let escalate_server = EscalateServer::new(
+    shell_zsh_path.clone(),
+    main_execve_wrapper_exe,
+    escalation_policy,
+);
+
+let exec_result = escalate_server
+    .exec(exec_params, cancel_token, Arc::new(command_executor))
+    .await?;
+```
+
+### 3.6 执行策略增强（host_executable）
+
+#### 职责定位
+
+`host_executable()` 规则允许执行策略使用 basename-aware 匹配，解决绝对路径命令的规则匹配问题。
+
+#### 匹配语义
+
+```text
+传统匹配（精确匹配）：
+  /usr/bin/git status  只能匹配  pattern=["/usr/bin/git", "status"]
+
+host_executable 匹配（basename 回退）：
+  /usr/bin/git status  可匹配  pattern=["git", "status"]
+  前提是 host_executable(name="git", paths=["/usr/bin/git"]) 已定义
+```
+
+#### 关键代码
+
+```rust
+// execpolicy/src/policy.rs:307-334
+
+fn match_host_executable_rules(&self, cmd: &[String]) -> Vec<RuleMatch> {
+    let Some(first) = cmd.first() else {
+        return Vec::new();
+    };
+    let Ok(program) = AbsolutePathBuf::try_from(first.clone()) else {
+        return Vec::new();
+    };
+    let Some(basename) = executable_path_lookup_key(program.as_path()) else {
+        return Vec::new();
+    };
+    let Some(rules) = self.rules_by_program.get_vec(&basename) else {
+        return Vec::new();
+    };
+    // 检查 host_executable 定义的路径白名单
+    if let Some(paths) = self.host_executables_by_name.get(&basename)
+        && !paths.iter().any(|path| path == &program)
+    {
+        return Vec::new();  // 路径不在白名单中，拒绝匹配
+    }
+
+    // 使用 basename 构建命令进行规则匹配
+    let basename_command = std::iter::once(basename)
+        .chain(cmd.iter().skip(1).cloned())
+        .collect::<Vec<_>>();
+    rules
+        .iter()
+        .filter_map(|rule| rule.matches(&basename_command))
+        .map(|rule_match| rule_match.with_resolved_program(&program))
+        .collect()
+}
+```
+
+#### 配置示例
+
+```starlark
+# execpolicy/README.md
+
+# 定义 host executable 路径白名单
+host_executable(
+    name = "git",
+    paths = [
+        "/opt/homebrew/bin/git",
+        "/usr/bin/git",
+    ],
+)
+
+# 现在可以使用 basename 定义规则
+prefix_rule(
+    pattern = ["git", "status"],
+    decision = "allow",
+)
+```
+
+### 3.7 网络审批持久化
+
+#### 职责定位
+
+网络策略审批结果现在持久化存储在 execpolicy 中，确保跨会话的一致性行为。
+
+#### 关键代码
+
+```rust
+// execpolicy/src/amend.rs:86-126
+
+/// 追加网络规则到策略文件（带文件锁）
+pub fn blocking_append_network_rule(
+    policy_path: &Path,
+    host: &str,
+    protocol: NetworkRuleProtocol,
+    decision: Decision,
+    justification: Option<&str>,
+) -> Result<(), AmendError> {
+    let host = normalize_network_rule_host(host)
+        .map_err(|err| AmendError::InvalidNetworkRule(err.to_string()))?;
+
+    // 序列化规则字段
+    let host = serde_json::to_string(&host)
+        .map_err(|source| AmendError::SerializeNetworkRule { source })?;
+    let protocol = serde_json::to_string(protocol.as_policy_string())?;
+    let decision = serde_json::to_string(match decision {
+        Decision::Allow => "allow",
+        Decision::Prompt => "prompt",
+        Decision::Forbidden => "deny",
+    })?;
+
+    // 构建规则字符串
+    let mut args = vec![
+        format!("host={host}"),
+        format!("protocol={protocol}"),
+        format!("decision={decision}"),
+    ];
+    if let Some(justification) = justification {
+        let justification = serde_json::to_string(justification)?;
+        args.push(format!("justification={justification}"));
+    }
+    let rule = format!("network_rule({})", args.join(", "));
+    append_rule_line(policy_path, &rule)
+}
+```
+
+```rust
+// core/src/network_policy_decision.rs:93-121
+
+/// 将网络策略修订转换为 execpolicy 格式
+pub(crate) fn execpolicy_network_rule_amendment(
+    amendment: &NetworkPolicyAmendment,
+    network_approval_context: &NetworkApprovalContext,
+    host: &str,
+) -> ExecPolicyNetworkRuleAmendment {
+    let protocol = match network_approval_context.protocol {
+        NetworkApprovalProtocol::Http => ExecPolicyNetworkRuleProtocol::Http,
+        NetworkApprovalProtocol::Https => ExecPolicyNetworkRuleProtocol::Https,
+        // ...
+    };
+    let (decision, action_verb) = match amendment.action {
+        NetworkPolicyRuleAction::Allow => (ExecPolicyDecision::Allow, "Allow"),
+        NetworkPolicyRuleAction::Deny => (ExecPolicyDecision::Forbidden, "Deny"),
+    };
+    let justification = format!("{action_verb} {protocol_label} access to {host}");
+
+    ExecPolicyNetworkRuleAmendment {
+        protocol,
+        decision,
+        justification,
+    }
+}
+```
+
+#### 持久化流程
+
+```text
+用户审批网络请求
+       │
+       ▼
+┌─────────────────┐
+│ NetworkPolicy   │ ──► 生成 NetworkPolicyAmendment
+│ Amendment       │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ execpolicy      │ ──► 转换为 network_rule() 格式
+│ amend.rs        │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ 策略文件追加    │ ──► 带文件锁追加到 .rules 文件
+│ (持久化存储)    │
+└─────────────────┘
+```
+
+### 3.8 组件间协作时序
 
 ```mermaid
 sequenceDiagram
@@ -319,7 +584,7 @@ sequenceDiagram
     end
 ```
 
-### 3.6 关键数据路径
+### 3.9 关键数据路径
 
 #### 主路径（正常审批）
 
@@ -621,6 +886,12 @@ pub startup_timeout_sec: Option<Duration>,
 | 沙箱编排 | `core/src/tools/sandboxing.rs` | 178 | 权限编排 |
 | MCP 拒绝 | `core/src/mcp_connection_manager.rs` | 245 | MCP 引导检查 |
 | 代理沙箱 | `linux-sandbox/src/proxy_routing.rs` | 70 | Proxy-Only 实现 |
+| **Shell 提权** | `shell-escalation/src/unix/escalate_server.rs` | 103 | FD-based 提权服务器 |
+| **Unix 提权实现** | `core/src/tools/runtimes/shell/unix_escalation.rs` | 53 | zsh-fork 提权集成 |
+| **host_executable** | `execpolicy/src/policy.rs` | 307 | basename-aware 匹配 |
+| **策略解析** | `execpolicy/src/parser.rs` | 437 | host_executable() 解析 |
+| **网络规则追加** | `execpolicy/src/amend.rs` | 86 | 网络审批持久化 |
+| **网络策略决策** | `core/src/network_policy_decision.rs` | 93 | 网络审批转换 |
 
 ---
 
@@ -633,4 +904,7 @@ pub startup_timeout_sec: Option<Duration>,
 ---
 
 *✅ Verified: 基于 codex/codex-rs/core/src/{safety,exec_policy,sandboxing}.rs 源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*⚠️ Inferred: Shell Escalation 重构基于 commit 3ca0e7673b77303db6e0d686c1d9d34fc2ed63e0*
+*⚠️ Inferred: host_executable() 基于 commit b148d98e0eaed114b38c461e6cd9ef845bb491d1*
+*⚠️ Inferred: 网络审批持久化基于 commit c3048ff90a4c41160d3bfb0186fba969aacb2cef*
+*基于版本：2026-02-08 | 最后更新：2026-03-02*

@@ -6,6 +6,8 @@
 
 Kimi CLI 的核心取舍：**Worker 子进程隔离 + 历史回放机制**（对比 Codex 的内嵌共享模式、OpenCode 的 Hono+Bun 多协议架构、Gemini CLI 的 A2A+SSE 协议）
 
+**近期改进**：支持 Ctrl+C 优雅退出、WebSocket 异步文件操作（非阻塞）、会话启动错误状态反馈
+
 ---
 
 ## 1. 为什么需要这个机制？（解决什么问题）
@@ -93,6 +95,9 @@ WebSocket 实时通信 + 历史回放 → 流式输出 + 会话恢复 → 类 Ch
 | `SessionProcess` | 单会话 Worker 子进程管理，WebSocket 广播 | `kimi-cli/src/kimi_cli/web/runner/process.py:54` |
 | `session_stream()` | WebSocket 连接处理，历史回放 | `kimi-cli/src/kimi_cli/web/api/sessions.py:1044` |
 | `run_worker()` | Worker 子进程入口，加载会话 | `kimi-cli/src/kimi_cli/web/runner/worker.py:26` |
+| **SIGINT 恢复** | **恢复默认信号处理器，支持 Ctrl+C 退出** | **`kimi-cli/src/kimi_cli/cli/__init__.py:608`** |
+| **异步文件操作** | **使用 asyncio.to_thread 避免阻塞事件循环** | **`kimi-cli/src/kimi_cli/web/api/sessions.py:233`** |
+| **会话错误处理** | **会话环境启动失败时发送错误状态** | **`kimi-cli/src/kimi_cli/web/api/sessions.py:1135`** |
 
 ### 2.3 核心组件交互关系
 
@@ -319,6 +324,90 @@ async def session_stream(session_id, websocket, runner):
 2. **回放模式切换**：先回放历史，再切换到实时模式
 3. **Busy 状态拒绝**：防止并发 prompt 导致状态混乱
 4. **优雅断开处理**：finally 块确保 WebSocket 被正确移除
+5. **异步文件操作**：使用 `asyncio.to_thread()` 避免阻塞事件循环
+6. **会话启动错误处理**：会话环境启动失败时发送明确的 error 状态
+
+---
+
+### 3.2.1 异步文件操作优化
+
+**问题**：历史回放时读取 `wire.jsonl` 文件会阻塞事件循环，影响并发性能。
+
+**解决方案**：使用 `asyncio.to_thread()` 将同步文件操作移至后台线程。
+
+```python
+# kimi-cli/src/kimi_cli/web/api/sessions.py:230-241
+async def replay_history(ws: WebSocket, session_dir: Path) -> None:
+    """Replay historical wire messages from wire.jsonl to a WebSocket."""
+    wire_file = session_dir / "wire.jsonl"
+    # 使用 asyncio.to_thread 避免阻塞事件循环
+    if not await asyncio.to_thread(wire_file.exists):
+        return
+
+    try:
+        lines = await asyncio.to_thread(_read_wire_lines, wire_file)
+        for event_text in lines:
+            await ws.send_text(event_text)
+    except Exception:
+        pass
+```
+
+**设计意图**：
+- **非阻塞 I/O**：文件操作在独立线程执行，不阻塞主事件循环
+- **并发性能提升**：多个 WebSocket 连接可同时处理历史回放
+- **兼容性保持**：保持原有同步文件读取逻辑，仅包装为异步接口
+
+---
+
+### 3.2.2 会话连接状态与错误处理
+
+**问题**：会话环境启动失败时，客户端会卡在 "Connecting to environment..." 状态，无明确错误反馈。
+
+**解决方案**：在会话启动流程中添加 try-except 块，启动失败时发送 error 状态。
+
+```python
+# kimi-cli/src/kimi_cli/web/api/sessions.py:1117-1152
+# Start session environment – if anything fails here, send an error
+# status so the client doesn't hang on "Connecting to environment...".
+try:
+    # Ensure work_dir exists
+    work_dir = Path(str(session.kimi_cli_session.work_dir))
+    await asyncio.to_thread(lambda: work_dir.mkdir(parents=True, exist_ok=True))
+
+    if not attached:
+        session_process = await runner.get_or_create_session(session_id)
+        await session_process.add_websocket_and_begin_replay(websocket)
+        attached = True
+
+    assert session_process is not None
+    # End replay and start worker
+    await session_process.end_replay(websocket)
+    await session_process.start()
+    await session_process.send_status_snapshot(websocket)
+except Exception as e:
+    logger.warning(f"Failed to start session environment: {e}")
+    try:
+        error_status = SessionStatus(
+            session_id=session_id,
+            state="error",
+            seq=0,
+            worker_id=None,
+            reason="initialization_failed",
+            detail=str(e),
+            updated_at=datetime.now(UTC),
+        )
+        await websocket.send_text(
+            new_session_status_message(error_status).model_dump_json()
+        )
+    except Exception:
+        pass
+    return
+```
+
+**设计意图**：
+- **明确错误反馈**：会话启动失败时立即通知客户端，避免无限等待
+- **详细错误信息**：包含具体的异常原因，便于问题定位
+- **优雅降级**：发送错误状态后正常关闭连接，不导致服务端异常
 
 ---
 
@@ -394,7 +483,87 @@ sequenceDiagram
 
 ---
 
-### 3.4 关键数据路径
+### 3.4 优雅关闭机制
+
+**问题**：从 CLI 模式切换到 Web 模式后，终端的 SIGINT 处理器被 shell 的 asyncio 修改，导致 Ctrl+C 无法正常退出 Web Server。
+
+**解决方案**：在启动 Web Server 前恢复默认 SIGINT 处理器和终端状态。
+
+```python
+# kimi-cli/src/kimi_cli/cli/__init__.py:603-620
+if switch_to_web:
+    from kimi_cli.utils.logging import restore_stderr
+
+    restore_stderr()
+
+    # Restore default SIGINT handler and terminal state after the shell's
+    # asyncio.run() to ensure Ctrl+C works in the uvicorn web server.
+    import signal
+
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+
+    from kimi_cli.utils.term import ensure_tty_sane
+
+    ensure_tty_sane()
+
+    from kimi_cli.web.app import run_web_server
+
+    run_web_server(open_browser=True)
+```
+
+**Web Server 关闭配置**：
+
+```python
+# kimi-cli/src/kimi_cli/web/app.py:529-537
+uvicorn.run(
+    "kimi_cli.web.app:create_app",
+    factory=True,
+    host=host,
+    port=actual_port,
+    reload=reload,
+    log_level="info",
+    timeout_graceful_shutdown=3,  # 3秒优雅关闭超时
+)
+```
+
+**Runner 异步停止**：
+
+```python
+# kimi-cli/src/kimi_cli/web/app.py:178-186
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Start KimiCLI runner
+    runner = KimiCLIRunner()
+    app.state.runner = runner
+    runner.start()
+
+    try:
+        yield
+    finally:
+        await runner.stop()  # 异步停止所有会话
+
+# kimi-cli/src/kimi_cli/web/runner/process.py:671-682
+async def stop(self) -> None:
+    """Stop all running sessions."""
+    tasks: list[asyncio.Task[None]] = []
+    for session in self._sessions.values():
+        if session.is_running:
+            tasks.append(asyncio.create_task(session.stop()))
+    if tasks:
+        _, pending = await asyncio.wait(tasks, timeout=5.0)
+        for t in pending:
+            t.cancel()
+```
+
+**设计意图**：
+- **信号处理器恢复**：恢复默认 SIGINT 处理器，使 Ctrl+C 能正常触发进程退出
+- **终端状态重置**：恢复终端到正常状态，避免 shell 残留状态影响 Web 模式
+- **优雅关闭超时**：uvicorn 配置 3 秒优雅关闭超时，确保连接正常关闭
+- **异步资源清理**：使用 async/await 模式确保所有会话资源被正确释放
+
+---
+
+### 3.5 关键数据路径
 
 #### 主路径（正常流程）
 
@@ -884,6 +1053,8 @@ gitGraph
 | 会话停止 | 调用 stop() | `process.py:223-226` |
 | Worker 重启 | 调用 restart_worker() | `process.py:259-264` |
 | 安全校验失败 | token/origin/lan 校验失败 | `sessions.py:1067-1083` |
+| **服务器优雅关闭** | **Ctrl+C / SIGINT 信号** | **`cli/__init__.py:608`** |
+| **会话初始化失败** | **work_dir 创建失败 / Worker 启动失败** | **`sessions.py:1135-1152`** |
 
 ### 7.2 超时/资源限制
 
@@ -897,12 +1068,16 @@ await asyncio.wait_for(self._process.wait(), timeout=10.0)  # process.py:241
 
 # Runner 停止超时
 await asyncio.wait(tasks, timeout=5.0)  # process.py:678
+
+# Web Server 优雅关闭超时
+uvicorn.run(..., timeout_graceful_shutdown=3)  # app.py:536
 ```
 
 **资源限制说明**：
 - 消息缓冲区：16MB（支持 base64 编码的大图片）
 - Worker 停止超时：10 秒
 - Runner 停止超时：5 秒
+- **Web Server 优雅关闭超时：3 秒**
 - 无全局消息历史限制（依赖磁盘空间）
 
 ### 7.3 错误恢复策略
@@ -933,6 +1108,10 @@ await asyncio.wait(tasks, timeout=5.0)  # process.py:678
 | 广播机制 | `kimi-cli/src/kimi_cli/web/runner/process.py` | 526 | _broadcast() |
 | 历史回放 | `kimi-cli/src/kimi_cli/web/api/sessions.py` | 1108 | replay_history() |
 | 文件编码 | `kimi-cli/src/kimi_cli/web/runner/process.py` | 377 | _encode_uploaded_files() |
+| **SIGINT 恢复** | **`kimi-cli/src/kimi_cli/cli/__init__.py`** | **608** | **恢复默认信号处理器支持 Ctrl+C** |
+| **异步文件读取** | **`kimi-cli/src/kimi_cli/web/api/sessions.py`** | **233** | **asyncio.to_thread 避免阻塞** |
+| **Runner 异步停止** | **`kimi-cli/src/kimi_cli/web/runner/process.py`** | **671** | **async stop() 优雅关闭** |
+| **会话启动错误** | **`kimi-cli/src/kimi_cli/web/api/sessions.py`** | **1135** | **初始化失败时发送 error 状态** |
 | 状态管理 | `kimi-cli/src/kimi_cli/web/runner/process.py` | 133 | _build_status() |
 | 安全配置 | `kimi-cli/src/kimi_cli/web/app.py` | 52 | DEFAULT_PORT 等常量 |
 
@@ -950,5 +1129,5 @@ await asyncio.wait(tasks, timeout=5.0)  # process.py:678
 
 ---
 
-*✅ Verified: 基于 kimi-cli/src/kimi_cli/web/app.py、runner/process.py、runner/worker.py、api/sessions.py 等源码分析*
-*基于版本：2026-02 | 最后更新：2026-02-24*
+*✅ Verified: 基于 kimi-cli/src/kimi_cli/web/app.py、runner/process.py、runner/worker.py、api/sessions.py、cli/__init__.py 等源码分析*
+*基于版本：2026-03 | 最后更新：2026-03-02*

