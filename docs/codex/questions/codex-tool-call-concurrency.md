@@ -5,14 +5,14 @@
 Codex **已实现 tool call 并发调用**，并且是“**模型能力开关 + 工具级并发能力 + 运行时读写锁**”三层联合控制。
 
 - 项目名 + 文件路径 + 关键职责：
-  - `codex` + `codex/codex-rs/core/src/codex.rs`：在采样请求里打开 `parallel_tool_calls`，并维护 `in_flight` 工具 future。
+  - `codex` + `codex/codex-rs/core/src/codex.rs`：在模型请求里打开 `parallel_tool_calls`，并维护 `in_flight` 工具 future。
   - `codex` + `codex/codex-rs/core/src/tools/parallel.rs`：`ToolCallRuntime` 根据工具是否支持并发决定读锁/写锁。
   - `codex` + `codex/codex-rs/core/src/tools/router.rs`：`ToolCall` 标准化、判断 `tool_supports_parallel`。
   - `codex` + `codex/codex-rs/core/src/tools/registry.rs`：`ConfiguredToolSpec.supports_parallel_tool_calls` + `is_mutating`/`tool_call_gate`。
 
 ## 如何实现
 
-1. 在 turn 采样请求中，从模型信息读取 `supports_parallel_tool_calls`，并写入 prompt 的 `parallel_tool_calls`。  
+1. 在 turn 模型请求中，从模型信息读取 `supports_parallel_tool_calls`，并写入 prompt 的 `parallel_tool_calls`。  
 2. 流式接收 `ResponseEvent::OutputItemDone`，遇到工具调用时生成 tool future，推入 `in_flight`。  
 3. `ToolCallRuntime.handle_tool_call()` 判断工具并发能力：  
    - 支持并发：拿 `RwLock` 读锁（可并发）  

@@ -2,7 +2,7 @@
 
 ## TL;DR（结论先行）
 
-一句话定义：Agent Loop 是 Codex 的**turn 内多轮采样循环机制**，模型每轮可能产出工具调用，工具结果回注历史后继续采样，直到 `needs_follow_up=false` 才结束该 turn。
+一句话定义：Agent Loop 是 Codex 的**turn 内多轮请求-响应迭代机制**，模型每轮可能产出工具调用，工具结果回注历史后继续请求模型，直到 `needs_follow_up=false` 才结束该 turn。
 
 Codex 的核心取舍：**事件驱动的异步流式处理 + Task 化生命周期管理**
 （对比 Kimi CLI 的命令式 while 循环 + Checkpoint 回滚、Gemini CLI 的递归 continuation）
@@ -56,7 +56,7 @@ Codex 进一步解决的问题：
 │ codex/codex-rs/core/src/codex.rs                            │
 │ - submission_loop(): 会话级事件循环                          │
 │ - run_turn(): turn 级主循环                                  │
-│ - run_sampling_request(): 单轮采样                          │
+│ - run_sampling_request(): 单轮模型请求                      │
 │ - try_run_sampling_request(): 流式事件处理                   │
 └───────────────────────┬─────────────────────────────────────┘
                         │ 依赖/调用
@@ -64,7 +64,7 @@ Codex 进一步解决的问题：
         ▼               ▼               ▼
 ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
 │ LLM Provider │ │ Tool System  │ │ Context      │
-│ 采样请求     │ │ 工具执行     │ │ 状态管理     │
+│ 模型请求     │ │ 工具执行     │ │ 状态管理     │
 └──────────────┘ └──────────────┘ └──────────────┘
 ```
 
@@ -74,9 +74,9 @@ Codex 进一步解决的问题：
 |-----|------|---------|
 | `submission_loop` | 会话级事件循环，消费 `Op::*` 并分发任务 | `core/src/codex.rs` |
 | `RegularTask` | turn 生命周期管理（启动、取消、完成） | `core/src/tasks/regular.rs` |
-| `run_turn` | turn 级主循环，控制多轮采样 | `core/src/codex.rs` |
-| `run_sampling_request` | 构建 prompt，执行 provider 级重试 | `core/src/codex.rs` |
-| `try_run_sampling_request` | 流式事件处理，工具并发控制 | `core/src/codex.rs` |
+| `run_turn` | turn 级主循环，控制多轮请求-响应迭代 | `core/src/codex.rs` |
+| `run_sampling_request` | 构建 prompt，执行单轮模型请求及重试 | `core/src/codex.rs` |
+| `try_run_sampling_request` | 流式响应处理，工具并发控制 | `core/src/codex.rs` |
 | `ToolCallRuntime` | 工具调用运行时，管理并发与取消 | `core/src/tools/runtime.rs` |
 | `ToolRouter` | 工具路由，解析和分发工具调用 | `core/src/tools/router.rs` |
 
@@ -136,8 +136,8 @@ sequenceDiagram
 |-----|---------|---------|
 | 1-2 | 用户输入进入会话级事件循环 | 解耦 CLI 与核心逻辑，支持多种输入源 |
 | 3 | Task 启动 turn 执行 | turn 作为独立任务，支持取消和替换 |
-| 4 | 预采样压缩检查 | 在调用 LLM 前处理上下文溢出 |
-| 5-7 | 构建 prompt 并开始流式采样 | 统一封装工具和模型参数 |
+| 4 | 预请求压缩检查 | 在调用 LLM 前处理上下文溢出 |
+| 5-7 | 构建 prompt 并开始流式请求 | 统一封装工具和模型参数 |
 | 8-10 | 流式处理中并发执行工具 | UI 实时更新，工具后台执行 |
 | 11-12 | 根据工具结果决定是否继续 | 核心状态机：needs_follow_up |
 
@@ -149,7 +149,7 @@ sequenceDiagram
 
 #### 职责定位
 
-`run_turn()` 是 Codex Agent Loop 的核心，负责管理单个 turn 内的多轮采样循环，直到没有更多工作需要模型处理。
+`run_turn()` 是 Codex Agent Loop 的核心，负责管理单个 turn 内的多轮请求-响应迭代，直到没有更多工作需要模型处理。
 
 #### 状态机图
 
@@ -175,7 +175,7 @@ stateDiagram-v2
 | 状态 | 说明 | 进入条件 | 退出条件 |
 |-----|------|---------|---------|
 | Initializing | 初始化阶段 | run_turn() 被调用 | 发送 TurnStarted 事件 |
-| Sampling | 采样中 | 调用 run_sampling_request() | 流结束或中断 |
+| Sampling | 模型请求中 | 调用 run_sampling_request() | 流结束或中断 |
 | Processing | 处理流式响应 | 收到 ResponseEvent | 处理完成或中断 |
 | Waiting | 等待工具执行 | 有并发工具在执行 | 所有工具完成 |
 | Compacting | 上下文压缩 | token 超限且需要继续 | 压缩完成 |
@@ -193,7 +193,7 @@ stateDiagram-v2
 └──────────────────────────┬──────────────────────────────────┘
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  处理层 - 每轮采样循环                                        │
+│  处理层 - 每轮请求-响应迭代                                   │
 │  ┌─────────────────────────────────────────────────────────┐│
 │  │ 主处理器: run_sampling_request()                        ││
 │  │   ├── Prompt 构建 (history + tools + instructions)      ││
@@ -250,8 +250,8 @@ flowchart TD
 
 **算法要点**：
 
-1. **双层循环结构**：外层 turn 生命周期，内层采样循环
-2. **Compaction 嵌入点**：turn 开始前 + 采样后 token 超限时
+1. **双层循环结构**：外层 turn 生命周期，内层请求-响应迭代
+2. **Compaction 嵌入点**：turn 开始前 + 模型响应后 token 超限时
 3. **needs_follow_up 判断**：工具调用或 pending_input 触发继续
 4. **优雅退出**：无后续工作时自然结束而非强制中断
 
@@ -260,7 +260,7 @@ flowchart TD
 | 接口 | 输入 | 输出 | 说明 | 代码位置 |
 |-----|------|------|------|---------|
 | `run_turn()` | `Arc<Session>`, `TurnContext` | `Option<String>` | turn 主循环 | `core/src/codex.rs` |
-| `run_sampling_request()` | `&mut TurnState`, `bool` | `SamplingRequestResult` | 单轮采样 | `core/src/codex.rs` |
+| `run_sampling_request()` | `&mut TurnState`, `bool` | `SamplingRequestResult` | 单轮模型请求 | `core/src/codex.rs` |
 | `try_run_sampling_request()` | `&mut TurnState`, `bool` | `SamplingRequestResult` | 流式事件处理 | `core/src/codex.rs` |
 
 ---
@@ -313,7 +313,7 @@ flowchart TD
 
 ### 3.3 组件间协作时序
 
-展示 `run_turn` 与工具系统如何协作完成一次带工具调用的采样。
+展示 `run_turn` 与工具系统如何协作完成一次带工具调用的模型请求。
 
 ```mermaid
 sequenceDiagram
@@ -363,7 +363,7 @@ sequenceDiagram
 
 **协作要点**：
 
-1. **run_turn 与 SamplingRequest**：单轮采样的完整封装，包括重试和流处理
+1. **run_turn 与 SamplingRequest**：单轮模型请求的完整封装，包括重试和流处理
 2. **流与工具并行**：工具 future 与流处理并行，不阻塞 UI 更新
 3. **结果顺序保证**：`drain_in_flight()` 确保工具结果按原始顺序注入 history
 
@@ -381,7 +381,7 @@ flowchart LR
     end
 
     subgraph Process["处理阶段"]
-        P1[Prompt 构建] --> P2[LLM 采样]
+        P1[Prompt 构建] --> P2[LLM 请求]
         P2 --> P3[流式事件处理]
         P3 --> P4[工具执行]
         P4 --> P5[结果注入 history]
@@ -410,7 +410,7 @@ flowchart TD
     E1 -->|用户取消| R4[abort_all_tasks]
 
     R1 --> R1A[指数退避]
-    R1A -->|成功| R1B[继续采样]
+    R1A -->|成功| R1B[继续请求]
     R1A -->|失败| R3
 
     R2 --> R2A[压缩 history]
@@ -436,7 +436,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    Start[采样完成] --> Check{token > limit?}
+    Start[模型响应完成] --> Check{token > limit?}
     Check -->|Yes| Check2{needs_follow_up?}
     Check -->|No| Normal[正常判断]
 
@@ -486,7 +486,7 @@ sequenceDiagram
     loop needs_follow_up = true
         Turn->>Turn: history.for_prompt()
         Turn->>Turn: built_tools()
-        Turn->>LLM: 采样请求
+        Turn->>LLM: 发送模型请求
         LLM-->>Turn: ResponseEvent 流
 
         loop 流式处理
@@ -522,7 +522,7 @@ sequenceDiagram
 |-----|------|------|------|---------|
 | 接收 | `Op::UserInput` | 构建 `TurnContext` | `TurnState` | `core/src/codex.rs` |
 | Prompt | `history` + `tools` | `for_prompt()` + `built_tools()` | `Input` | `core/src/codex.rs` |
-| 采样 | `Input` | Provider API 调用 | `ResponseEvent` 流 | `core/src/codex.rs` |
+| 模型请求 | `Input` | Provider API 调用 | `ResponseEvent` 流 | `core/src/codex.rs` |
 | 工具 | `ToolCall` | 沙箱执行 | `ToolOutput` | `core/src/tools/` |
 | 输出 | `ToolOutput` | 格式化为 `ResponseInputItem` | 注入 history | `core/src/codex.rs` |
 
@@ -536,7 +536,7 @@ flowchart LR
     end
 
     subgraph Process["处理阶段"]
-        P1[Prompt 构建] --> P2[LLM 采样]
+        P1[Prompt 构建] --> P2[LLM 请求]
         P2 --> P3[流式事件]
         P3 --> P4{分支判断}
         P4 -->|工具| P5[ToolCallRuntime]
@@ -547,7 +547,7 @@ flowchart LR
 
     subgraph Output["输出阶段"]
         O1[needs_follow_up?] --> O2{继续?}
-        O2 -->|Yes| O3[下一轮采样]
+        O2 -->|Yes| O3[下一轮请求]
         O2 -->|No| O4[TurnComplete]
     end
 
@@ -567,7 +567,7 @@ flowchart TD
     B -->|Yes| C[abort_all_tasks]
     C --> D[TurnAborted]
 
-    B -->|No| E[采样]
+    B -->|No| E[模型请求]
     E --> F{错误?}
     F -->|可重试| G[指数退避重试]
     G --> E
@@ -610,7 +610,7 @@ struct TurnState {
     history: History,
     /// 在飞的工具调用
     in_flight: InFlightTracker,
-    /// 是否需要继续采样
+    /// 是否需要继续请求模型
     needs_follow_up: bool,
     /// Token 使用情况
     total_usage_tokens: usize,
@@ -643,7 +643,7 @@ struct TrackedToolCall {
 | `needs_follow_up` | `bool` | 控制主循环是否继续 |
 | `total_usage_tokens` | `usize` | 累计 token 使用，用于触发 compaction |
 | `cancellation_token` | `CancellationToken` | 支持用户取消操作 |
-| `pending_input` | `Vec<InputItem>` | 采样期间注入的新输入 |
+| `pending_input` | `Vec<InputItem>` | 模型请求期间注入的新输入 |
 
 ### 5.2 主链路代码
 
@@ -660,7 +660,7 @@ async fn run_turn(
     // 1. 发送 TurnStarted
     session.send_event(EventMsg::TurnStarted { ... });
 
-    // 2. 预采样压缩
+    // 2. 预请求压缩
     if let Some(compact_result) = run_pre_sampling_compact(&mut state).await? {
         // 处理压缩结果
     }
@@ -676,7 +676,7 @@ async fn run_turn(
             return Err(Error::Cancelled);
         }
 
-        // 5. 单轮采样
+        // 5. 单轮模型请求
         let result = run_sampling_request(&mut state, false).await?;
 
         // 6. 检查是否需要自动压缩
@@ -708,9 +708,9 @@ async fn run_turn(
 **代码要点**：
 
 1. **状态机驱动**：`needs_follow_up` 控制循环，而非固定轮数
-2. **Compaction 嵌入**：采样前后都检查 token 限制
+2. **Compaction 嵌入**：模型请求前后都检查 token 限制
 3. **取消检查**：每次循环开始检查 `CancellationToken`
-4. **Pending input 处理**：支持采样期间动态注入输入
+4. **Pending input 处理**：支持模型请求期间动态注入输入
 
 ### 5.3 关键调用链
 
@@ -748,7 +748,7 @@ submit(Op::UserInput)                    [core/src/codex.rs:457]
 |-----|-------------|---------|---------|
 | 循环结构 | 事件驱动的 async/await | while 迭代（Kimi）/ 递归（Gemini） | 流式处理自然，但状态分散在多个 await 点 |
 | 并发模型 | 并发派发、顺序收集 | 完全串行 / 完全并行 | 工具执行效率高，结果顺序有保证 |
-| 上下文管理 | 前置压缩 + 采样后触发 | 无压缩（Codex 旧版）/ 强制截断 | 长会话可持续，但压缩可能丢失细节 |
+| 上下文管理 | 前置压缩 + 响应后触发 | 无压缩（Codex 旧版）/ 强制截断 | 长会话可持续，但压缩可能丢失细节 |
 | 任务生命周期 | Task 化（RegularTask） | 直接函数调用 | 支持取消/替换，但增加了抽象复杂度 |
 | 工具集成 | 统一 Registry + Router | 硬编码分支 | 扩展性好，但动态分发有开销 |
 
@@ -868,7 +868,7 @@ let retry_config = RetryConfig {
 |-----|------|------|------|
 | 入口 | `core/src/codex.rs` | 457 | `submit()` 会话级入口 |
 | 核心 | `core/src/codex.rs` | 1204 | `run_turn()` turn 主循环 |
-| 采样 | `core/src/codex.rs` | 1456 | `run_sampling_request()` |
+| 模型请求 | `core/src/codex.rs` | 1456 | `run_sampling_request()` |
 | 流处理 | `core/src/codex.rs` | 1623 | `try_run_sampling_request()` |
 | 工具运行时 | `core/src/tools/runtime.rs` | 89 | `ToolCallRuntime` |
 | 工具路由 | `core/src/tools/router.rs` | 156 | `ToolRouter::dispatch_tool_call()` |

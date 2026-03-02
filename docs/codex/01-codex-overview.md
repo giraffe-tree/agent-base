@@ -108,7 +108,7 @@ sequenceDiagram
     else 工具调用
         Core->>Tools: dispatch(invocation)
         Tools-->>Core: tool output
-        Core->>Model: 继续采样
+        Core->>Model: 继续请求
     end
 
     Core->>Core: 更新 history/token/rollout
@@ -135,7 +135,7 @@ spawn Codex
   -> submission_loop
     -> 创建 TurnContext
     -> 运行 task（regular/review/...）
-    -> 模型采样 + 工具调用 + 状态更新
+    -> 模型请求 + 工具调用 + 状态更新
     -> flush rollout + TurnComplete
 ```
 
