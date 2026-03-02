@@ -120,26 +120,27 @@
 
 ---
 
-## 统一分析框架（01~12 编号）
+## 统一分析框架（01~13 编号）
 
 绝大多数项目都按以下主线组织，便于横向对读：
 
-| 编号 | 主题 |
-|:---:|:---|
-| `01` | Overview（整体架构与核心取舍） |
-| `02` | CLI Entry / Session Management |
-| `03` | Session Runtime |
-| `04` | Agent Loop |
-| `05` | Tools System |
-| `06` | MCP Integration |
-| `07` | Memory Context |
-| `08` | UI Interaction |
-| `09` | Web Server |
-| `10` | Safety Control |
-| `11` | Prompt Organization |
-| `12` | Logging |
+| 编号 | 主题 | codex | gemini-cli | kimi-cli | opencode | swe-agent | qwen-code |
+|:---:|:---|:---:|:---:|:---:|:---:|:---:|:---:|
+| `01` | Overview（整体架构） | [01](./docs/codex/01-codex-overview.md) | [01](./docs/gemini-cli/01-gemini-cli-overview.md) | [01](./docs/kimi-cli/01-kimi-cli-overview.md) | [01](./docs/opencode/01-opencode-overview.md) | [01](./docs/swe-agent/01-swe-agent-overview.md) | [01](./docs/qwen-code/01-qwen-code-overview.md) |
+| `02` | CLI Entry / Session | [02](./docs/codex/02-codex-session-management.md) | [02](./docs/gemini-cli/02-gemini-cli-session-management.md) | [02](./docs/kimi-cli/02-kimi-cli-session-management.md) | [02](./docs/opencode/02-opencode-session-management.md) | [02](./docs/swe-agent/02-swe-agent-session-management.md) | [02](./docs/qwen-code/02-qwen-code-session-management.md) |
+| `03` | Session Runtime | [03](./docs/codex/03-codex-session-runtime.md) | [03](./docs/gemini-cli/03-gemini-cli-session-runtime.md) | [03](./docs/kimi-cli/03-kimi-cli-session-runtime.md) | [03](./docs/opencode/03-opencode-session-runtime.md) | [03](./docs/swe-agent/03-swe-agent-session-runtime.md) | [03](./docs/qwen-code/03-qwen-code-session-runtime.md) |
+| `04` | Agent Loop | [04](./docs/codex/04-codex-agent-loop.md) | [04](./docs/gemini-cli/04-gemini-cli-agent-loop.md) | [04](./docs/kimi-cli/04-kimi-cli-agent-loop.md) | [04](./docs/opencode/04-opencode-agent-loop.md) | [04](./docs/swe-agent/04-swe-agent-agent-loop.md) | [04](./docs/qwen-code/04-qwen-code-agent-loop.md) |
+| `05` | Tools System | [05](./docs/codex/05-codex-tools-system.md) | [05](./docs/gemini-cli/05-gemini-cli-tools-system.md) | [05](./docs/kimi-cli/05-kimi-cli-tools-system.md) | [05](./docs/opencode/05-opencode-tools-system.md) | [05](./docs/swe-agent/05-swe-agent-tools-system.md) | [05](./docs/qwen-code/05-qwen-code-tools-system.md) |
+| `06` | MCP Integration | [06](./docs/codex/06-codex-mcp-integration.md) | [06](./docs/gemini-cli/06-gemini-cli-mcp-integration.md) | [06](./docs/kimi-cli/06-kimi-cli-mcp-integration.md) | [06](./docs/opencode/06-opencode-mcp-integration.md) | - | [06](./docs/qwen-code/06-qwen-code-mcp-integration.md) |
+| `07` | Memory Context | [07](./docs/codex/07-codex-memory-context.md) | [07](./docs/gemini-cli/07-gemini-cli-memory-context.md) | [07](./docs/kimi-cli/07-kimi-cli-memory-context.md) | [07](./docs/opencode/07-opencode-memory-context.md) | [07](./docs/swe-agent/07-swe-agent-memory-context.md) | [07](./docs/qwen-code/07-qwen-code-memory-context.md) |
+| `08` | UI Interaction | [08](./docs/codex/08-codex-ui-interaction.md) | [08](./docs/gemini-cli/08-gemini-cli-ui-interaction.md) | [08](./docs/kimi-cli/08-kimi-cli-ui-interaction.md) | [08](./docs/opencode/08-opencode-ui-interaction.md) | [08](./docs/swe-agent/08-swe-agent-ui-interaction.md) | [08](./docs/qwen-code/08-qwen-code-ui-interaction.md) |
+| `09` | Web Server | [09](./docs/codex/09-codex-web-server.md) | [09](./docs/gemini-cli/09-gemini-cli-web-server.md) | [09](./docs/kimi-cli/09-kimi-cli-web-server.md) | [09](./docs/opencode/09-opencode-web-server.md) | [09](./docs/swe-agent/09-swe-agent-web-server.md) | [09](./docs/qwen-code/09-qwen-code-web-server.md) |
+| `10` | Safety Control | [10](./docs/codex/10-codex-safety-control.md) | [10](./docs/gemini-cli/10-gemini-cli-safety-control.md) | [10](./docs/kimi-cli/10-kimi-cli-safety-control.md) | [10](./docs/opencode/10-opencode-safety-control.md) | [10](./docs/swe-agent/10-swe-agent-safety-control.md) | [10](./docs/qwen-code/10-qwen-code-safety-control.md) |
+| `11` | Prompt Organization | [11](./docs/codex/11-codex-prompt-organization.md) | [11](./docs/gemini-cli/11-gemini-cli-prompt-organization.md) | [11](./docs/kimi-cli/11-kimi-cli-prompt-organization.md) | [11](./docs/opencode/11-opencode-prompt-organization.md) | [11](./docs/swe-agent/11-swe-agent-prompt-organization.md) | [11](./docs/qwen-code/11-qwen-code-prompt-organization.md) |
+| `12` | Logging | [12](./docs/codex/12-codex-logging.md) | [12](./docs/gimini-cli/12-gemini-cli-logging.md) | [12](./docs/kimi-cli/12-kimi-cli-logging.md) | [12](./docs/opencode/12-opencode-logging.md) | [12](./docs/swe-agent/12-swe-agent-logging.md) | [12](./docs/qwen-code/12-qwen-code-logging.md) |
+| `13` | ACP Integration | - | - | - | - | - | - |
 
-> **扩展内容**：`13` [ACP Integration](./docs/comm/13-comm-acp-integration.md) - 跨项目 ACP（Agent Client Protocol）实现对比
+> **注**：`13` 为跨项目对比文档，详见 [ACP Integration 对比](./docs/comm/13-comm-acp-integration.md)
 
 ---
 
