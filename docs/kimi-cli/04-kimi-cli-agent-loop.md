@@ -81,7 +81,7 @@ sequenceDiagram
     participant UI as UI (Wire)
     participant Run as KimiSoul.run()
     participant Turn as _turn()
-    participant Loop as _agent_loop()
+    participant AgentLoop as _agent_loop()
     participant Step as _step()
     participant LLM as kosong (LLM)
     participant Tool as Tool System
@@ -96,18 +96,18 @@ sequenceDiagram
         Run->>Turn: 4b. _turn(user_message)
         Turn->>Turn: 5. 创建 checkpoint
         Turn->>Turn: 6. append 用户消息
-        Turn->>Loop: 7. _agent_loop()
+        Turn->>AgentLoop: 7. _agent_loop()
 
-        Loop->>Loop: 8. 启动审批转发协程
-        Loop->>Loop: 9. step_no += 1
-        Loop->>Loop: 10. 检查 max_steps_per_turn
-        Loop->>UI: 11. StepBegin 事件
+        AgentLoop->>AgentLoop: 8. 启动审批转发协程
+        AgentLoop->>AgentLoop: 9. step_no += 1
+        AgentLoop->>AgentLoop: 10. 检查 max_steps_per_turn
+        AgentLoop->>UI: 11. StepBegin 事件
 
         alt 需要 compaction
-            Loop->>Loop: 12a. compact_context()
+            AgentLoop->>AgentLoop: 12a. compact_context()
         end
 
-        Loop->>Step: 13. _step()
+        AgentLoop->>Step: 13. _step()
         Step->>LLM: 14. kosong.step()
         LLM-->>Step: 15. StepResult (流式)
         Step->>Tool: 16. 并发执行工具
@@ -115,13 +115,13 @@ sequenceDiagram
         Step->>Step: 18. _grow_context()
 
         alt 有 D-Mail
-            Step-->>Loop: 19a. throw BackToTheFuture
-            Loop->>Loop: 20a. revert_to(checkpoint_id)
+            Step-->>AgentLoop: 19a. throw BackToTheFuture
+            AgentLoop->>AgentLoop: 20a. revert_to(checkpoint_id)
         else 无 tool_calls
-            Step-->>Loop: 19b. StepOutcome
-            Loop-->>Turn: 20b. TurnOutcome
+            Step-->>AgentLoop: 19b. StepOutcome
+            AgentLoop-->>Turn: 20b. TurnOutcome
         else 有 tool_calls
-            Step-->>Loop: 19c. None (继续循环)
+            Step-->>AgentLoop: 19c. None (继续循环)
         end
     end
 
@@ -358,26 +358,26 @@ _agent_loop()                    [kimisoul.py:302]
 
 ```mermaid
 sequenceDiagram
-    participant Loop as _agent_loop()
+    participant AgentLoop as _agent_loop()
     participant Context as Context (Checkpoint)
     participant Step as _step()
     participant LLM as kosong (LLM)
     participant Tool as Tool System
     participant Denwa as DenwaRenji
 
-    Loop->>Loop: step_no += 1
-    Loop->>Loop: 检查 max_steps_per_turn
+    AgentLoop->>AgentLoop: step_no += 1
+    AgentLoop->>AgentLoop: 检查 max_steps_per_turn
 
     alt token 超限
-        Loop->>Context: clear()
-        Loop->>Context: _checkpoint()
-        Loop->>Context: append_message(compacted)
+        AgentLoop->>Context: clear()
+        AgentLoop->>Context: _checkpoint()
+        AgentLoop->>Context: append_message(compacted)
     end
 
-    Loop->>Context: _checkpoint()
-    Context-->>Loop: checkpoint_id
+    AgentLoop->>Context: _checkpoint()
+    Context-->>AgentLoop: checkpoint_id
 
-    Loop->>Step: _step()
+    AgentLoop->>Step: _step()
     activate Step
 
     Step->>LLM: kosong.step()
@@ -402,14 +402,14 @@ sequenceDiagram
     Denwa-->>Step: D-Mail | None
 
     alt 有 D-Mail
-        Step-->>Loop: throw BackToTheFuture
-        Loop->>Context: revert_to(checkpoint_id)
-        Loop->>Context: _checkpoint()
-        Loop->>Context: append_message(D-Mail)
+        Step-->>AgentLoop: throw BackToTheFuture
+        AgentLoop->>Context: revert_to(checkpoint_id)
+        AgentLoop->>Context: _checkpoint()
+        AgentLoop->>Context: append_message(D-Mail)
     else 无 tool_calls
-        Step-->>Loop: return StepOutcome
+        Step-->>AgentLoop: return StepOutcome
     else 有 tool_calls
-        Step-->>Loop: return None
+        Step-->>AgentLoop: return None
     end
 
     deactivate Step
@@ -430,7 +430,7 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-    subgraph Input["输入阶段"]
+    subgraph Input[输入阶段]
         I1[用户输入] --> I2[_turn 初始化]
         I2 --> I3[创建 checkpoint]
         I3 --> I4[append 用户消息]
@@ -444,7 +444,7 @@ flowchart LR
         P3 --> P4[_grow_context]
     end
 
-    subgraph Output["输出阶段"]
+    subgraph Output[输出阶段]
         O1{有 tool_calls?} -->|是| O2[继续循环]
         O1 -->|否| O3[返回 TurnOutcome]
         O2 --> P1
@@ -588,13 +588,13 @@ sequenceDiagram
     participant U as 用户
     participant Run as KimiSoul.run()
     participant Turn as _turn()
-    participant Loop as _agent_loop()
+    participant AgentLoop as _agent_loop()
     participant Step as _step()
     participant LLM as kosong
     participant Tool as Tool System
     participant Context as Context
 
-    U->>Run: 输入: "修复这个 bug"
+    U->>Run: 输入: 修复这个 bug
     Run->>Run: 刷新 OAuth token
     Run->>U: TurnBegin 事件
 
@@ -602,45 +602,45 @@ sequenceDiagram
     Turn->>Turn: 校验 LLM 配置
     Turn->>Context: _checkpoint() → checkpoint 0
     Turn->>Context: append_message(user_message)
-    Turn->>Loop: _agent_loop()
+    Turn->>AgentLoop: _agent_loop()
 
-    Note over Loop: Step 1
-    Loop->>Loop: step_no = 1
-    Loop->>U: StepBegin(n=1)
-    Loop->>Step: _step()
+    Note over AgentLoop: Step 1
+    AgentLoop->>AgentLoop: step_no = 1
+    AgentLoop->>U: StepBegin(n=1)
+    AgentLoop->>Step: _step()
 
     Step->>LLM: kosong.step()
-    LLM-->>Step: "让我先查看文件"
+    LLM-->>Step: 让我先查看文件
     LLM-->>Step: tool_call: read_file
     Step->>Tool: 执行 read_file
     Tool-->>Step: 文件内容
     Step->>Context: _grow_context()
-    Step-->>Loop: return None (有 tool_calls)
+    Step-->>AgentLoop: return None (有 tool_calls)
 
-    Note over Loop: Step 2
-    Loop->>Loop: step_no = 2
-    Loop->>U: StepBegin(n=2)
-    Loop->>Step: _step()
+    Note over AgentLoop: Step 2
+    AgentLoop->>AgentLoop: step_no = 2
+    AgentLoop->>U: StepBegin(n=2)
+    AgentLoop->>Step: _step()
 
     Step->>LLM: kosong.step()
-    LLM-->>Step: "找到问题了，让我修复"
+    LLM-->>Step: 找到问题了，让我修复
     LLM-->>Step: tool_call: write_file
     Step->>Tool: 执行 write_file
     Tool-->>Step: 成功
     Step->>Context: _grow_context()
-    Step-->>Loop: return None (有 tool_calls)
+    Step-->>AgentLoop: return None (有 tool_calls)
 
-    Note over Loop: Step 3
-    Loop->>Loop: step_no = 3
-    Loop->>U: StepBegin(n=3)
-    Loop->>Step: _step()
+    Note over AgentLoop: Step 3
+    AgentLoop->>AgentLoop: step_no = 3
+    AgentLoop->>U: StepBegin(n=3)
+    AgentLoop->>Step: _step()
 
     Step->>LLM: kosong.step()
-    LLM-->>Step: "已修复，请验证"
+    LLM-->>Step: 已修复，请验证
     Step->>Context: _grow_context()
-    Step-->>Loop: return StepOutcome(no_tool_calls)
+    Step-->>AgentLoop: return StepOutcome(no_tool_calls)
 
-    Loop-->>Turn: return TurnOutcome
+    AgentLoop-->>Turn: return TurnOutcome
     Turn-->>Run: Turn 完成
     Run->>U: TurnEnd 事件
 ```
@@ -660,12 +660,12 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-    subgraph Input["输入阶段"]
+    subgraph Input[输入阶段]
         I1[用户输入] --> I2[解析为 Message]
         I2 --> I3[校验 LLM 配置]
     end
 
-    subgraph Process["处理阶段"]
+    subgraph Process[处理阶段]
         P1[创建 checkpoint] --> P2[append 用户消息]
         P2 --> P3[while 循环]
         P3 --> P4[_step: LLM 调用]
@@ -676,7 +676,7 @@ flowchart LR
         P7 -->|否| P8[返回结果]
     end
 
-    subgraph Output["输出阶段"]
+    subgraph Output[输出阶段]
         O1[TurnOutcome] --> O2[TurnEnd 事件]
     end
 
