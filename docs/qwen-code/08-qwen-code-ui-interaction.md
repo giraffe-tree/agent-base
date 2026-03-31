@@ -1,3 +1,14 @@
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置文档 | `02-qwen-code-cli-entry.md`、`04-qwen-code-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 # UI 交互（Qwen Code）
 
 ## TL;DR（结论先行）
@@ -5,6 +16,17 @@
 一句话定义：Qwen Code 的 UI 交互是**基于 Ink.js + React 的终端渲染系统**，通过多层 Context Provider 实现状态管理，支持流式消息渲染、Vim 模式、Kitty 键盘协议等高级终端特性。
 
 Qwen Code 的核心取舍：**React 组件化 + Context 依赖注入**（对比 Codex 的 Ratatui、Kimi CLI 的 Wire 协议解耦）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 渲染框架 | Ink.js + React 组件化 | `packages/cli/src/gemini.tsx:179` |
+| 状态管理 | Context Provider 依赖注入 | `packages/cli/src/ui/contexts/KeypressContext.tsx:82` |
+| 键盘处理 | Kitty 协议 + 自定义解析 | `packages/cli/src/ui/contexts/KeypressContext.tsx:150` |
+| 输入编辑 | TextBuffer 类管理光标和文本 | `packages/cli/src/ui/components/InputPrompt.tsx:386` |
+| 流式渲染 | Static 组件优化性能 | `packages/cli/src/ui/components/MainContent.tsx:23` |
+| 主题系统 | themeManager 全局管理 | `packages/cli/src/ui/themes/theme-manager.ts` |
 
 ---
 
@@ -107,27 +129,27 @@ sequenceDiagram
     participant I as InputPrompt
     participant M as MainContent
 
-    U->>K: 键盘输入
+    U->>K: 1. 键盘输入
     Note over K: Kitty 协议解析
-    K->>K: 解析按键序列
-    K->>I: 分发 Key 事件
+    K->>K: 2. 解析按键序列
+    K->>I: 3. 分发 Key 事件
 
     alt 普通输入
-        I->>I: 更新 TextBuffer
-        I->>I: 触发重渲染
+        I->>I: 4a. 更新 TextBuffer
+        I->>I: 5a. 触发重渲染
     else 提交消息
-        I->>A: onSubmit(value)
-        A->>A: 添加到历史
-        A->>M: 更新消息列表
-        M->>M: 渲染历史消息
+        I->>A: 4b. onSubmit(value)
+        A->>A: 5b. 添加到历史
+        A->>M: 6b. 更新消息列表
+        M->>M: 7b. 渲染历史消息
     else 斜杠命令
-        I->>I: 检测 / 前缀
-        I->>A: 执行命令
-        A->>A: 处理命令逻辑
+        I->>I: 4c. 检测 / 前缀
+        I->>A: 5c. 执行命令
+        A->>A: 6c. 处理命令逻辑
     end
 
     alt Vim 模式
-        I->>I: vimHandleInput(key)
+        I->>I: 8. vimHandleInput(key)
         Note over I: 模式切换/移动
     end
 ```
@@ -136,11 +158,10 @@ sequenceDiagram
 
 | 步骤 | 交互内容 | 设计意图 |
 |-----|---------|---------|
-| 1-2 | 键盘事件捕获 | 统一入口处理所有按键 |
-| 3 | Kitty 协议解析 | 支持高级终端特性 |
-| 4-6 | 输入处理 | 根据按键类型分发处理 |
-| 7-9 | 消息提交 | 解耦输入与历史管理 |
-| 10-12 | 命令处理 | 统一斜杠命令入口 |
+| 1-3 | 键盘事件捕获与解析 | 统一入口处理所有按键，支持 Kitty 协议 |
+| 4-5 | 普通输入处理 | TextBuffer 管理光标和文本状态 |
+| 6-7 | 消息提交 | 解耦输入与历史管理，触发 Agent Loop |
+| 8 | Vim 模式 | 支持高级编辑键位，提升效率 |
 
 ---
 

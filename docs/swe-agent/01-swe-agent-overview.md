@@ -1,10 +1,31 @@
 # SWE-agent 概述
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | 无（本文档为入口文档） |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 SWE-agent 是一个学术研究型 Python Agent，专注于软件工程任务（特别是自动化代码修复和 GitHub Issue 解决），采用"双层循环 + 轨迹持久化"架构：内层 step 级循环处理单轮模型调用与工具执行，外层 retry 级循环支持多次尝试与结果选优。
 
 SWE-agent 的核心取舍：**轨迹为中心的 Session 管理 + 配置驱动的工具系统**（对比 Kimi CLI 的 Checkpoint 回滚、Codex 的 Actor 消息驱动）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 核心机制 | 双层循环（step + attempt）驱动任务执行 | `sweagent/agent/agents.py:400` |
+| 状态管理 | 双轨数据结构（history + trajectory） | `sweagent/agent/agents.py:481-483` |
+| 错误恢复 | forward_with_handling 重采样机制 | `sweagent/agent/agents.py:700` |
+| 环境隔离 | Docker 容器化执行环境 | `sweagent/environment/swe_env.py` |
+| 配置系统 | pydantic-settings + 点号分隔参数 | `sweagent/run/common.py:187` |
 
 ---
 
@@ -327,34 +348,53 @@ class StepOutput(BaseModel):
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```python
-# sweagent/agent/agents.py:800-850 (简化)
-def step(self) -> StepOutput:
-    """执行单步：模型调用 + 工具执行"""
-    self._chook.on_step_start()
+# sweagent/agent/agents.py:400-434
+def run(self, env: SWEEnv, problem_statement: ProblemStatement, output_dir: Path) -> AgentRunResult:
+    """主循环入口：双层循环驱动任务执行"""
+    # 1. 初始化 Session
+    self.setup(env, problem_statement, output_dir)
+    self._chook.on_run_start()
 
-    # 1. 获取处理后的消息
-    messages = self.messages
+    # 2. 核心 Agent Loop
+    step_output = None
+    while not step_output or not step_output.done:
+        step_output = self.step()           # 执行单步
+        self.save_trajectory()              # 每步持久化
 
-    # 2. 模型推理与错误处理
-    step_output = self.forward_with_handling(messages)
-
-    # 3. 更新 history 和 trajectory
-    self.add_step_to_history(step_output)
-    self.add_step_to_trajectory(step_output)
-
-    # 4. 更新元数据
-    self.info["submission"] = step_output.submission
-    self.info["exit_status"] = step_output.exit_status
-
-    return step_output
+    # 3. 完成处理
+    self._chook.on_run_done(trajectory=self.trajectory, info=self.info)
+    return AgentRunResult(info=self.info, trajectory=self.trajectory)
 ```
 
-**代码要点**：
-1. **Hook 系统**：通过 `_chook` 在关键节点触发回调，支持扩展
-2. **错误处理**：`forward_with_handling` 封装重试逻辑
-3. **双轨记录**：同时更新 history（对话）和 trajectory（执行）
-4. **即时持久化**：每步保存 trajectory，支持断点续传
+**设计意图**：
+1. **简洁的主循环**：setup -> while not done -> step -> save
+2. **Hook 系统**：通过 `_chook` 在关键节点触发回调，支持扩展
+3. **即时持久化**：每步保存 trajectory，支持断点续传
+4. **结果封装**：返回完整的 AgentRunResult
+
+<details>
+<summary>查看完整实现（含异常处理、日志等）</summary>
+
+```python
+# sweagent/agent/agents.py:400-434
+def run(self, env: SWEEnv, problem_statement: ProblemStatement, output_dir: Path) -> AgentRunResult:
+    """Run the agent on a problem statement"""
+    self.setup(env, problem_statement, output_dir)
+    self._chook.on_run_start()
+
+    step_output = None
+    while not step_output or not step_output.done:
+        step_output = self.step()
+        self.save_trajectory()
+
+    self._chook.on_run_done(trajectory=self.trajectory, info=self.info)
+    return AgentRunResult(info=self.info, trajectory=self.trajectory)
+```
+
+</details>
 
 ### 5.3 关键调用链
 
@@ -404,6 +444,30 @@ RunSingle.run()                    [sweagent/run/run_single.py]
   - 状态无法自动回滚
 
 ### 6.3 与其他项目的对比
+
+```mermaid
+gitGraph
+    commit id: "传统方案"
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "双层循环+轨迹持久化"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "单层+Checkpoint回滚"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "Actor消息驱动"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "递归continuation"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "resetTimeoutOnProgress"
+```
 
 | 项目 | 核心差异 | 适用场景 |
 |-----|---------|---------|
@@ -513,9 +577,9 @@ class ModelConfig(BaseModel):
 
 - 前置知识：`docs/swe-agent/02-swe-agent-cli-entry.md`
 - 相关机制：`docs/swe-agent/04-swe-agent-agent-loop.md`、`docs/swe-agent/05-swe-agent-tools-system.md`
-- 深度分析：`docs/swe-agent/02-swe-agent-session-management.md`
+- 深度分析：`docs/swe-agent/03-swe-agent-session-runtime.md`
 
 ---
 
 *✅ Verified: 基于 sweagent/agent/agents.py、sweagent/agent/models.py、sweagent/tools/tools.py、sweagent/run/run_single.py 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-25*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

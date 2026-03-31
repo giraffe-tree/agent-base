@@ -1,10 +1,31 @@
 # gemini-cli 概述
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | 无（本文档为入口） |
+> | 文档结构 | TL;DR → 架构概览 → 核心机制 → 数据流转 → 对比分析 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：gemini-cli 是 Google 官方推出的 TypeScript CLI Agent，采用「**CLI 命令层 + GeminiClient 核心 + Turn 回合管理 + Scheduler 工具调度**」的分层架构。
 
 gemini-cli 的核心取舍：**事件驱动流式处理 + 并行工具调度 + Hook 扩展系统**（对比 Kimi CLI 的 Checkpoint 回滚、Codex 的 Rust 原生安全沙箱）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 架构分层 | CLI → Commands → GeminiClient → Turn → Scheduler → Tools | `packages/cli/index.ts:1` |
+| Agent Loop | 递归 continuation + 事件驱动 | `packages/core/src/core/client.ts:789` |
+| 工具调度 | Scheduler 状态机 + 并行执行 | `packages/core/src/scheduler/scheduler.ts:90` |
+| 扩展机制 | Before/After Agent Hook 系统 | `packages/core/src/core/client.ts:811` |
+| 状态持久化 | JSON 文件 + 自动清理 | `packages/core/src/services/chatRecordingService.ts:128` |
 
 ---
 
@@ -16,7 +37,7 @@ gemini-cli 的核心取舍：**事件驱动流式处理 + 并行工具调度 + H
 问题：企业级 CLI Agent 需要兼顾交互体验、工具扩展性和会话可恢复性。
 
 如果单层混合：
-  命令解析、UI 渲染、Agent 循环、工具执行耦合在一起
+  命令解析、UI 渲染、Agent Loop、工具执行耦合在一起
   -> 难以扩展 Hook、难以审计、状态管理混乱
 
 gemini-cli 的分层做法：
@@ -116,7 +137,7 @@ gemini-cli 的分层做法：
                         │ 持久化
                         ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ Checkpoint Layer（packages/core/src/utils/checkpointUtils.ts）│
+│ Session Layer（packages/core/src/services/chatRecordingService.ts）│
 │ - 状态持久化                                                 │
 │ - 会话恢复                                                   │
 │ - 压缩管理                                                   │
@@ -134,7 +155,7 @@ gemini-cli 的分层做法：
 | `ToolRegistry` | 工具注册、Schema 管理 | `packages/core/src/tools/tool-registry.ts:197` |
 | `Scheduler` | 工具调度、并行执行、确认管理 | `packages/core/src/scheduler/scheduler.ts:90` |
 | `GeminiChat` | 模型调用、流式响应 | `packages/core/src/core/geminiChat.ts:238` |
-| `CheckpointUtils` | 状态持久化、会话恢复 | `packages/core/src/utils/checkpointUtils.ts:48` |
+| `ChatRecordingService` | 状态持久化、会话恢复 | `packages/core/src/services/chatRecordingService.ts:128` |
 
 ### 2.3 组件交互时序
 
@@ -200,7 +221,7 @@ GeminiClient.initialize()
             -> 并行执行工具
             -> 发送结果到模型
       -> fireAfterAgentHook()
-    -> 保存 Checkpoint
+    -> 保存 Session
 ```
 
 代码依据：
@@ -224,7 +245,7 @@ Scheduler.schedule
 ### 3.3 事件驱动架构
 
 ```typescript
-// packages/core/src/core/turn.ts
+// packages/core/src/core/turn.ts:53-72
 enum GeminiEventType {
   Content = 'content',                // 内容增量
   ToolCallRequest = 'tool_call_request',  // 工具调用请求
@@ -238,7 +259,7 @@ enum GeminiEventType {
 }
 ```
 
-### 3.4 Checkpoint 机制
+### 3.4 Session 机制
 
 ```text
 自动保存触发条件:
@@ -248,7 +269,7 @@ enum GeminiEventType {
 
 保存内容:
 ┌─────────────────┐
-│ Checkpoint      │
+│ Session Record  │
 ├─────────────────┤
 │ - sessionId     │
 │ - timestamp     │
@@ -258,7 +279,7 @@ enum GeminiEventType {
 └─────────────────┘
 ```
 
-代码依据：`packages/core/src/utils/checkpointUtils.ts:48`
+代码依据：`packages/core/src/services/chatRecordingService.ts:128`
 
 ---
 
@@ -282,13 +303,13 @@ flowchart LR
     L --> M[Send Results]
     M --> E
     J --> N{After Hook}
-    N --> O[Save Checkpoint]
+    N --> O[Save Session]
 ```
 
 ### 4.2 关键数据结构
 
 ```typescript
-// packages/core/src/core/turn.ts
+// packages/core/src/core/turn.ts:53-72
 interface ServerGeminiStreamEvent {
   type: GeminiEventType;
   text?: string;
@@ -395,10 +416,10 @@ main()                          [packages/cli/index.ts:1]
 
 | 维度 | gemini-cli 的选择 | 替代方案 | 取舍分析 |
 |-----|------------------|---------|---------|
-| 循环结构 | 事件驱动 + while 循环 | 递归 continuation | 流式处理更自然，但状态管理稍复杂 |
+| 循环结构 | 事件驱动 + 递归 continuation | while 循环（Kimi CLI） | 流式处理更自然，但状态管理稍复杂 |
 | 工具执行 | 并行调度 (Promise.all) | 顺序执行 | 效率更高，但结果顺序需保证 |
 | 扩展机制 | Hook 系统 (Before/After) | 中间件链 | 扩展点明确，但灵活性稍低 |
-| 状态持久化 | Checkpoint 文件 | 内存快照 | 支持跨进程恢复，但有 IO 成本 |
+| 状态持久化 | JSON 文件 + 自动清理 | SQLite（Codex） | 可读性强，但查询效率低 |
 | 响应处理 | 流式事件 (GeminiEventType) | 批量响应 | 实时性好，但需处理事件顺序 |
 
 ### 6.2 为什么这样设计？
@@ -455,10 +476,23 @@ gitGraph
 
 | 项目 | 核心差异 | 适用场景 |
 |-----|---------|---------|
-| **gemini-cli** | Hook 系统 + 并行工具调度 + Checkpoint | 企业级扩展、审计需求 |
+| **gemini-cli** | Hook 系统 + 并行工具调度 + Session 持久化 | 企业级扩展、审计需求 |
 | **Codex** | Rust 原生 + TUI 层 + Rollout 事件流 | 高性能、安全优先 |
 | **Kimi CLI** | Python + Checkpoint 回滚 + D-Mail | 状态恢复、灵活调试 |
 | **OpenCode** | resetTimeoutOnProgress + 长任务优化 | 长时间运行任务 |
+| **SWE-agent** | forward_with_handling() + autosubmit | 学术场景、错误恢复 |
+
+**详细对比**：
+
+| 对比维度 | gemini-cli | Codex | Kimi CLI | OpenCode | SWE-agent |
+|---------|------------|-------|----------|----------|-----------|
+| **语言** | TypeScript | Rust | Python | TypeScript | Python |
+| **Agent Loop** | 递归 continuation | Actor 消息驱动 | while 循环 | async/await | while 循环 |
+| **工具执行** | Scheduler 状态机 | 沙箱进程 | 直接执行 | 直接执行 | 直接执行 |
+| **状态持久化** | JSON 文件 | SQLite + JSONL | Checkpoint 文件 | SQLite | 内存（无持久化） |
+| **扩展机制** | Before/After Hook | 配置驱动 | 配置驱动 | 配置驱动 | 配置驱动 |
+| **并行工具** | ✅ Promise.all | ✅ 并发执行 | ✅ 并发派发 | ⚠️ 顺序执行 | ⚠️ 顺序执行 |
+| **企业特性** | Hook 审计 | 原生沙箱 | - | - | - |
 
 ---
 
@@ -516,7 +550,7 @@ if (
 | GeminiChat | `packages/core/src/core/geminiChat.ts` | 238 | 模型封装 |
 | ToolRegistry | `packages/core/src/tools/tool-registry.ts` | 197 | 工具注册 |
 | Scheduler | `packages/core/src/scheduler/scheduler.ts` | 90 | 工具调度 |
-| Checkpoint | `packages/core/src/utils/checkpointUtils.ts` | 48 | 检查点 |
+| Session | `packages/core/src/services/chatRecordingService.ts` | 128 | 会话持久化 |
 
 ### 8.2 配置类
 
@@ -538,12 +572,13 @@ if (
 
 ## 9. 延伸阅读
 
+- CLI Entry: `02-gemini-cli-cli-entry.md`
+- Session Runtime: `03-gemini-cli-session-runtime.md`
 - Agent Loop: `04-gemini-cli-agent-loop.md`
 - MCP Integration: `06-gemini-cli-mcp-integration.md`
 - Memory Context: `07-gemini-cli-memory-context.md`
-- Checkpoint: `docs/gemini-cli/questions/gemini-cli-checkpoint-implementation.md`
 
 ---
 
 *✅ Verified: 基于 gemini-cli/packages/core/src/ 源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-25*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

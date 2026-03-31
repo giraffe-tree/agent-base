@@ -1,10 +1,31 @@
 # Subagent/Task Implementation
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-35 分钟 |
+> | 前置文档 | `docs/qwen-code/04-qwen-code-agent-loop.md`、`docs/qwen-code/05-qwen-code-tools-system.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
-Qwen Code 通过 **Task Tool + SubAgentScope 运行时 + 五级配置存储** 实现子代理功能，支持主代理将复杂任务委托给具有独立工具集和系统提示的专用子代理并行执行。
+一句话定义：Qwen Code 通过 **Task Tool + SubAgentScope 运行时 + 五级配置存储** 实现子代理功能，支持主代理将复杂任务委托给具有独立工具集和系统提示的专用子代理并行执行。
 
-Qwen Code 的核心取舍：**文件化配置 + 事件驱动监控**（对比其他项目的动态 spawning 或嵌套对话模式）
+Qwen Code 的核心取舍：**文件化配置 + 事件驱动监控**（对比 Gemini CLI 的递归 continuation、Kimi CLI 的 Checkpoint 回滚、Codex 的 Actor 消息驱动）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 核心机制 | Task Tool 作为子代理调用入口，动态加载可用子代理 | `packages/core/src/tools/task.ts:52` |
+| 运行时 | SubAgentScope 实现独立 Agent Loop，支持资源限制 | `packages/core/src/subagents/subagent.ts:165` |
+| 配置存储 | 五级存储体系（session/project/user/extension/builtin） | `packages/core/src/subagents/subagent-manager.ts:44` |
+| 执行监控 | 事件驱动架构，实时发射 START/TOOL_CALL/FINISH 等事件 | `packages/core/src/subagents/subagent-events.ts:131` |
+| 权限控制 | 工具白名单机制，子代理仅拥有最小必要工具集 | `packages/core/src/subagents/subagent.ts:594` |
 
 ---
 
@@ -86,7 +107,7 @@ Qwen Code 的核心取舍：**文件化配置 + 事件驱动监控**（对比其
 |-----|------|---------|
 | `TaskTool` | 动态加载子代理配置，生成工具 Schema | `packages/core/src/tools/task.ts:52` |
 | `TaskToolInvocation` | 执行子代理调用，管理生命周期和事件 | `packages/core/src/tools/task.ts:264` |
-| `SubAgentScope` | 子代理运行时容器，管理独立对话循环 | `packages/core/src/subagents/subagent.ts:165` |
+| `SubAgentScope` | 子代理运行时容器，管理独立 Agent Loop | `packages/core/src/subagents/subagent.ts:165` |
 | `SubagentManager` | 子代理配置的 CRUD 和存储管理 | `packages/core/src/subagents/subagent-manager.ts:44` |
 | `BuiltinAgentRegistry` | 内置子代理注册（如 general-purpose） | `packages/core/src/subagents/builtin-agents.ts:13` |
 | `SubAgentEventEmitter` | 事件发射，支持实时进度监控 | `packages/core/src/subagents/subagent-events.ts:131` |
@@ -578,6 +599,8 @@ export interface TaskParams {
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```typescript
 // packages/core/src/subagents/subagent.ts:263-347
 async runNonInteractive(
@@ -653,12 +676,83 @@ async runNonInteractive(
 }
 ```
 
-**代码要点**：
+**设计意图**：
 
 1. **工具过滤**：子代理默认继承主代理工具，但会过滤掉 Task Tool 防止递归调用
 2. **终止条件检查**：每轮开始前检查 max_turns 和 max_time_minutes
 3. **流式处理**：支持流式响应，实时收集文本和工具调用
 4. **事件驱动**：关键节点发射事件，支持外部监控
+
+<details>
+<summary>📋 查看完整实现</summary>
+
+```typescript
+// packages/core/src/subagents/subagent.ts:263-400
+async runNonInteractive(
+  context: ContextState,
+  externalSignal?: AbortSignal,
+): Promise<void> {
+  const chat = await this.createChatObject(context);
+  if (!chat) {
+    this.terminateMode = SubagentTerminateMode.ERROR;
+    return;
+  }
+
+  const toolsList = this.prepareToolsList();
+  const initialTaskText = String(context.get('task_prompt') ?? 'Get Started!');
+  let currentMessages: Content[] = [
+    { role: 'user', parts: [{ text: initialTaskText }] },
+  ];
+
+  const startTime = Date.now();
+  this.executionStats.startTimeMs = startTime;
+  let turnCounter = 0;
+
+  this.eventEmitter?.emit(SubAgentEventType.START, {
+    subagentName: this.subagentConfig.name,
+    taskPrompt: initialTaskText,
+  });
+
+  try {
+    while (true) {
+      // 检查终止条件
+      if (this.runConfig.max_turns && turnCounter >= this.runConfig.max_turns) {
+        this.terminateMode = SubagentTerminateMode.MAX_TURNS;
+        break;
+      }
+      const durationMin = (Date.now() - startTime) / (1000 * 60);
+      if (this.runConfig.max_time_minutes && durationMin >= this.runConfig.max_time_minutes) {
+        this.terminateMode = SubagentTerminateMode.TIMEOUT;
+        break;
+      }
+
+      // 执行单轮对话
+      const response = await this.executeRound(chat, currentMessages, toolsList);
+
+      if (response.functionCalls.length > 0) {
+        currentMessages = await this.processFunctionCalls(response.functionCalls);
+      } else {
+        this.finalText = response.text;
+        this.terminateMode = SubagentTerminateMode.GOAL;
+        break;
+      }
+
+      turnCounter++;
+    }
+  } catch (error) {
+    this.terminateMode = SubagentTerminateMode.ERROR;
+    this.executionStats.error = error;
+  }
+
+  this.eventEmitter?.emit(SubAgentEventType.FINISH, {
+    subagentName: this.subagentConfig.name,
+    terminateMode: this.terminateMode,
+    executionStats: this.executionStats,
+  });
+}
+```
+
+</details>
 
 ### 5.3 关键调用链
 
@@ -718,12 +812,36 @@ async runNonInteractive(
 
 ### 6.3 与其他项目的对比
 
+```mermaid
+gitGraph
+    commit id: "基础子代理"
+    branch "Qwen Code"
+    checkout "Qwen Code"
+    commit id: "文件化配置+事件驱动"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "递归 continuation"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "Checkpoint 回滚"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "Actor 消息驱动"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "resetTimeoutOnProgress"
+```
+
 | 项目 | 核心差异 | 适用场景 |
 |-----|---------|---------|
 | **Qwen Code** | 文件化配置 + 事件驱动监控 + 非交互式执行 | 需要预定义专用代理、重视可观测性的场景 |
-| **Codex** | 无内置子代理系统，依赖单次对话 | 简单任务，不需要任务分解 |
-| **Gemini CLI** | 通过 continuation 实现递归调用 | 需要深度嵌套对话的场景 |
+| **Gemini CLI** | 递归 continuation 模式，支持嵌套对话 | 需要深度嵌套对话的场景 |
 | **Kimi CLI** | Checkpoint 机制支持状态回滚 | 需要容错和状态恢复的场景 |
+| **Codex** | Actor 模型，高并发隔离 | 高并发、需要隔离失败的场景 |
 | **OpenCode** | resetTimeoutOnProgress 支持长任务 | 需要长时间运行的任务 |
 
 **关键差异说明**：
@@ -796,4 +914,4 @@ export interface RunConfig {
 ---
 
 *✅ Verified: 基于 qwen-code/packages/core/src/subagents/*.ts、qwen-code/packages/core/src/tools/task.ts 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

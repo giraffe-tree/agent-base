@@ -1,14 +1,36 @@
 # CLI Entry（Qwen Code）
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `01-qwen-code-overview.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Qwen Code 的 CLI Entry 是「**双进程沙盒可选的 React 终端应用**」，采用 yargs 参数解析 + Ink React TUI 架构，支持交互式/非交互式/ACP 三种运行模式，以及 Docker/Podman/sandbox-exec 多类型沙盒隔离。
 
-核心取舍：
+Qwen Code 的核心取舍：
 - **双进程架构**：父进程负责沙盒检查与重启，子进程执行实际业务（对比 Gemini CLI 的单进程模式）
 - **沙盒策略**：支持 Docker/Podman 容器 + macOS Seatbelt 双重隔离（对比 Codex 的原生沙箱、Kimi CLI 的无沙盒）
 - **内存优化**：自动计算并配置 `--max-old-space-size`（对比其他项目的固定内存配置）
 - **TUI 框架**：React + Ink 组件化渲染（与 Gemini CLI 相同，对比 Kimi CLI 的 prompt_toolkit）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 进程架构 | 双进程（父检查+子执行） | `packages/cli/index.ts:14` |
+| 参数解析 | yargs 框架，支持多层配置合并 | `packages/cli/src/config/config.ts:177` |
+| 沙盒支持 | Docker/Podman + macOS Seatbelt | `packages/cli/src/utils/sandbox.ts:175` |
+| 内存优化 | 自动计算 50% 系统内存作为堆限制 | `packages/cli/src/gemini.tsx:83` |
+| 模式分发 | 交互式/非交互式/ACP 三种模式 | `packages/cli/src/gemini.tsx:209` |
+| 异常处理 | FatalError 分类 + 全局捕获 | `packages/cli/index.ts:14` |
 
 ---
 
@@ -230,6 +252,29 @@ stateDiagram-v2
 | FatalError | 可预期错误 | 抛出 FatalError | 使用 error.exitCode 退出 |
 | UnexpectedError | 未预期错误 | 抛出其他异常 | 退出码 1 |
 
+#### 内部数据流
+
+```text
+┌────────────────────────────────────────────┐
+│  输入层                                     │
+│   命令行参数 / 环境变量 / 配置文件          │
+└──────────────────┬─────────────────────────┘
+                   ▼
+┌────────────────────────────────────────────┐
+│  异常处理层                                 │
+│   ├── main() 调用                          │
+│   ├── FatalError 分类处理                  │
+│   └── 未预期错误捕获                       │
+└──────────────────┬─────────────────────────┘
+                   ▼
+┌────────────────────────────────────────────┐
+│  输出层                                     │
+│   ├── 正常退出 (exit 0)                    │
+│   ├── 可预期错误 (exit error.exitCode)     │
+│   └── 未预期错误 (exit 1 + 堆栈)           │
+└────────────────────────────────────────────┘
+```
+
 #### 关键接口
 
 | 接口 | 输入 | 输出 | 说明 | 代码位置 |
@@ -399,6 +444,18 @@ stateDiagram-v2
     Execute --> [*]
     Error --> [*]
 ```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| ConfigCheck | 配置检查 | 开始加载沙盒配置 | 确定沙盒类型 |
+| DockerMode | Docker/Podman 模式 | 配置命令为 docker/podman | 镜像检查完成 |
+| SeatbeltMode | Seatbelt 模式 | 配置命令为 sandbox-exec | profile 检查完成 |
+| ImageCheck | 镜像检查 | Docker 模式启动 | 镜像状态确定 |
+| RunContainer | 运行容器 | 镜像可用 | 容器执行完成 |
+| RunSeatbelt | 运行 Seatbelt | profile 存在 | 命令执行完成 |
+| Error | 错误状态 | 任何步骤失败 | 返回错误码 |
 
 #### 关键接口
 
@@ -749,15 +806,27 @@ main()                              [packages/cli/index.ts:14]
 ### 6.3 与其他项目的对比
 
 ```mermaid
-flowchart LR
-    subgraph Architecture["进程架构选择"]
-        direction TB
-        A[双进程<br/>父检查+子执行] --> B[Qwen Code]
-        C[单进程<br/>直接执行] --> D[Gemini CLI]
-        E[多进程<br/>Agent Pool] --> F[Codex]
-        G[单进程<br/>Python asyncio] --> H[Kimi CLI]
-        I[单进程<br/>Node.js 二进制] --> J[OpenCode]
-    end
+gitGraph
+    commit id: "传统 CLI"
+    branch "Qwen Code"
+    checkout "Qwen Code"
+    commit id: "双进程+沙盒"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "单进程+yargs"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "多进程+Agent Pool"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "单进程+Typer"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "单进程+二进制"
 ```
 
 | 项目 | CLI 框架 | 进程架构 | 沙盒策略 | 内存优化 | 适用场景 |
@@ -877,4 +946,4 @@ function getNodeMemoryArgs(isDebugMode: boolean): string[] {
 ---
 
 *✅ Verified: 基于 qwen-code/packages/cli 源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

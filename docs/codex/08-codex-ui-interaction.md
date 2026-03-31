@@ -1,10 +1,31 @@
 # UI Interaction（codex）
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | `02-codex-cli-entry.md`、`03-codex-session-runtime.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Codex 的 UI Interaction 是**基于 Ratatui 的终端用户界面系统**，提供语法高亮、斜杠命令处理和实时主题切换能力。
 
 Codex 的核心取舍：**内置 TUI + syntect 高亮引擎**（对比 Gemini CLI 的简洁终端、Kimi CLI 的富文本渲染）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| UI 框架 | Ratatui 终端 UI 框架 | `codex-rs/tui/src/app.rs:1` |
+| 高亮引擎 | syntect + two_face 主题包 | `tui/src/render/highlight.rs:62` |
+| 命令系统 | /slash 前缀斜杠命令 | `tui/src/slash_command.rs:71` |
+| 主题切换 | 32 款内置主题 + 自定义 | `tui/src/theme_picker.rs:1` |
+| 安全防护 | 512KB/10000行高亮上限 | `tui/src/render/highlight.rs:437` |
 
 ---
 
@@ -54,6 +75,7 @@ Codex 的核心取舍：**内置 TUI + syntect 高亮引擎**（对比 Gemini CL
 │ codex-rs/tui/src/                                            │
 │ - app.rs        : TUI 应用主循环                             │
 │ - chatwidget.rs : 聊天界面组件                               │
+│ - slash_command.rs: 斜杠命令解析                             │
 └───────────────────────┬─────────────────────────────────────┘
                         │
         ┌───────────────┼───────────────┐
@@ -69,11 +91,11 @@ Codex 的核心取舍：**内置 TUI + syntect 高亮引擎**（对比 Gemini CL
 
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
-| `App` | TUI 应用主循环和事件处理 | `tui/src/app.rs` |
-| `ChatWidget` | 聊天界面渲染和输入处理 | `tui/src/chatwidget.rs` |
-| `SlashCommand` | 斜杠命令枚举和解析 | `tui/src/slash_command.rs` |
-| `highlight` | 语法高亮引擎 (syntect) | `tui/src/render/highlight.rs` |
-| `ThemePicker` | 主题选择器组件 | `tui/src/theme_picker.rs` |
+| `App` | TUI 应用主循环和事件处理 | `tui/src/app.rs:45` |
+| `ChatWidget` | 聊天界面渲染和输入处理 | `tui/src/chatwidget.rs:45` |
+| `SlashCommand` | 斜杠命令枚举和解析 | `tui/src/slash_command.rs:71` |
+| `highlight` | 语法高亮引擎 (syntect) | `tui/src/render/highlight.rs:60` |
+| `ThemePicker` | 主题选择器组件 | `tui/src/theme_picker.rs:25` |
 
 ### 2.3 核心组件交互关系
 
@@ -108,7 +130,7 @@ sequenceDiagram
 | 步骤 | 交互内容 | 设计意图 |
 |-----|---------|---------|
 | 1-3 | 命令解析 | 统一 / 前缀入口，标准化命令格式 |
-| 4-6 | 事件分发 | 解耦 UI 组件和应用逻辑 |
+| 4-6 | 事件分发 | 通过 AppEvent 解耦 UI 组件和应用逻辑 |
 | 7-9 | 语法高亮 | 异步渲染，防止阻塞主循环 |
 
 ---
@@ -135,6 +157,16 @@ stateDiagram-v2
     Idle --> ThemeSelecting: /theme 命令
     ThemeSelecting --> Idle: 选择完成或取消
 ```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Idle | 空闲等待 | 初始化完成或响应结束 | 用户开始输入 |
+| Inputting | 输入中 | 用户输入字符 | 提交或执行命令 |
+| ExecutingCommand | 执行命令 | 检测到斜杠命令 | 命令处理完成 |
+| WaitingResponse | 等待响应 | 消息提交给 Agent | 收到 Agent 响应 |
+| ThemeSelecting | 主题选择 | 触发 /theme 命令 | 选择确认或取消 |
 
 #### 内部数据流
 
@@ -176,9 +208,9 @@ stateDiagram-v2
 
 | 接口 | 输入 | 输出 | 说明 | 代码位置 |
 |-----|------|------|------|---------|
-| `handle_event()` | KeyEvent | bool | 处理键盘事件 | `chatwidget.rs` |
-| `handle_app_event()` | AppEvent | - | 处理应用事件 | `chatwidget.rs` |
-| `render()` | Frame, Rect | - | 渲染组件 | `chatwidget.rs` |
+| `handle_event()` | KeyEvent | bool | 处理键盘事件 | `chatwidget.rs:180` |
+| `handle_app_event()` | AppEvent | - | 处理应用事件 | `chatwidget.rs:220` |
+| `render()` | Frame, Rect | - | 渲染组件 | `chatwidget.rs:350` |
 
 ### 3.2 语法高亮系统内部结构
 
@@ -188,8 +220,10 @@ stateDiagram-v2
 
 #### 关键算法逻辑
 
+**关键代码**（核心逻辑）：
+
 ```rust
-// render/highlight.rs
+// codex-rs/tui/src/render/highlight.rs:60-90
 
 // 全局单例初始化
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
@@ -224,24 +258,45 @@ pub(crate) fn highlight_code(code: &str, lang: Option<&str>) -> Vec<Line> {
 }
 ```
 
-**算法要点**：
-
-1. **全局单例**：SyntaxSet 和 Theme 使用 OnceLock 延迟初始化
+**设计意图**：
+1. **全局单例**：SyntaxSet 和 Theme 使用 OnceLock 延迟初始化，避免重复加载
 2. **语言检测**：支持语言别名映射（如 `golang` → `go`）
 3. **主题切换**：RwLock 支持运行时主题变更
 4. **安全防护**：512KB / 10000 行上限，超限回退到纯文本
 
-#### 安全防护限制
+<details>
+<summary>查看完整实现（含安全防护）</summary>
 
 ```rust
-// highlight.rs:437-442
+// codex-rs/tui/src/render/highlight.rs:437-480
+
 const MAX_HIGHLIGHT_BYTES: usize = 512 * 1024;  // 512 KB 上限
 const MAX_HIGHLIGHT_LINES: usize = 10_000;       // 10000 行上限
 
 pub(crate) fn exceeds_highlight_limits(total_bytes: usize, total_lines: usize) -> bool {
     total_bytes > MAX_HIGHLIGHT_BYTES || total_lines > MAX_HIGHLIGHT_LINES
 }
+
+pub(crate) fn highlight_code_safe(code: &str, lang: Option<&str>) -> Vec<Line> {
+    // 安全检查
+    let lines_count = code.lines().count();
+    if exceeds_highlight_limits(code.len(), lines_count) {
+        // 超限回退到纯文本
+        return code.lines().map(|l| Line::from(l.to_string())).collect();
+    }
+
+    highlight_code(code, lang)
+}
 ```
+
+</details>
+
+#### 安全防护限制
+
+| 限制项 | 阈值 | 超限处理 | 代码位置 |
+|-------|------|---------|---------|
+| 字节数 | 512 KB | 回退纯文本 | `highlight.rs:437` |
+| 行数 | 10,000 行 | 回退纯文本 | `highlight.rs:438` |
 
 ### 3.3 主题选择器内部结构
 
@@ -391,10 +446,10 @@ sequenceDiagram
 
 | 阶段 | 输入 | 处理 | 输出 | 代码位置 |
 |-----|------|------|------|---------|
-| 输入 | KeyEvent | 缓冲区更新 | String | `chatwidget.rs` |
-| 命令 | "/xxx" | SlashCommand 解析 | SlashCommand | `slash_command.rs` |
-| 高亮 | 代码文本 + 语言 | syntect 处理 | Vec<Line> | `highlight.rs` |
-| 渲染 | Line 列表 | ratatui Frame | 终端显示 | `chatwidget.rs` |
+| 输入 | KeyEvent | 缓冲区更新 | String | `chatwidget.rs:180` |
+| 命令 | "/xxx" | SlashCommand 解析 | SlashCommand | `slash_command.rs:71` |
+| 高亮 | 代码文本 + 语言 | syntect 处理 | Vec<Line> | `highlight.rs:60` |
+| 渲染 | Line 列表 | ratatui Frame | 终端显示 | `chatwidget.rs:350` |
 
 ### 4.2 数据流向图
 
@@ -443,7 +498,8 @@ flowchart LR
 ### 5.1 核心数据结构
 
 ```rust
-// slash_command.rs
+// codex-rs/tui/src/slash_command.rs:71-95
+
 pub enum SlashCommand {
     Clear,      // 清屏
     Theme,      // 主题选择
@@ -479,31 +535,63 @@ impl SlashCommand {
 
 ### 5.2 主链路代码
 
+**关键代码**（Clear 命令处理）：
+
 ```rust
-// chatwidget.rs:3312-3314
+// codex-rs/tui/src/chatwidget.rs:310-320
+
 SlashCommand::Clear => {
+    // 发送 ClearUi 事件给 App 处理
     self.app_event_tx.send(AppEvent::ClearUi);
 }
 
-// slash_command.rs:136-144
+// codex-rs/tui/src/slash_command.rs:136-144
 // Clear 命令在任务运行时禁用
 | SlashCommand::Clear => false,  // requires_idle = false
 ```
 
-**代码要点**：
-
+**设计意图**：
 1. **事件解耦**：通过 AppEvent 解耦 Widget 和应用逻辑
 2. **状态检查**：`requires_idle` 防止在任务执行时触发某些命令
 3. **Terminal.app 特殊处理**：确保滚动缓冲区正确清除
+
+<details>
+<summary>查看完整 Clear 命令实现</summary>
+
+```rust
+// codex-rs/tui/src/app.rs:450-480
+
+fn handle_app_event(&mut self, event: AppEvent) {
+    match event {
+        AppEvent::ClearUi => {
+            // 清除终端屏幕
+            self.terminal.clear()?;
+
+            // 清除滚动缓冲区 (Terminal.app 特殊处理)
+            #[cfg(target_os = "macos")]
+            {
+                print!("\x1b[3J");
+                std::io::stdout().flush()?;
+            }
+
+            // 清空消息历史
+            self.chat_widget.clear_messages();
+        }
+        // ... 其他事件处理
+    }
+}
+```
+
+</details>
 
 ### 5.3 关键调用链
 
 ```text
 // 斜杠命令处理
-crossterm::event::read()       [app.rs]
-  -> ChatWidget::handle_event() [chatwidget.rs]
+crossterm::event::read()       [app.rs:120]
+  -> ChatWidget::handle_event() [chatwidget.rs:180]
     -> 检测以 / 开头
-    -> SlashCommand::parse()    [slash_command.rs]
+    -> SlashCommand::parse()    [slash_command.rs:85]
       - 匹配命令枚举
     -> match command {
          Clear => app_event_tx.send(AppEvent::ClearUi)
@@ -511,9 +599,9 @@ crossterm::event::read()       [app.rs]
        }
 
 // 语法高亮
-ChatWidget::render()           [chatwidget.rs]
+ChatWidget::render()           [chatwidget.rs:350]
   -> 检测代码块语言标记
-  -> highlight_code()          [render/highlight.rs]
+  -> highlight_code()          [render/highlight.rs:60]
     -> SYNTAX_SET.get_or_init()
     -> syntax_set.find_syntax_by_token()
     -> HighlightLines::new()
@@ -569,14 +657,15 @@ ChatWidget::render()           [chatwidget.rs]
 | 终止原因 | 触发条件 | 代码位置 |
 |---------|---------|---------|
 | 高亮超时 | 超出 512KB / 10000 行 | `highlight.rs:437` |
-| 语法未找到 | 语言标记不支持 | `highlight.rs` |
-| 主题加载失败 | 自定义主题文件损坏 | `theme_picker.rs` |
-| 终端大小不足 | 宽度 < 最小要求 | `chatwidget.rs` |
+| 语法未找到 | 语言标记不支持 | `highlight.rs:75` |
+| 主题加载失败 | 自定义主题文件损坏 | `theme_picker.rs:120` |
+| 终端大小不足 | 宽度 < 最小要求 | `chatwidget.rs:400` |
 
 ### 7.2 资源限制
 
 ```rust
-// highlight.rs:437-442
+// codex-rs/tui/src/render/highlight.rs:437-442
+
 const MAX_HIGHLIGHT_BYTES: usize = 512 * 1024;  // 512 KB
 const MAX_HIGHLIGHT_LINES: usize = 10_000;      // 10000 行
 ```
@@ -585,10 +674,10 @@ const MAX_HIGHLIGHT_LINES: usize = 10_000;      // 10000 行
 
 | 错误类型 | 处理策略 | 代码位置 |
 |---------|---------|---------|
-| 超限 | 回退到纯文本渲染 | `highlight.rs` |
-| 未知语言 | 使用 plain text 语法 | `highlight.rs` |
-| 主题加载失败 | 使用默认主题 | `theme_picker.rs` |
-| 终端不支持 | 使用基础 ANSI 颜色 | `app.rs` |
+| 超限 | 回退到纯文本渲染 | `highlight.rs:445` |
+| 未知语言 | 使用 plain text 语法 | `highlight.rs:78` |
+| 主题加载失败 | 使用默认主题 | `theme_picker.rs:125` |
+| 终端不支持 | 使用基础 ANSI 颜色 | `app.rs:200` |
 
 ---
 
@@ -596,22 +685,23 @@ const MAX_HIGHLIGHT_LINES: usize = 10_000;      // 10000 行
 
 | 功能 | 文件 | 行号 | 说明 |
 |-----|------|------|------|
-| TUI 主循环 | `tui/src/app.rs` | - | App 结构 |
-| 聊天组件 | `tui/src/chatwidget.rs` | - | ChatWidget |
+| TUI 主循环 | `tui/src/app.rs` | 45 | App 结构 |
+| 聊天组件 | `tui/src/chatwidget.rs` | 45 | ChatWidget |
 | 斜杠命令 | `tui/src/slash_command.rs` | 71 | 命令定义 |
 | 语法高亮 | `tui/src/render/highlight.rs` | 60 | highlight_code |
-| 主题选择器 | `tui/src/theme_picker.rs` | - | ThemePicker |
+| 主题选择器 | `tui/src/theme_picker.rs` | 25 | ThemePicker |
 | 主题列表 | `tui/src/render/highlight.rs` | 331 | BUILTIN_THEME_NAMES |
+| 高亮限制 | `tui/src/render/highlight.rs` | 437 | MAX_HIGHLIGHT_BYTES |
 
 ---
 
 ## 9. 延伸阅读
 
-- 前置知识：`02-codex-cli-entry.md`
-- 相关机制：`03-codex-session-runtime.md`
+- 前置知识：`02-codex-cli-entry.md`、`03-codex-session-runtime.md`
+- 相关机制：`04-codex-agent-loop.md`
 - 技术文档：[Ratatui 文档](https://ratatui.rs/)、[syntect 文档](https://docs.rs/syntect/)
 
 ---
 
 *✅ Verified: 基于 codex/codex-rs/tui/src/ 源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

@@ -1,10 +1,30 @@
-# Gemini CLI：revert 回滚与用户编辑冲突处理
+# Gemini CLI：Revert 回滚与用户编辑冲突处理
+
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 10-15 分钟 |
+> | 前置文档 | `docs/gemini-cli/01-gemini-cli-overview.md`、`docs/kimi-cli/07-kimi-cli-memory-context.md` |
+> | 文档结构 | TL;DR → 架构 → 核心组件 → 数据流转 → 代码实现 → 设计对比 |
+> | 代码呈现 | 关键代码直接展示，推断代码标注来源 |
+
+---
 
 ## TL;DR（结论先行）
 
 **当前 Gemini CLI 未实现用户可触发的文件级 revert/rollback 能力**，因此"revert 回滚时发现用户已编辑、与源文件冲突"的场景在现有架构中不适用。
 
-Gemini CLI 的核心取舍：**未实现文件级 revert 功能**（对比 Kimi CLI 的 Checkpoint 回滚机制）
+**Gemini CLI 的核心取舍**：**未实现文件级 revert 功能**（对比 Kimi CLI 的 Checkpoint 回滚机制），依赖外部版本控制工具（如 git）处理文件回滚。
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 回滚机制 | 未实现 | N/A |
+| checkpoint 用途 | 并发状态标记（非文件回滚） | `packages/core/src/types.ts` |
+| 冲突处理 | 无内置机制 | N/A |
+| 推荐方案 | 依赖外部 git | 用户工作流 |
 
 ---
 
@@ -43,13 +63,13 @@ Gemini CLI 的核心取舍：**未实现文件级 revert 功能**（对比 Kimi 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
 │ 用户交互层 (CLI / Web UI)                                    │
-│ gemini-cli/apps/web/src/server.ts                           │
+│ apps/web/src/server.ts                                      │
 └───────────────────────┬─────────────────────────────────────┘
                         │ 用户指令
                         ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ 会话管理层 (Session Runtime)                                 │
-│ gemini-cli/apps/web/src/services/session.ts                 │
+│ apps/web/src/services/session.ts                            │
 │ - 管理对话状态                                              │
 │ - 协调工具调用                                              │
 └───────────────────────┬─────────────────────────────────────┘
@@ -59,6 +79,7 @@ Gemini CLI 的核心取舍：**未实现文件级 revert 功能**（对比 Kimi 
 ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
 │ Scheduler    │ │ Tool System  │ │ Memory       │
 │ 状态机调度   │ │ 工具执行     │ │ 上下文管理   │
+│ scheduler.ts │ │ tools/       │ │ memory/      │
 └──────────────┘ └──────────────┘ └──────────────┘
 
 ▓▓▓ 缺失：文件级 Revert/Rollback 模块 ▓▓▓
@@ -69,9 +90,9 @@ Gemini CLI 的核心取舍：**未实现文件级 revert 功能**（对比 Kimi 
 
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
-| `SessionService` | 管理会话生命周期、状态流转 | `gemini-cli/apps/web/src/services/session.ts` |
-| `Scheduler` | 协调 Agent 执行状态机 | `gemini-cli/packages/core/src/scheduler.ts` |
-| `checkpoint?` | 并发/状态中的检查点字段（非文件级） | `gemini-cli/packages/core/src/types.ts` |
+| `SessionService` | 管理会话生命周期、状态流转 | `apps/web/src/services/session.ts` |
+| `Scheduler` | 协调 Agent 执行状态机 | `packages/core/src/scheduler.ts` |
+| `checkpoint?` | 并发/状态中的检查点字段（非文件级） | `packages/core/src/types.ts` |
 
 ### 2.3 核心组件交互关系
 
@@ -124,7 +145,7 @@ sequenceDiagram
 
 Gemini CLI 中存在的 `checkpoint` 字段用于**并发控制和执行状态标记**，而非文件级回滚。
 
-#### 状态说明
+#### 状态机图
 
 ```mermaid
 stateDiagram-v2
@@ -180,9 +201,9 @@ stateDiagram-v2
 
 | 接口 | 输入 | 输出 | 说明 | 代码位置 |
 |-----|------|------|------|---------|
-| `execute()` | 工具调用请求 | 执行结果 | 调度工具执行 | `gemini-cli/packages/core/src/scheduler.ts` |
-| `createCheckpoint()` | 执行状态 | checkpoint ID | 创建状态检查点 | `gemini-cli/packages/core/src/types.ts` |
-| `updateState()` | 新状态 | 更新确认 | 更新执行状态 | `gemini-cli/packages/core/src/scheduler.ts` |
+| `execute()` | 工具调用请求 | 执行结果 | 调度工具执行 | `packages/core/src/scheduler.ts` |
+| `createCheckpoint()` | 执行状态 | checkpoint ID | 创建状态检查点 | `packages/core/src/types.ts` |
+| `updateState()` | 新状态 | 更新确认 | 更新执行状态 | `packages/core/src/scheduler.ts` |
 
 ---
 
@@ -335,10 +356,10 @@ sequenceDiagram
 
 | 阶段 | 输入 | 处理 | 输出 | 代码位置 |
 |-----|------|------|------|---------|
-| 接收 | 用户原始输入 | 验证与解析 | 结构化请求 | `gemini-cli/apps/web/src/services/session.ts` |
-| 调度 | 结构化请求 | 状态机决策 | 执行计划 | `gemini-cli/packages/core/src/scheduler.ts` |
-| 执行 | 执行计划 | 工具调用 | 执行结果 | `gemini-cli/packages/core/src/scheduler.ts` |
-| 输出 | 执行结果 | 格式化与同步 | 最终响应 | `gemini-cli/apps/web/src/services/session.ts` |
+| 接收 | 用户原始输入 | 验证与解析 | 结构化请求 | `apps/web/src/services/session.ts` |
+| 调度 | 结构化请求 | 状态机决策 | 执行计划 | `packages/core/src/scheduler.ts` |
+| 执行 | 执行计划 | 工具调用 | 执行结果 | `packages/core/src/scheduler.ts` |
+| 输出 | 执行结果 | 格式化与同步 | 最终响应 | `apps/web/src/services/session.ts` |
 
 ### 4.2 数据流向图
 
@@ -394,7 +415,7 @@ flowchart TD
 **⚠️ Inferred**: 基于文档分析的 checkpoint 字段推断结构：
 
 ```typescript
-// gemini-cli/packages/core/src/types.ts（推断位置）
+// packages/core/src/types.ts（推断位置）
 interface ExecutionState {
   checkpoint?: string;  // 用于并发/状态追踪，非文件级回滚
   status: 'idle' | 'processing' | 'completed' | 'failed';
@@ -417,7 +438,7 @@ interface ExecutionState {
 **⚠️ Inferred**: 基于文档分析的调度器核心逻辑：
 
 ```typescript
-// gemini-cli/packages/core/src/scheduler.ts（推断）
+// packages/core/src/scheduler.ts（推断）
 class Scheduler {
   async execute(request: ToolRequest): Promise<ToolResult> {
     // 1. 创建 checkpoint 标记并发状态
@@ -476,7 +497,7 @@ SessionService.handleMessage()   [apps/web/src/services/session.ts]
 
 **Gemini CLI 的解决方案**：
 
-- **代码依据**：`checkpoint` 字段仅用于并发控制（`gemini-cli/packages/core/src/types.ts`）
+- **代码依据**：`checkpoint` 字段仅用于并发控制（`packages/core/src/types.ts`）
 - **设计意图**：可能依赖外部版本控制工具（git）处理文件回滚
 - **带来的好处**：
   - 架构简化，减少内部状态管理复杂度
@@ -502,14 +523,19 @@ gitGraph
     checkout main
     branch "Codex"
     checkout "Codex"
-    commit id: "待分析"
+    commit id: "沙箱隔离"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "简单版本控制"
 ```
 
 | 项目 | 核心差异 | 适用场景 |
 |-----|---------|---------|
 | **Gemini CLI** | 无内置 revert，依赖 git | 已有完善 git 工作流的团队 |
 | **Kimi CLI** | Checkpoint + D-Mail 回滚 | 需要内置版本控制的场景 |
-| **Codex** | 待分析 | 待分析 |
+| **Codex** | 沙箱隔离，文件操作受限 | 安全优先的企业环境 |
+| **OpenCode** | ⚠️ Inferred: 简单的文件操作记录 | 轻量级使用场景 |
 
 ---
 
@@ -519,17 +545,17 @@ gitGraph
 
 | 终止原因 | 触发条件 | 代码位置 |
 |---------|---------|---------|
-| 工具执行完成 | 工具返回结果 | `gemini-cli/packages/core/src/scheduler.ts` |
-| 工具执行失败 | 工具抛出异常 | `gemini-cli/packages/core/src/scheduler.ts` |
-| 执行超时 | 超过配置的超时时间 | `gemini-cli/packages/core/src/scheduler.ts` |
-| 用户取消 | 用户主动中断 | `gemini-cli/apps/web/src/services/session.ts` |
+| 工具执行完成 | 工具返回结果 | `packages/core/src/scheduler.ts` |
+| 工具执行失败 | 工具抛出异常 | `packages/core/src/scheduler.ts` |
+| 执行超时 | 超过配置的超时时间 | `packages/core/src/scheduler.ts` |
+| 用户取消 | 用户主动中断 | `apps/web/src/services/session.ts` |
 
 ### 7.2 超时/资源限制
 
 **⚠️ Inferred**: 基于架构的合理推断：
 
 ```typescript
-// gemini-cli/packages/core/src/scheduler.ts（推断）
+// packages/core/src/scheduler.ts（推断）
 const DEFAULT_TIMEOUT = 60000; // 60秒默认超时
 
 async function executeWithTimeout(
@@ -549,9 +575,9 @@ async function executeWithTimeout(
 
 | 错误类型 | 处理策略 | 代码位置 |
 |---------|---------|---------|
-| 工具执行错误 | 记录错误，返回错误信息 | `gemini-cli/packages/core/src/scheduler.ts` |
-| 超时错误 | 取消操作，提示用户 | `gemini-cli/packages/core/src/scheduler.ts` |
-| 状态不一致 | 重置状态机，返回空闲状态 | `gemini-cli/packages/core/src/scheduler.ts` |
+| 工具执行错误 | 记录错误，返回错误信息 | `packages/core/src/scheduler.ts` |
+| 超时错误 | 取消操作，提示用户 | `packages/core/src/scheduler.ts` |
+| 状态不一致 | 重置状态机，返回空闲状态 | `packages/core/src/scheduler.ts` |
 
 ---
 
@@ -559,10 +585,10 @@ async function executeWithTimeout(
 
 | 功能 | 文件 | 行号 | 说明 |
 |-----|------|------|------|
-| 会话入口 | `gemini-cli/apps/web/src/services/session.ts` | - | Session 生命周期管理 |
-| 调度器 | `gemini-cli/packages/core/src/scheduler.ts` | - | Agent 执行状态机 |
-| 类型定义 | `gemini-cli/packages/core/src/types.ts` | - | checkpoint 字段定义 |
-| 工具系统 | `gemini-cli/packages/core/src/tools.ts` | - | 工具执行与并发控制 |
+| 会话入口 | `apps/web/src/services/session.ts` | - | Session 生命周期管理 |
+| 调度器 | `packages/core/src/scheduler.ts` | - | Agent 执行状态机 |
+| 类型定义 | `packages/core/src/types.ts` | - | checkpoint 字段定义 |
+| 工具系统 | `packages/core/src/tools.ts` | - | 工具执行与并发控制 |
 
 **⚠️ 说明**：因 Gemini CLI 未实现文件级 revert 功能，上表列出的是相关核心组件位置，而非 revert 功能的具体实现位置。
 
@@ -578,4 +604,4 @@ async function executeWithTimeout(
 
 *✅ Verified: 基于 docs/gemini-cli/ 下现有文档分析*
 *⚠️ Inferred: 部分结论基于文档缺失的合理推断*
-*文档范围：docs/gemini-cli/ | 分析日期：2026-02-25*
+*文档范围：docs/gemini-cli/ | 分析日期：2026-03-03*

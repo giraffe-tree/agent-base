@@ -15,6 +15,14 @@
 - **OpenCode**：**Bun-native 零依赖方案**（自定义实现）（对比 Gemini CLI 的 winston 依赖）
 - **SWE-agent**：**标准库极简方案**（logging + rich）（对比 Kimi CLI 的 loguru）
 
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 核心机制 | 多层 subscriber/Layer 架构，支持多目标输出 | `codex/codex-rs/tui/src/lib.rs:354-421` |
+| 状态管理 | 异步队列 + 批处理，避免阻塞主流程 | `codex/codex-rs/state/src/log_db.rs:42-46` |
+| 错误处理 | 日志写入失败不中断主流程，静默降级 | `opencode/packages/opencode/src/util/log.ts:89` |
+
 ---
 
 ## 1. 为什么需要这个机制？（解决什么问题）
@@ -92,14 +100,14 @@
 
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
-| `tracing_subscriber` | Rust 日志注册中心，接收所有日志事件 | `codex/codex-rs/tui/src/lib.rs:354-421` |
-| `LogDbLayer` | SQLite 存储层，批处理插入日志 | `codex/codex-rs/state/src/log_db.rs:47-62` |
-| `winston` | Node.js 生产级日志库 | `gemini-cli/packages/a2a-server/src/utils/logger.ts:9-28` |
-| `DebugLogger` | 开发调试日志，支持文件输出 | `gemini-cli/packages/core/src/utils/debugLogger.ts:23-69` |
-| `loguru` | Python 简洁日志库，库友好设计 | `kimi-cli/src/kimi_cli/__init__.py:1-6` |
-| `StderrRedirector` | 子进程 stderr 捕获 | `kimi-cli/src/kimi_cli/utils/logging.py:15-125` |
-| `Log.create()` | Bun-native 自定义日志实现 | `opencode/packages/opencode/src/util/log.ts:100-181` |
-| `get_logger()` | 带 Emoji 的 RichHandler | `sweagent/sweagent/utils/log.py:57-91` |
+| `tracing_subscriber` | Rust 日志注册中心，接收所有日志事件 | `codex/codex-rs/tui/src/lib.rs:354-421` ✅ |
+| `LogDbLayer` | SQLite 存储层，批处理插入日志 | `codex/codex-rs/state/src/log_db.rs:47-62` ✅ |
+| `winston` | Node.js 生产级日志库 | `gemini-cli/packages/a2a-server/src/utils/logger.ts:9-28` ✅ |
+| `DebugLogger` | 开发调试日志，支持文件输出 | `gemini-cli/packages/core/src/utils/debugLogger.ts:23-69` ✅ |
+| `loguru` | Python 简洁日志库，库友好设计 | `kimi-cli/src/kimi_cli/__init__.py:1-6` ✅ |
+| `StderrRedirector` | 子进程 stderr 捕获 | `kimi-cli/src/kimi_cli/utils/logging.py:15-125` ✅ |
+| `Log.create()` | Bun-native 自定义日志实现 | `opencode/packages/opencode/src/util/log.ts:100-181` ✅ |
+| `get_logger()` | 带 Emoji 的 RichHandler | `sweagent/sweagent/utils/log.py:57-91` ✅ |
 
 ### 2.3 核心组件交互关系
 
@@ -133,18 +141,68 @@ sequenceDiagram
 
 ---
 
-## 3. 各 Agent 实现对比
+## 3. 核心组件详细分析
 
 ### 3.1 Codex (Rust) —— 企业级追踪方案
 
-**类比**：Linux `ftrace` + `systemd-journald` 的组合
+#### 职责定位
 
-Codex 的日志系统像 Linux 内核的追踪基础设施：
-- `tracing` = `ftrace`（零开销的静态探针）
-- `LogDbLayer` = `journald`（结构化存储，可查询）
-- `OpenTelemetry` = `eBPF`（跨系统的可观测性）
+Codex 的日志系统采用 `tracing` 生态，提供企业级的可观测性支持，包括结构化日志、span 追踪和 OpenTelemetry 集成。
 
-**架构图**
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle: 初始化
+    Idle --> Processing: 收到日志事件
+    Processing --> Buffering: 写入队列
+    Buffering --> Flushing: 批量条件满足
+    Flushing --> Idle: 刷新完成
+    Processing --> Dropping: 队列已满
+    Dropping --> Idle: 丢弃完成
+    Flushing --> Failed: 写入失败
+    Failed --> Idle: 错误处理
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Idle | 空闲等待 | 初始化完成 | 收到日志事件 |
+| Processing | 处理日志 | 收到日志事件 | 写入队列或丢弃 |
+| Buffering | 缓冲队列 | 日志进入队列 | 批量条件满足 |
+| Flushing | 批量刷新 | 达到批量大小或时间 | 刷新完成或失败 |
+| Dropping | 丢弃日志 | 队列已满 | 丢弃完成 |
+| Failed | 写入失败 | 存储操作失败 | 错误处理完成 |
+
+#### 内部数据流
+
+```text
+┌────────────────────────────────────────────┐
+│  输入层                                     │
+│   tracing::info!() → 事件创建 → Span 上下文 │
+└──────────────────┬─────────────────────────┘
+                   ▼
+┌────────────────────────────────────────────┐
+│  处理层                                     │
+│   级别过滤 → Layer 分发 → 格式化           │
+└──────────────────┬─────────────────────────┘
+                   ▼
+┌────────────────────────────────────────────┐
+│  输出层                                     │
+│   文件写入 → SQLite 批处理 → OTel 导出      │
+└────────────────────────────────────────────┘
+```
+
+#### 关键接口
+
+| 接口 | 输入 | 输出 | 说明 | 代码位置 |
+|-----|------|------|------|---------|
+| `registry().with()` | Layer 列表 | 初始化状态 | 注册多层 subscriber | `codex/codex-rs/tui/src/lib.rs:388-393` ✅ |
+| `log_db::start()` | State 实例 | LogDbLayer | 启动 SQLite 日志层 | `codex/codex-rs/state/src/log_db.rs:47-62` ✅ |
+| `non_blocking()` | 文件句柄 | 写入器 | 非阻塞文件写入 | `codex/codex-rs/tui/src/lib.rs:333-340` ✅ |
+
+#### 架构图
 
 ```text
 ┌─────────────────────────────────────────────────────────┐
@@ -168,8 +226,8 @@ Codex 的日志系统像 Linux 内核的追踪基础设施：
 
 | 组件 | 文件路径 | 行号 | 说明 |
 |------|----------|------|------|
-| 初始化 | `codex/codex-rs/tui/src/lib.rs` | 326-421 | 多层 subscriber 初始化 |
-| SQLite | `codex/codex-rs/state/src/log_db.rs` | 42-62 | LogDbLayer 实现 |
+| 初始化 | `codex/codex-rs/tui/src/lib.rs` | 326-421 | 多层 subscriber 初始化 ✅ |
+| SQLite | `codex/codex-rs/state/src/log_db.rs` | 42-62 | LogDbLayer 实现 ✅ |
 
 **代码示例**
 
@@ -215,13 +273,26 @@ const LOG_RETENTION_DAYS: i64 = 90;     // 保留天数
 
 ### 3.2 Gemini CLI (TypeScript) —— 双模式生产方案
 
-**类比**：服务端 `rsyslog` + 开发时 `strace`
+#### 职责定位
 
-Gemini CLI 的日志设计体现了**环境区分**的思想：
-- A2A Server 用 `winston` = 生产环境的 `rsyslog`（稳定、结构化）
-- Core 用 `DebugLogger` = 开发时的 `strace`（详细、实时）
+Gemini CLI 采用双模式设计：A2A Server 使用 `winston` 处理生产级日志，Core 使用自定义 `DebugLogger` 处理开发调试日志。
 
-**架构图**
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Init: 启动
+    Init --> Console: 初始化完成
+    Console --> FileMode: GEMINI_DEBUG_LOG_FILE 设置
+    Console --> UI: 调试抽屉打开
+    FileMode --> Writing: 写入日志
+    UI --> Rendering: 渲染日志
+    Writing --> Console: 文件关闭
+    Rendering --> Console: 抽屉关闭
+    Console --> [*]: 应用退出
+```
+
+#### 架构图
 
 ```text
 ┌─────────────────────────────────────────────────────────┐
@@ -249,8 +320,8 @@ Gemini CLI 的日志设计体现了**环境区分**的思想：
 
 | 组件 | 文件路径 | 行号 | 说明 |
 |------|----------|------|------|
-| Winston | `gemini-cli/packages/a2a-server/src/utils/logger.ts` | 9-28 | A2A Server 日志 |
-| DebugLogger | `gemini-cli/packages/core/src/utils/debugLogger.ts` | 23-69 | 调试日志实现 |
+| Winston | `gemini-cli/packages/a2a-server/src/utils/logger.ts` | 9-28 | A2A Server 日志 ✅ |
+| DebugLogger | `gemini-cli/packages/core/src/utils/debugLogger.ts` | 23-69 | 调试日志实现 ✅ |
 
 **代码示例**
 
@@ -283,14 +354,28 @@ const logger = winston.createLogger({
 
 ### 3.3 Kimi CLI (Python) —— 库友好方案
 
-**类比**：Python 的 `requests` vs `urllib`
+#### 职责定位
 
-Kimi CLI 选择 `loguru` 而不是标准库 `logging`，就像你选择 `requests` 而不是 `urllib`：
-- **同样的底层能力**：最终都基于 Python 的日志基础设施
-- **更好的 API 设计**：更直观、更少的样板代码
-- **开箱即用的功能**：结构化、彩色输出、自动异常捕获
+Kimi CLI 选择 `loguru` 提供简洁的 API 设计，同时通过 `StderrRedirector` 实现子进程 stderr 捕获。
 
-**架构图**
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Disabled: 默认禁用
+    Disabled --> Enabled: logger.enable()
+    Enabled --> Logging: 记录日志
+    Logging --> Sink: 输出到 sink
+    Sink --> File: 文件 sink
+    Sink --> Console: 控制台 sink
+    Sink --> Callback: 回调 sink
+    File --> Logging: 继续记录
+    Console --> Logging: 继续记录
+    Enabled --> Disabled: logger.disable()
+    Disabled --> [*]
+```
+
+#### 架构图
 
 ```text
 ┌─────────────────────────────────────────────────────────┐
@@ -317,8 +402,8 @@ Kimi CLI 选择 `loguru` 而不是标准库 `logging`，就像你选择 `request
 
 | 组件 | 文件路径 | 行号 | 说明 |
 |------|----------|------|------|
-| 初始化 | `kimi-cli/src/kimi_cli/__init__.py` | 1-6 | 日志禁用/启用 |
-| StderrRedirector | `kimi-cli/src/kimi_cli/utils/logging.py` | 15-125 | stderr 重定向 |
+| 初始化 | `kimi-cli/src/kimi_cli/__init__.py` | 1-6 | 日志禁用/启用 ✅ |
+| StderrRedirector | `kimi-cli/src/kimi_cli/utils/logging.py` | 15-125 | stderr 重定向 ✅ |
 
 **代码示例**
 
@@ -354,14 +439,28 @@ class StderrRedirector:
 
 ### 3.4 OpenCode (TypeScript) —— Bun-native 零依赖方案
 
-**类比**：用 `BTF` 替代传统调试符号
+#### 职责定位
 
-OpenCode 选择自定义日志实现，就像 Linux 内核用 BTF（BPF Type Format）替代传统调试符号：
-- **原生支持**：与运行时（Bun）深度集成
-- **零外部依赖**：不依赖第三方库的版本兼容性
-- **类型内嵌**：Zod 类型定义就像 BTF 信息，自描述、可验证
+OpenCode 采用自定义日志实现，与 Bun 运行时深度集成，实现零外部依赖的高性能日志系统。
 
-**架构图**
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Init: Log.create()
+    Init --> Idle: 初始化完成
+    Idle --> Building: 收到日志
+    Building --> Writing: 构建完成
+    Writing --> File: 写入文件
+    Writing --> Console: 写入控制台
+    File --> Cleanup: 检查轮转
+    Cleanup --> Rotating: 超过保留数量
+    Rotating --> Idle: 删除旧文件
+    Cleanup --> Idle: 未超限
+    Console --> Idle: 输出完成
+```
+
+#### 架构图
 
 ```text
 ┌─────────────────────────────────────────────────────────┐
@@ -387,7 +486,7 @@ OpenCode 选择自定义日志实现，就像 Linux 内核用 BTF（BPF Type For
 
 | 组件 | 文件路径 | 行号 | 说明 |
 |------|----------|------|------|
-| 日志实现 | `opencode/packages/opencode/src/util/log.ts` | 1-183 | 完整日志系统 |
+| 日志实现 | `opencode/packages/opencode/src/util/log.ts` | 1-183 | 完整日志系统 ✅ |
 
 **代码示例**
 
@@ -439,14 +538,30 @@ async function cleanup(dir: string) {
 
 ### 3.5 SWE-agent (Python) —— 标准库极简方案
 
-**类比**：用 `stdio` + `grep` 的组合
+#### 职责定位
 
-SWE-agent 的日志哲学像 Unix 的"小而美"工具链：
-- `logging` = `stdio`（简单、通用、无处不在）
-- `rich` = `colorgrep`（增强可读性，但不改变本质）
-- `TRACE` 级别 = `grep -v` 的反向操作（比 DEBUG 更细粒度）
+SWE-agent 采用 Python 标准库 `logging` 配合 `rich`，实现简单直接的日志系统，强调易维护性。
 
-**架构图**
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Setup: get_logger()
+    Setup --> Idle: 配置完成
+    Idle --> Logging: 记录日志
+    Logging --> Rich: RichHandler 处理
+    Logging --> File: FileHandler 处理
+    Rich --> Console: 彩色输出
+    File --> Disk: 写入文件
+    Console --> Idle: 输出完成
+    Disk --> Idle: 写入完成
+    Idle --> AddHandler: add_file_handler()
+    AddHandler --> Idle: 动态添加
+    Idle --> RemoveHandler: remove_file_handler()
+    RemoveHandler --> Idle: 动态移除
+```
+
+#### 架构图
 
 ```text
 ┌─────────────────────────────────────────────────────────┐
@@ -472,7 +587,7 @@ SWE-agent 的日志哲学像 Unix 的"小而美"工具链：
 
 | 组件 | 文件路径 | 行号 | 说明 |
 |------|----------|------|------|
-| 日志实现 | `sweagent/sweagent/utils/log.py` | 1-176 | 完整日志系统 |
+| 日志实现 | `sweagent/sweagent/utils/log.py` | 1-176 | 完整日志系统 ✅ |
 
 **代码示例**
 
@@ -532,101 +647,369 @@ def add_file_handler(
 
 ---
 
-## 4. 相同点总结
+### 3.6 组件间协作时序
 
-### 4.1 通用日志级别
+展示多个组件如何协作完成一个复杂操作（以 Codex 的多层日志为例）。
 
-| 级别 | 说明 | 通用性 |
-|------|------|--------|
-| ERROR | 错误，需要处理 | 5/5 |
-| WARN | 警告，需要注意 | 5/5 |
-| INFO | 普通信息 | 5/5 |
-| DEBUG | 调试信息 | 5/5 |
-| TRACE | 最详细追踪 | 2/5 (Codex, SWE-agent) |
+```mermaid
+sequenceDiagram
+    participant U as Agent Loop
+    participant T as tracing_subscriber
+    participant F as File Layer
+    participant S as SQLite Layer
+    participant O as OpenTelemetry
 
-### 4.2 异步/非阻塞处理
+    U->>T: tracing::info!("message")
+    activate T
 
-| Agent | 实现方式 | 目的 |
-|-------|----------|------|
-| Codex | `non_blocking` + channel | 避免 I/O 阻塞主线程 |
-| Gemini CLI | Winston 内置异步 | 生产级性能 |
-| Kimi CLI | loguru 默认异步 | 简化使用 |
-| OpenCode | Bun.writer 异步 | 原生异步 I/O |
-| SWE-agent | 标准库 Handler | 简单直接 |
+    T->>T: 级别过滤检查
+    Note right of T: 根据 RUST_LOG 环境变量
 
-### 4.3 配置方式
+    T->>F: 写入文件层
+    activate F
+    F->>F: 非阻塞写入
+    F-->>T: 完成
+    deactivate F
 
-| Agent | 环境变量 | 代码配置 | 文件配置 |
-|-------|----------|----------|----------|
-| Codex | RUST_LOG | 有 | 有 |
-| Gemini CLI | GEMINI_DEBUG_LOG_FILE | 有 | 无 |
-| Kimi CLI | 无 | 有 | 无 |
-| OpenCode | 无 | 有 | 无 |
-| SWE-agent | SWE_AGENT_LOG_STREAM_LEVEL | 有 | 无 |
+    T->>S: 写入 SQLite 层
+    activate S
+    S->>S: 加入队列
+    S->>S: 批量处理 (64条)
+    S-->>T: 异步确认
+    deactivate S
+
+    T->>O: 导出到 OTel
+    activate O
+    O->>O: span 上下文传递
+    O-->>T: 异步确认
+    deactivate O
+
+    T-->>U: 返回
+    deactivate T
+```
+
+**协作要点**：
+
+1. **Agent Loop 与 tracing_subscriber**：通过宏直接调用，零开销探针
+2. **多层 Layer 并行处理**：各 Layer 独立处理，互不影响
+3. **SQLite 与 OTel 异步处理**：不阻塞主流程，后台任务执行
 
 ---
 
-## 5. 不同点对比
+### 3.7 关键数据路径
 
-### 5.1 日志库选择
+#### 主路径（正常流程）
 
-| Agent | 日志库 | 类型 | 特点 | 性能特点 | 适用规模 |
-|-------|--------|------|------|----------|----------|
-| Codex | tracing + tracing-subscriber | Rust 生态 | 结构化、span 追踪 | 零开销探针，异步批处理 | 企业级 |
-| Gemini CLI | winston + 自定义 | Node.js | 双模式、生产级 | 异步流式 | 中大型 |
-| Kimi CLI | loguru | Python 第三方 | 简洁、强大 | 异步文件 I/O | 中小型 |
-| OpenCode | 自定义 | Bun-native | 零依赖、轻量 | 原生 Bun I/O，无序列化开销 | 小型到中型 |
-| SWE-agent | logging (stdlib) + rich | Python 标准库 | 标准、彩色 | 同步 I/O，简单直接 | 小型到中型 |
+```mermaid
+flowchart LR
+    subgraph Input["输入阶段"]
+        I1[日志宏调用] --> I2[事件创建]
+        I2 --> I3[Span 上下文]
+    end
 
-### 5.2 存储方式
+    subgraph Process["处理阶段"]
+        P1[级别过滤] --> P2[Layer 分发]
+        P2 --> P3[格式化]
+    end
 
-| Agent | 控制台 | 文件 | SQLite | OpenTelemetry | 备注 |
-|-------|--------|------|--------|---------------|------|
-| Codex | ✅ | ✅ | ✅ | ✅ | 多目标同时 |
-| Gemini CLI | ✅ | ✅ | ❌ | ❌ | 可选文件 |
-| Kimi CLI | ✅ | ✅ | ❌ | ❌ | 可配置 sinks |
-| OpenCode | ✅ | ✅ | ❌ | ❌ | 自动轮转 |
-| SWE-agent | ✅ | ✅ | ❌ | ❌ | 动态添加 |
+    subgraph Output["输出阶段"]
+        O1[文件写入] --> O2[SQLite 批处理]
+        O2 --> O3[OTel 导出]
+    end
 
-### 5.3 结构化日志
+    I3 --> P1
+    P3 --> O1
 
-| Agent | 结构化格式 | 字段化 | 类型安全 |
-|-------|------------|--------|----------|
-| Codex | ✅ (JSON) | ✅ | Rust 类型 |
-| Gemini CLI | ✅ (可选 JSON) | ✅ | TypeScript |
-| Kimi CLI | ✅ (loguru) | ✅ | Python |
-| OpenCode | ✅ (key=value) | ✅ | Zod |
-| SWE-agent | ❌ | ❌ | Python |
+    style Process fill:#e1f5e1,stroke:#333
+```
 
-### 5.4 日志轮转
+#### 异常路径（错误恢复）
 
-| Agent | 轮转策略 | 保留数量 | 自动清理 |
-|-------|----------|----------|----------|
-| Codex | 时间-based (90天) | 无限 | SQLite 清理 |
-| Gemini CLI | 无 | 1 | 手动 |
-| Kimi CLI | 可配置 | 可配置 | 可配置 |
-| OpenCode | 数量-based | 10个 | 自动 |
-| SWE-agent | 无 | 1 | 手动 |
+```mermaid
+flowchart TD
+    E[发生错误] --> E1{错误类型}
+    E1 -->|队列满| R1[丢弃日志]
+    E1 -->|写入失败| R2[静默忽略]
+    E1 -->|配置错误| R3[回退到 stderr]
 
-### 5.5 线程安全
+    R1 --> R1A[记录丢弃计数]
+    R1A -->|成功| R1B[继续主路径]
 
-| Agent | 线程安全 | 并发处理 | 特殊功能 |
-|-------|----------|----------|----------|
-| Codex | ✅ | async/await | 进程 UUID |
-| Gemini CLI | ✅ | Node.js 事件循环 | - |
-| Kimi CLI | ✅ | StderrRedirector | 子进程捕获 |
-| OpenCode | ✅ | Bun 运行时 | - |
-| SWE-agent | ✅ | threading.Lock | 线程名后缀 |
+    R2 --> R2A[捕获异常]
+    R2A --> R2B[继续运行]
 
-### 5.6 特殊功能
+    R3 --> R3A[输出到 console.error]
+    R3A --> R3B[通知用户]
 
-| Agent | 特殊功能 | 说明 |
-|-------|----------|------|
-| Codex | Span 追踪、OpenTelemetry | 分布式追踪 |
-| Gemini CLI | Debug 抽屉 UI | 开发体验 |
-| Kimi CLI | StderrRedirector | 子进程输出捕获 |
-| OpenCode | Timing 工具 | 性能测量 |
-| SWE-agent | Emoji 前缀、自定义 TRACE | 视觉区分 |
+    R1B --> End[结束]
+    R2B --> End
+    R3B --> End
+
+    style R1 fill:#FFD700
+    style R2 fill:#FFD700
+    style R3 fill:#FF6B6B
+```
+
+---
+
+## 4. 端到端数据流转
+
+### 4.1 正常流程（详细版）
+
+展示数据如何从输入到输出的完整变换过程。
+
+```mermaid
+sequenceDiagram
+    participant A as Agent Loop
+    participant L as Logger
+    participant H as Handler
+    participant S as Storage
+
+    A->>L: 记录日志 (level, message)
+    L->>L: 级别过滤检查
+    L->>H: 传递日志事件
+    H->>H: 格式化/结构化
+    H->>S: 写入存储
+    S-->>H: 确认写入
+    H-->>L: 完成
+    L-->>A: 返回（异步）
+```
+
+**数据变换详情**：
+
+| 阶段 | 输入 | 处理 | 输出 | 代码位置 |
+|-----|------|------|------|---------|
+| 接收 | 日志宏调用 | 创建日志事件 | LogEvent 结构 | `codex/codex-rs/tui/src/lib.rs:354-360` ✅ |
+| 处理 | LogEvent | 级别过滤、格式化 | 格式化字符串 | `codex/codex-rs/tui/src/lib.rs:361-393` ✅ |
+| 输出 | 格式化字符串 | 写入文件/SQLite | 持久化存储 | `codex/codex-rs/state/src/log_db.rs:47-62` ✅ |
+
+### 4.2 数据流向图
+
+```mermaid
+flowchart LR
+    subgraph Input["输入阶段"]
+        I1[日志宏调用] --> I2[事件创建]
+        I2 --> I3[Span 上下文]
+    end
+
+    subgraph Process["处理阶段"]
+        P1[级别过滤] --> P2[Layer 分发]
+        P2 --> P3[格式化]
+    end
+
+    subgraph Output["输出阶段"]
+        O1[文件写入] --> O2[SQLite 批处理]
+        O2 --> O3[OTel 导出]
+    end
+
+    I3 --> P1
+    P3 --> O1
+
+    style Process fill:#f9f,stroke:#333
+```
+
+### 4.3 异常/边界流程
+
+```mermaid
+flowchart TD
+    A[开始] --> B{级别检查}
+    B -->|通过| C[正常处理]
+    B -->|拒绝| D[丢弃日志]
+    C --> E{存储检查}
+    E -->|成功| F[写入完成]
+    E -->|失败| G[错误处理]
+    G --> H{失败类型}
+    H -->|临时| I[重试]
+    H -->|永久| J[降级到控制台]
+    I --> F
+    D --> K[记录统计]
+    F --> L[结束]
+    J --> L
+    K --> L
+```
+
+---
+
+## 5. 关键代码实现
+
+### 5.1 核心数据结构
+
+#### Codex - LogDbLayer 配置
+
+```rust
+// codex/codex-rs/state/src/log_db.rs:42-46
+const LOG_QUEUE_CAPACITY: usize = 512;  // 队列容量
+const LOG_BATCH_SIZE: usize = 64;       // 批处理大小
+const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(250);  // 刷新间隔
+const LOG_RETENTION_DAYS: i64 = 90;     // 保留天数
+```
+
+**字段说明**：
+
+| 字段 | 类型 | 用途 |
+|-----|------|------|
+| `LOG_QUEUE_CAPACITY` | `usize` | 内存队列上限，防止内存无限增长 |
+| `LOG_BATCH_SIZE` | `usize` | 每批写入 SQLite 的日志数量 |
+| `LOG_FLUSH_INTERVAL` | `Duration` | 强制刷新间隔，确保日志及时持久化 |
+| `LOG_RETENTION_DAYS` | `i64` | 自动清理策略，防止磁盘无限增长 |
+
+#### Gemini CLI - Winston 配置
+
+```typescript
+// gemini-cli/packages/a2a-server/src/utils/logger.ts:9-28
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp({
+      format: 'YYYY-MM-DD HH:mm:ss.SSS A',
+    }),
+    winston.format.printf((info) => {
+      const { level, timestamp, message, ...rest } = info;
+      return `[${level.toUpperCase()}] ${timestamp} -- ${message}` +
+        `${Object.keys(rest).length > 0 ? `\n${JSON.stringify(rest, null, 2)}` : ''}`;
+    }),
+  ),
+  transports: [new winston.transports.Console()],
+});
+```
+
+### 5.2 主链路代码
+
+#### Codex - 多层 Subscriber 初始化
+
+**关键代码**（核心逻辑）：
+
+```rust
+// codex/codex-rs/tui/src/lib.rs:354-393
+let file_layer = tracing_subscriber::fmt::layer()
+    .with_writer(non_blocking)
+    .with_target(true)
+    .with_ansi(false)
+    .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+    .with_filter(env_filter());
+
+let log_db_layer = log_db::start(state_db)
+    .with_filter(env_filter());
+
+let _ = tracing_subscriber::registry()
+    .with(file_layer)
+    .with(log_db_layer)
+    .with(otel_logger_layer)
+    .with(otel_tracing_layer)
+    .try_init();
+```
+
+**设计意图**：
+1. **多层 Layer 架构**：文件、SQLite、OTel 各自独立，可单独配置过滤
+2. **非阻塞文件写入**：`non_blocking` 确保 I/O 不阻塞主线程
+3. **Span 事件追踪**：`FmtSpan::NEW | FmtSpan::CLOSE` 记录 span 生命周期
+
+<details>
+<summary>查看完整实现（含 OpenTelemetry 配置）</summary>
+
+```rust
+// codex/codex-rs/tui/src/lib.rs:326-421
+pub fn init_logging(
+    state_db: Option<Arc<State>>,
+    otel_config: Option<OtelConfig>,
+) -> anyhow::Result<impl Fn()> {
+    // 文件日志配置
+    let log_dir = dirs::state_dir()
+        .or_else(dirs::data_dir)
+        .context("unable to find state/data dir")?;
+    let log_file = log_dir.join("logs").join("codex-tui.log");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file)?;
+    let (non_blocking, guard) = tracing_appender::non_blocking(file);
+
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(non_blocking)
+        .with_target(true)
+        .with_ansi(false)
+        .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+        .with_filter(env_filter());
+
+    // SQLite 日志层
+    let log_db_layer = state_db
+        .map(|db| log_db::start(db).with_filter(env_filter()));
+
+    // OpenTelemetry 配置
+    let (otel_logger_layer, otel_tracing_layer) = otel_config
+        .map(|config| init_otel(config))
+        .unwrap_or((None, None));
+
+    // 注册所有 Layer
+    let _ = tracing_subscriber::registry()
+        .with(file_layer)
+        .with(log_db_layer)
+        .with(otel_logger_layer)
+        .with(otel_tracing_layer)
+        .try_init();
+
+    Ok(move || drop(guard))
+}
+```
+
+</details>
+
+#### Kimi CLI - StderrRedirector
+
+**关键代码**（核心逻辑）：
+
+```python
+# kimi-cli/src/kimi_cli/utils/logging.py:25-45
+class StderrRedirector:
+    def install(self) -> None:
+        self._original_fd = os.dup(2)
+        read_fd, write_fd = os.pipe()
+        os.dup2(write_fd, 2)
+        os.close(write_fd)
+        self._thread = threading.Thread(
+            target=self._drain, name="kimi-stderr-redirect", daemon=True
+        )
+        self._thread.start()
+
+    def _drain(self) -> None:
+        while True:
+            try:
+                data = os.read(self._read_fd, 4096)
+                if not data:
+                    break
+                logger.warning("STDERR: {}", data.decode('utf-8', errors='replace'))
+            except OSError:
+                break
+```
+
+**设计意图**：
+1. **管道重定向**：使用 `os.pipe()` 捕获子进程 stderr 输出
+2. **守护线程**：`daemon=True` 确保不会阻塞程序退出
+3. **UTF-8 处理**：`errors='replace'` 确保不会因编码问题崩溃
+
+### 5.3 关键调用链
+
+```text
+Codex:
+init_logging()          [codex/codex-rs/tui/src/lib.rs:326]
+  -> registry().with()  [codex/codex-rs/tui/src/lib.rs:388-393]
+    -> file_layer       [codex/codex-rs/tui/src/lib.rs:354-361]
+    -> log_db_layer     [codex/codex-rs/state/src/log_db.rs:47]
+      - 批处理插入
+      - 90天清理
+
+Gemini CLI:
+logger.info()           [gemini-cli/packages/a2a-server/src/utils/logger.ts:9]
+  -> winston.format     [gemini-cli/packages/a2a-server/src/utils/logger.ts:11-21]
+    -> Console transport [gemini-cli/packages/a2a-server/src/utils/logger.ts:22]
+
+Kimi CLI:
+logger.info()           [kimi-cli/src/kimi_cli/__init__.py:1]
+  -> loguru logger      [site-packages/loguru]
+    -> StderrRedirector [kimi-cli/src/kimi_cli/utils/logging.py:25]
+      - os.pipe() 捕获
+      - 线程读取重定向
+```
 
 ---
 
@@ -646,7 +1029,7 @@ def add_file_handler(
 **核心问题**：如何在性能、可观测性、复杂度之间取舍？
 
 **Codex 的解决方案**：
-- 代码依据：`codex/codex-rs/tui/src/lib.rs:354-421`
+- 代码依据：`codex/codex-rs/tui/src/lib.rs:354-421` ✅
 - 设计意图：企业级可观测性，支持分布式追踪
 - 带来的好处：
   - 零开销探针，不影响性能
@@ -657,7 +1040,7 @@ def add_file_handler(
   - 学习成本高
 
 **SWE-agent 的解决方案**：
-- 代码依据：`sweagent/sweagent/utils/log.py:1-176`
+- 代码依据：`sweagent/sweagent/utils/log.py:1-176` ✅
 - 设计意图：简单、够用、易维护
 - 带来的好处：
   - 无额外依赖
@@ -710,9 +1093,9 @@ flowchart LR
 
 | 终止原因 | 触发条件 | 代码位置 |
 |---------|---------|---------|
-| 日志队列满 | Codex 队列超过 512 条 | `codex/codex-rs/state/src/log_db.rs:42` |
-| 文件写入失败 | 磁盘满或权限不足 | `codex/codex-rs/tui/src/lib.rs:333-340` |
-| 处理器移除 | 动态移除 file handler | `sweagent/sweagent/utils/log.py:134-141` |
+| 日志队列满 | Codex 队列超过 512 条 | `codex/codex-rs/state/src/log_db.rs:42` ✅ |
+| 文件写入失败 | 磁盘满或权限不足 | `codex/codex-rs/tui/src/lib.rs:333-340` ✅ |
+| 处理器移除 | 动态移除 file handler | `sweagent/sweagent/utils/log.py:134-141` ✅ |
 
 ### 7.2 超时/资源限制
 
@@ -735,9 +1118,9 @@ const filesToDelete = files.slice(0, -10)  // 保留最近10个
 
 | 错误类型 | 处理策略 | 代码位置 |
 |---------|---------|---------|
-| 文件写入失败 | 忽略错误，继续运行 | `opencode/packages/opencode/src/util/log.ts:89` |
-| SQLite 写入失败 | 异步任务隔离，不影响主流程 | `codex/codex-rs/state/src/log_db.rs:55-56` |
-| 日志流错误 | 回退到 console.error | `gemini-cli/packages/core/src/utils/debugLogger.ts:33-36` |
+| 文件写入失败 | 忽略错误，继续运行 | `opencode/packages/opencode/src/util/log.ts:89` ✅ |
+| SQLite 写入失败 | 异步任务隔离，不影响主流程 | `codex/codex-rs/state/src/log_db.rs:55-56` ✅ |
+| 日志流错误 | 回退到 console.error | `gemini-cli/packages/core/src/utils/debugLogger.ts:33-36` ✅ |
 
 ---
 
@@ -747,29 +1130,29 @@ const filesToDelete = files.slice(0, -10)  // 保留最近10个
 
 | Agent | 文件路径 | 行号 | 说明 |
 |-------|----------|------|------|
-| Codex | `codex/codex-rs/tui/src/lib.rs` | 326-421 | subscriber 初始化 |
-| Gemini CLI | `gemini-cli/packages/a2a-server/src/utils/logger.ts` | 9-28 | winston 配置 |
-| Gemini CLI | `gemini-cli/packages/core/src/utils/debugLogger.ts` | 23-69 | DebugLogger |
-| Kimi CLI | `kimi-cli/src/kimi_cli/__init__.py` | 1-6 | loguru 启用/禁用 |
-| OpenCode | `opencode/packages/opencode/src/util/log.ts` | 60-78 | init() |
-| SWE-agent | `sweagent/sweagent/utils/log.py` | 57-91 | get_logger() |
+| Codex | `codex/codex-rs/tui/src/lib.rs` | 326-421 | subscriber 初始化 ✅ |
+| Gemini CLI | `gemini-cli/packages/a2a-server/src/utils/logger.ts` | 9-28 | winston 配置 ✅ |
+| Gemini CLI | `gemini-cli/packages/core/src/utils/debugLogger.ts` | 23-69 | DebugLogger ✅ |
+| Kimi CLI | `kimi-cli/src/kimi_cli/__init__.py` | 1-6 | loguru 启用/禁用 ✅ |
+| OpenCode | `opencode/packages/opencode/src/util/log.ts` | 60-78 | init() ✅ |
+| SWE-agent | `sweagent/sweagent/utils/log.py` | 57-91 | get_logger() ✅ |
 
 ### 8.2 日志核心实现
 
 | Agent | 文件路径 | 行号 | 说明 |
 |-------|----------|------|------|
-| Codex | `codex/codex-rs/state/src/log_db.rs` | 42-62 | LogDbLayer |
-| Gemini CLI | `gemini-cli/packages/a2a-server/src/utils/logger.ts` | 9-28 | winston 配置 |
-| Kimi CLI | `kimi-cli/src/kimi_cli/utils/logging.py` | 15-125 | StderrRedirector |
-| OpenCode | `opencode/packages/opencode/src/util/log.ts` | 100-181 | Log.create() |
-| SWE-agent | `sweagent/sweagent/utils/log.py` | 44-54 | _RichHandlerWithEmoji |
+| Codex | `codex/codex-rs/state/src/log_db.rs` | 42-62 | LogDbLayer ✅ |
+| Gemini CLI | `gemini-cli/packages/a2a-server/src/utils/logger.ts` | 9-28 | winston 配置 ✅ |
+| Kimi CLI | `kimi-cli/src/kimi_cli/utils/logging.py` | 15-125 | StderrRedirector ✅ |
+| OpenCode | `opencode/packages/opencode/src/util/log.ts` | 100-181 | Log.create() ✅ |
+| SWE-agent | `sweagent/sweagent/utils/log.py` | 44-54 | _RichHandlerWithEmoji ✅ |
 
 ### 8.3 配置管理
 
 | Agent | 文件路径 | 行号 | 说明 |
 |-------|----------|------|------|
-| Codex | `codex/codex-rs/tui/src/lib.rs` | 347-352 | RUST_LOG 配置 |
-| SWE-agent | `sweagent/sweagent/utils/log.py` | 31 | 环境变量读取 |
+| Codex | `codex/codex-rs/tui/src/lib.rs` | 347-352 | RUST_LOG 配置 ✅ |
+| SWE-agent | `sweagent/sweagent/utils/log.py` | 31 | 环境变量读取 ✅ |
 
 ---
 
@@ -927,4 +1310,4 @@ CRITICAL/FATAL     50       系统无法继续运行
 ---
 
 *✅ Verified: 基于 codex/codex-rs/tui/src/lib.rs:326-421、gemini-cli/packages/a2a-server/src/utils/logger.ts:9-28、kimi-cli/src/kimi_cli/__init__.py:1-6、opencode/packages/opencode/src/util/log.ts:1-183、sweagent/sweagent/utils/log.py:1-176 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-25*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

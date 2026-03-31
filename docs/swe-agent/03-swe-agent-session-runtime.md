@@ -1,10 +1,31 @@
-# Session 管理（SWE-agent）
+# Session Runtime（SWE-agent）
+
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | `docs/swe-agent/01-swe-agent-overview.md`、`docs/swe-agent/02-swe-agent-cli-entry.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
 
 ## TL;DR（结论先行）
 
-SWE-agent 的 Session 管理采用"双轨数据结构 + Processor 链 + 频繁持久化"设计：Agent 同时维护 history（对话历史，用于模型输入）和 trajectory（执行轨迹，用于结构化持久化），通过可配置的 History Processor 链进行上下文压缩，每步执行后自动保存 checkpoint 到 `.traj` 文件。
+SWE-agent 的 Session Runtime 采用"双轨数据结构 + Processor 链 + 频繁持久化"设计：Agent 同时维护 history（对话历史，用于模型输入）和 trajectory（执行轨迹，用于结构化持久化），通过可配置的 History Processor 链进行上下文压缩，每步执行后自动保存 checkpoint 到 `.traj` 文件。
 
 SWE-agent 的核心取舍：**trajectory 为中心的有状态执行单元**（对比 Kimi CLI 的 Checkpoint 回滚、Codex 的无状态 Actor 模型）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 数据结构 | 双轨（history + trajectory） | `sweagent/agent/agents.py:481-483` |
+| 上下文压缩 | Processor 链（可配置） | `sweagent/agent/history_processors.py` |
+| 持久化策略 | 每步自动保存 | `sweagent/agent/agents.py:save_trajectory` |
+| 状态恢复 | Trajectory 重放 | `sweagent/run/run_replay.py` |
+| 批量隔离 | 独立进程 + 独立 output_dir | `sweagent/run/run_batch.py` |
 
 ---
 
@@ -184,7 +205,7 @@ TrajectoryStep {
 
 通过可配置的 Processor 链对 history 进行变换，实现上下文压缩和优化。
 
-#### Processor 列表
+#### 内部数据流
 
 ```text
 Raw History          Processors              Model Input
@@ -324,6 +345,32 @@ sequenceDiagram
 | Trajectory 更新 | StepOutput | 构建 TrajectoryStep | 更新后 trajectory | `sweagent/agent/agents.py:300` |
 | 持久化 | trajectory + history + info | JSON 序列化 | .traj 文件 | `sweagent/agent/agents.py:save_trajectory` |
 
+### 4.3 数据流向图
+
+```mermaid
+flowchart LR
+    subgraph Input["输入阶段"]
+        I1[problem_statement] --> I2[env初始化]
+        I2 --> I3[构建初始history]
+    end
+
+    subgraph Process["处理阶段"]
+        P1[应用Processors] --> P2[模型调用]
+        P2 --> P3[执行工具]
+        P3 --> P4[构建StepOutput]
+    end
+
+    subgraph Output["输出阶段"]
+        O1[更新history] --> O2[更新trajectory]
+        O2 --> O3[保存.traj文件]
+    end
+
+    I3 --> P1
+    P4 --> O1
+
+    style Process fill:#e1f5e1,stroke:#333
+```
+
 ---
 
 ## 5. 关键代码实现
@@ -359,8 +406,41 @@ class TrajectoryStep(TypedDict):
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```python
-# sweagent/agent/agents.py:561-580 (简化)
+# sweagent/agent/agents.py:561-580
+def setup(self, env: SWEEnv, problem_statement: ProblemStatement, output_dir: Path):
+    """Session 初始化：双轨数据结构 + 环境准备"""
+    self._problem_statement = problem_statement
+    self._env = env
+    self.traj_path = output_dir / (self._problem_statement.id + ".traj")
+
+    # 1. 重置状态集合
+    self.info = AgentInfo()
+    self.history = []
+    self._trajectory = []
+
+    # 2. 初始化环境
+    self.tools.install(self._env)
+
+    # 3. 构建初始 history
+    self.add_system_message_to_history()
+    self.add_demonstrations_to_history()
+    self.add_instance_template_to_history(state=self.tools.get_state(self._env))
+```
+
+**设计意图**：
+1. **双轨初始化**：同时初始化 history 和 trajectory
+2. **路径设置**：trajectory 文件路径基于 problem id
+3. **环境准备**：工具安装和初始状态获取
+4. **历史构建**：系统消息 + 演示 + 实例模板
+
+<details>
+<summary>查看完整实现（含异常处理）</summary>
+
+```python
+# sweagent/agent/agents.py:561-580
 def setup(self, env: SWEEnv, problem_statement: ProblemStatement, output_dir: Path):
     """Initialize a new session"""
     self._problem_statement = problem_statement
@@ -381,11 +461,7 @@ def setup(self, env: SWEEnv, problem_statement: ProblemStatement, output_dir: Pa
     self.add_instance_template_to_history(state=self.tools.get_state(self._env))
 ```
 
-**代码要点**：
-1. **双轨初始化**：同时初始化 history 和 trajectory
-2. **路径设置**：trajectory 文件路径基于 problem id
-3. **环境准备**：工具安装和初始状态获取
-4. **历史构建**：系统消息 + 演示 + 实例模板
+</details>
 
 ### 5.3 关键调用链
 
@@ -438,12 +514,37 @@ RunSingle.run()                    [sweagent/run/run_single.py]
 
 ### 6.3 与其他项目的对比
 
+```mermaid
+gitGraph
+    commit id: "传统方案"
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "双轨数据+Processor链"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "Checkpoint文件回滚"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "无状态Actor模型"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "分层内存管理"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "内存快照"
+```
+
 | 项目 | 核心差异 | 适用场景 |
 |-----|---------|---------|
 | SWE-agent | 双轨数据 + Processor 链 + 频繁持久化 | 学术研究、可复现实验 |
 | Kimi CLI | Checkpoint 文件回滚 | 对话回滚、状态恢复 |
 | Codex | 无状态 Actor 模型 | 高并发、无状态服务 |
 | Gemini CLI | 分层内存管理 | 长上下文任务 |
+| OpenCode | 内存快照 | 快速状态保存 |
 
 ---
 
@@ -509,4 +610,4 @@ class LastNObservations:
 ---
 
 *✅ Verified: 基于 sweagent/agent/agents.py、sweagent/agent/history_processors.py 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

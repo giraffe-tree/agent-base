@@ -1,10 +1,32 @@
-# MCP 集成（gemini-cli）
+# MCP Integration（gemini-cli）
+
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-35 分钟 |
+> | 前置文档 | `05-gemini-cli-tools-system.md`、`04-gemini-cli-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
 
 ## TL;DR（结论先行）
 
 一句话定义：Gemini CLI 的 MCP 集成是**多传输自动回退 + 动态发现 + Policy Engine 审批**的外部工具接入框架，支持 StreamableHTTP/SSE/Stdio/WebSocket 多种传输，运行时动态发现工具/Prompt/Resource，并通过 Policy Engine 实现细粒度的工具调用审批。
 
-Gemini CLI 的核心取舍：**完整 OAuth 2.0 + 服务器级信任模型**（对比 Codex 的命名空间隔离、Kimi CLI 的 ACP 桥接、OpenCode 的 AI SDK 原生集成）
+Gemini CLI 的核心取舍：**完整 OAuth 2.0 + 服务器级信任模型 + Wildcard Policy 匹配**（对比 Codex 的命名空间隔离、Kimi CLI 的 ACP 桥接、OpenCode 的 AI SDK 原生集成）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 传输协议 | StreamableHTTP/SSE/WebSocket/Stdio 自动回退 | `mcp-client.ts:180` |
+| 认证机制 | OAuth 2.0 + Google 服务账号 | `mcp/oauth-provider.ts:45` |
+| 工具命名 | `{server}__{tool}` 格式避免冲突 | `mcp-tool.ts:333` |
+| Policy 匹配 | Wildcard + Annotation 灵活规则 | `policy-engine.ts:27` |
+| 进度显示 | 进度条 + 节流 + 输入验证 | `scheduler.ts:135` |
+| 动态刷新 | ToolListChangedNotification 支持 | `mcp-client.ts:382` |
 
 ---
 
@@ -299,6 +321,8 @@ flowchart TD
 
 ### 3.3 组件间协作时序
 
+展示多个组件如何协作完成一个复杂操作。
+
 ```mermaid
 sequenceDiagram
     participant U as Agent Loop
@@ -586,6 +610,8 @@ flowchart TD
 
 ### 4.1 正常流程（详细版）
 
+展示数据如何从输入到输出的完整变换过程。
+
 ```mermaid
 sequenceDiagram
     participant Config as settings.json
@@ -786,6 +812,8 @@ type MCPOAuthConfig = {
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```typescript
 // packages/core/src/tools/mcp-client.ts:180-250
 async function createTransport(
@@ -836,12 +864,84 @@ async function createTransport(
 }
 ```
 
-**代码要点**：
-
+**设计意图**（非逐行解释, 说明关键设计）：
 1. **传输优先级**：StreamableHTTP → SSE → WebSocket → Stdio
 2. **自动回退**：一种传输失败自动尝试下一种，无需用户干预
 3. **OAuth 集成**：远程传输自动注入 McpOAuthProvider
 4. **环境清理**：Stdio 传输对环境变量进行安全清理
+
+<details>
+<summary>查看完整实现</summary>
+
+```typescript
+// packages/core/src/tools/mcp-client.ts:180-320
+async function createTransport(
+  mcpServerName: string,
+  mcpServerConfig: MCPServerConfig,
+  debugMode: boolean,
+  sanitizationConfig: EnvironmentSanitizationConfig,
+): Promise<Transport> {
+  // HTTP/SSE 传输（远程服务器）
+  if (mcpServerConfig.httpUrl || mcpServerConfig.url) {
+    const url = new URL(mcpServerConfig.httpUrl || mcpServerConfig.url!);
+    const authProvider = createAuthProvider(mcpServerConfig);
+    const headers = await authProvider?.getRequestHeaders?.() ?? {};
+
+    const transports = [
+      {
+        name: 'StreamableHTTP',
+        transport: new StreamableHTTPClientTransport(url, {
+          authProvider,
+          requestInit: { headers }
+        }),
+      },
+      {
+        name: 'SSE',
+        transport: new SSEClientTransport(url, {
+          authProvider,
+          requestInit: { headers }
+        }),
+      },
+      {
+        name: 'WebSocket',
+        transport: new WebSocketClientTransport(url, {
+          authProvider
+        }),
+      },
+    ];
+
+    for (const { name, transport } of transports) {
+      try {
+        return await tryConnect(transport);
+      } catch (error) {
+        if (debugMode) {
+          debugLogger.log(`${name} transport failed for ${mcpServerName}:`, error);
+        }
+      }
+    }
+
+    throw new Error(`All transport types failed for ${mcpServerName}`);
+  }
+
+  // Stdio 传输（本地服务器）
+  if (mcpServerConfig.command) {
+    const extensionEnv = getExtensionEnvironment(mcpServerConfig.extension);
+    const expansionEnv = { ...process.env, ...extensionEnv };
+    const sanitizedEnv = sanitizeEnvironment(expansionEnv, sanitizationConfig);
+
+    return new StdioClientTransport({
+      command: mcpServerConfig.command,
+      args: mcpServerConfig.args || [],
+      env: sanitizedEnv,
+      cwd: mcpServerConfig.cwd,
+    });
+  }
+
+  throw new Error(`Invalid MCP server configuration for ${mcpServerName}`);
+}
+```
+
+</details>
 
 ### 5.3 关键调用链
 
@@ -1040,6 +1140,17 @@ function createTransportRequestInit(
   - 连接时间可能增加（多次尝试）
   - 调试时难以确定实际使用的传输
 
+**OAuth 2.0 设计**：
+- 代码依据：`mcp/oauth-provider.ts:45` 的 McpOAuthProvider
+- 设计意图：支持企业级安全认证，包括动态客户端注册
+- 带来的好处：
+  - 符合 OAuth 2.0 标准
+  - 支持 Token 刷新
+  - 支持 Google 服务账号
+- 付出的代价：
+  - 首次授权流程复杂
+  - 需要浏览器交互
+
 ### 6.3 与其他项目的对比
 
 ```mermaid
@@ -1102,7 +1213,7 @@ flowchart TD
 
 | 项目 | 核心差异 | 适用场景 |
 |-----|---------|---------|
-| **Gemini CLI** | 完整 OAuth 2.0 + 服务器级信任模型 | 需要访问 Google Workspace 等企业服务 |
+| **Gemini CLI** | 完整 OAuth 2.0 + 服务器级信任模型 + Wildcard Policy | 需要访问 Google Workspace 等企业服务 |
 | **Codex** | 原生 Rust 实现 + 命名空间隔离 | 追求高性能和稳定性的企业场景 |
 | **Kimi CLI** | ACP 桥接 + fastmcp 执行 | 已使用 Moonshot ACP 生态的用户 |
 | **OpenCode** | AI SDK 原生集成 + 状态驱动 | 使用 Vercel AI SDK 的项目 |

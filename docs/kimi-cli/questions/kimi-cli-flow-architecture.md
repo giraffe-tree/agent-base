@@ -1,10 +1,31 @@
 # Kimi CLI Flow 架构设计详解
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-35 分钟 |
+> | 前置文档 | `docs/kimi-cli/04-kimi-cli-agent-loop.md`、`docs/kimi-cli/07-kimi-cli-memory-context.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
-一句话定义：Flow 架构是 Kimi CLI 基于可视化流程图（Mermaid/D2）的工作流编排系统，让 Agent 能够按预定义步骤自动执行并支持条件分支决策。
+**一句话定义**：Flow 架构是 Kimi CLI 基于可视化流程图（Mermaid/D2）的工作流编排系统，让 Agent 能够按预定义步骤自动执行并支持条件分支决策。
 
 Kimi CLI 的核心取舍：**声明式 Flow 编排**（对比 Codex/Gemini CLI/OpenCode 的 Plan/Execute 模式、SWE-agent 的 Thought-Action 模式）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 流程定义 | Mermaid/D2 语法，声明式流程图 | `kimi-cli/src/kimi_cli/skill/flow/mermaid.py:41` |
+| 节点类型 | BEGIN/END/TASK/DECISION 四种 | `kimi-cli/src/kimi_cli/skill/flow/__init__.py:9` |
+| 执行模式 | 遍历解释器模式，状态外化 | `kimi-cli/src/kimi_cli/soul/kimisoul.py:594` |
+| 分支决策 | 标签匹配（非意图理解） | `kimi-cli/src/kimi_cli/soul/kimisoul.py:698` |
+| 安全限制 | max_moves=1000 防止死循环 | `kimi-cli/src/kimi_cli/soul/kimisoul.py:66-67` |
 
 ---
 
@@ -36,7 +57,7 @@ Flow 方式：
 
 ---
 
-## 2. 整体架构（ASCII 图）
+## 2. 整体架构
 
 ### 2.1 在系统中的位置
 
@@ -788,42 +809,27 @@ KimiSoul._handle_slash_command()    [kimi-cli/src/kimi_cli/soul/kimisoul.py:457]
 ### 6.3 与其他项目的对比
 
 ```mermaid
-flowchart TB
-    subgraph Kimi["Kimi CLI - Flow 编排"]
-        K1[声明式: Mermaid/D2 流程图]
-        K2[预定义流程 + 分支决策]
-        K3[自动遍历执行]
-    end
-
-    subgraph Codex["Codex - Plan/Execute"]
-        C1[命令式: 模式枚举]
-        C2[Plan 阶段只读探索]
-        C3[Execute 阶段修改执行]
-    end
-
-    subgraph Gemini["Gemini CLI - 策略驱动"]
-        G1[TOML 策略配置]
-        G2[细粒度权限控制]
-        G3[用户确认触发]
-    end
-
-    subgraph OpenCode["OpenCode - Agent 分离"]
-        O1[多 Agent 类型]
-        O2[权限清晰分离]
-        O3[resetTimeoutOnProgress]
-    end
-
-    subgraph SWE["SWE-agent - Thought-Action"]
-        S1[反应式: 每步重新思考]
-        S2[forward_with_handling]
-        S3[Trajectory 累积]
-    end
-
-    K1 --> K2 --> K3
-    C1 --> C2 --> C3
-    G1 --> G2 --> G3
-    O1 --> O2 --> O3
-    S1 --> S2 --> S3
+gitGraph
+    commit id: "传统方案: 代码编排"
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "声明式 Flow 编排"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "Plan/Execute 模式"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "TOML 策略配置"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "Agent 分离模式"
+    checkout main
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "Thought-Action 模式"
 ```
 
 | 项目 | 核心差异 | 适用场景 |
@@ -839,12 +845,12 @@ flowchart TB
 | 特性 | Kimi CLI | Codex | Gemini CLI | OpenCode | SWE-agent |
 |-----|----------|-------|-----------|----------|-----------|
 | **工作流定义** | Mermaid/D2 图 | 模式枚举 | TOML 策略 | Agent 切换 | 模板引导 |
-| **分支支持** | 原生支持 | 不支持 | 不支持 | 不支持 | 不支持 |
-| **自动迭代** | Ralph 模式 | 不支持 | 不支持 | 超时重置 | 重试机制 |
-| **可视化** | 流程图 | 无 | 无 | 无 | 无 |
+| **分支支持** | ✅ 原生支持 | ❌ 不支持 | ❌ 不支持 | ❌ 不支持 | ❌ 不支持 |
+| **自动迭代** | ✅ Ralph 模式 | ❌ 不支持 | ❌ 不支持 | ✅ 超时重置 | ✅ 重试机制 |
+| **可视化** | ✅ 流程图 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 |
 | **用户干预点** | 每个决策节点 | 模式切换时 | 策略触发时 | Agent 切换时 | 每步执行前 |
 | **状态管理** | 节点遍历 | 配置切换 | Config + 文件 | Agent 切换 | Trajectory 累积 |
-| **多轮自动执行** | 是 | 否 | 否 | 否 | 是 |
+| **多轮自动执行** | ✅ 是 | ❌ 否 | ❌ 否 | ❌ 否 | ✅ 是 |
 
 ---
 
@@ -914,4 +920,4 @@ max_moves: int = DEFAULT_MAX_FLOW_MOVES
 ---
 
 *✅ Verified: 基于 kimi-cli/src/kimi_cli/soul/kimisoul.py:542-715、kimi-cli/src/kimi_cli/skill/flow/__init__.py 等源码分析*
-*基于版本：kimi-cli (commit: 2026-02-08 baseline) | 最后更新：2026-02-24*
+*基于版本：kimi-cli (commit: 2026-02-08 baseline) | 最后更新：2026-03-03*

@@ -1,10 +1,30 @@
 # 日志记录机制（Qwen Code）
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置文档 | `02-qwen-code-cli-entry.md`、`03-qwen-code-session-runtime.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Qwen Code 的日志记录机制采用**分层设计**，通过 `DebugLogger` 实现文件化调试日志，通过 `UITelemetryService` 实现运行时指标统计，通过 `ChatRecordingService` 实现会话持久化，形成覆盖调试、监控、审计的完整日志体系。
 
 Qwen Code 的核心取舍：**文件化调试日志 + 事件驱动遥测 + JSONL 会话持久化**（对比 Codex 的 SQLite 结构化存储、Kimi CLI 的 stderr 重定向、Gemini CLI 的双模式日志）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 调试日志 | 文件化 + AsyncLocalStorage 会话隔离 | `packages/core/src/utils/debugLogger.ts:150` |
+| 遥测统计 | EventEmitter 事件驱动，实时 Token/工具统计 | `packages/core/src/telemetry/uiTelemetry.ts:119` |
+| 会话持久化 | JSONL 格式 + 树形结构（uuid/parentUuid） | `packages/core/src/services/chatRecordingService.ts:173` |
+| 错误上报 | 上下文收集 + debug.log 记录 | `packages/core/src/utils/errorReporting.ts:25` |
 
 ---
 
@@ -708,7 +728,7 @@ function writeLog(
 }
 ```
 
-**代码要点**：
+**设计意图**：
 
 1. **会话检查**：所有级别方法首先检查 session 存在性，无 session 则静默返回
 2. **异步写入**：使用 `void` 忽略 Promise，避免阻塞调用方
@@ -770,7 +790,7 @@ private ensureConversationFile(): string {
 }
 ```
 
-**代码要点**：
+**设计意图**：
 
 1. **原子创建**：`wx` 标志确保创建操作的原子性，避免 TOCTOU 竞态
 2. **EEXIST 处理**：文件已存在是正常情况，其他错误才抛出
@@ -836,30 +856,23 @@ Turn 处理流程:
 ### 6.3 与其他项目的对比
 
 ```mermaid
-flowchart TD
-    subgraph Qwen["Qwen Code"]
-        Q1[DebugLogger<br/>文件化调试]
-        Q2[UITelemetry<br/>事件驱动]
-        Q3[ChatRecording<br/>JSONL持久化]
-    end
-
-    subgraph Gemini["Gemini CLI"]
-        G1[Winston<br/>生产级]
-        G2[DebugLogger<br/>开发友好]
-        G3[Debug Drawer<br/>UI集成]
-    end
-
-    subgraph Kimi["Kimi CLI"]
-        K1[loguru<br/>库友好]
-        K2[StderrRedirector<br/>子进程捕获]
-        K3[文件日志<br/>轮转保留]
-    end
-
-    subgraph Codex["Codex"]
-        C1[tracing<br/>企业级追踪]
-        C2[SQLite<br/>结构化存储]
-        C3[OpenTelemetry<br/>分布式追踪]
-    end
+gitGraph
+    commit id: "基础日志"
+    branch "Qwen Code"
+    checkout "Qwen Code"
+    commit id: "分层设计+JSONL"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "Winston+双模式"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "loguru+stderr重定向"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "tracing+SQLite+OTel"
 ```
 
 | 项目 | 日志框架 | 存储介质 | 核心特点 | 适用场景 |
@@ -968,4 +981,4 @@ flowchart TD
 ---
 
 *✅ Verified: 基于 qwen-code/packages/core/src/utils/debugLogger.ts、telemetry/uiTelemetry.ts、services/chatRecordingService.ts、utils/errorReporting.ts 源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

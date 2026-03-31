@@ -1,3 +1,14 @@
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `01-kimi-cli-overview.md`、`02-kimi-cli-cli-entry.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 # Prompt Organization（Kimi CLI）
 
 ## TL;DR（结论先行）
@@ -5,6 +16,16 @@
 一句话定义：Prompt Organization 是 AI Coding Agent 中负责管理系统提示词（System Prompt）的获取、组装和渲染的机制，确保 LLM 在不同场景下接收到恰当的指令和上下文。
 
 Kimi CLI 的核心取舍：**YAML 配置继承 + Jinja2 模板渲染 + 运行时内置变量注入**（对比 OpenCode 的 Provider-specific 多版本、SWE-agent 的 YAML 配置驱动、Gemini CLI 的代码片段组合）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 配置格式 | YAML + Pydantic 模型验证 | `src/kimi_cli/agentspec.py:31` |
+| 继承机制 | extend 字段递归继承 | `src/kimi_cli/agentspec.py:70` |
+| 模板引擎 | Jinja2 自定义分隔符 `${...}` | `src/kimi_cli/soul/agent.py:279` |
+| 运行时注入 | BuiltinSystemPromptArgs 结构体 | `src/kimi_cli/soul/agent.py:34` |
+| 变量安全 | StrictUndefined 严格模式 | `src/kimi_cli/soul/agent.py:284` |
 
 ---
 

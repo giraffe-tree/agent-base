@@ -1,10 +1,31 @@
 # Session Runtime（gemini-cli）
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置文档 | `01-gemini-cli-overview.md`、`02-gemini-cli-cli-entry.md` |
+> | 文档结构 | TL;DR → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：gemini-cli 的 Session Runtime 采用**"项目隔离的文件持久化单元"**模型，以 JSON 文件形式存储对话历史，支持基于时间戳的 session 选择和自动清理策略。
 
 gemini-cli 的核心取舍：**文件系统持久化 + 自动降级**（对比 Codex 的 SQLite 持久化、Kimi CLI 的 append-only 日志）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 存储格式 | JSON 文件（项目隔离） | `chatRecordingService.ts:151` |
+| 隔离策略 | projectHash 目录隔离 | `chatRecordingService.ts:534` |
+| 命名方式 | 时间戳+UUID | `chatRecordingService.ts:529` |
+| 容错策略 | ENOSPC 优雅降级 | `chatRecordingService.ts:201` |
+| 清理策略 | 基于时间+数量的自动清理 | `sessionCleanup.ts:43` |
 
 ---
 
@@ -78,7 +99,7 @@ gemini-cli 的做法：
 | `useSessionResume` | UI 层会话恢复 Hook | `packages/cli/src/ui/hooks/useSessionResume.ts:33` |
 | `GeminiClient.resumeChat` | 客户端对话恢复 | `packages/core/src/core/client.ts:286` |
 
-### 2.3 核心组件交互时序
+### 2.3 核心组件交互关系
 
 ```mermaid
 sequenceDiagram
@@ -748,4 +769,4 @@ function validateRetentionConfig(config, retentionConfig): string | null {
 ---
 
 *✅ Verified: 基于 gemini-cli/packages/core/src/services/chatRecordingService.ts 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

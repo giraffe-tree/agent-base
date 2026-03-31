@@ -1,10 +1,31 @@
 # SWE-agent Subagent/Task Implementation Analysis
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `docs/swe-agent/04-swe-agent-agent-loop.md`、`docs/swe-agent/06-swe-agent-mcp-integration.md` |
+> | 文档结构 | 结论 → 架构 → 组件分析 → 数据流 → 代码实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 **SWE-agent does NOT implement a subagent/Task system** for parallel or delegated task execution; instead, it uses a **RetryAgent** pattern that sequentially spawns multiple independent agent attempts (sub-agents) with different configurations, then selects the best solution using a reviewer/chooser mechanism.
 
-SWE-agent 的核心取舍：**串行多尝试 + 外部选择器**（对比其他项目如 OpenCode 的并发 subagent、Kimi CLI 的 D-Mail 子任务系统）
+SWE-agent 的核心取舍：**串行多尝试 + 外部选择器**（对比 OpenCode 的并发 subagent、Kimi CLI 的 D-Mail 子任务系统、Gemini CLI 的递归 continuation）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 执行模式 | 串行多尝试，非并行 | `sweagent/agent/agents.py:RetryAgent.run()` |
+| 子 Agent 创建 | 每次尝试新建 DefaultAgent 实例 | `sweagent/agent/agents.py:_setup_attempt()` |
+| 配置策略 | 配置轮换 `agent_configs[i % n]` | `sweagent/agent/agents.py:306` |
+| 评估机制 | Reviewer 评分 + Chooser 选择 | `sweagent/agent/reviewer.py:375` |
+| 停止条件 | 成本/次数/评分综合判断 | `sweagent/agent/reviewer.py:524` |
 
 ---
 
@@ -35,10 +56,11 @@ SWE-agent 的解决方案：
 | 配置选择困难 | 不同任务需要不同工具配置，单一配置难以通用 |
 | 成本失控 | 多次尝试可能导致 API 费用激增 |
 | 环境状态隔离 | 多次尝试之间需要独立环境，避免相互污染 |
+| 结果评估 | 如何判断哪个尝试的结果最好 |
 
 ---
 
-## 2. 整体架构（ASCII 图）
+## 2. 整体架构
 
 ### 2.1 在系统中的位置
 
@@ -171,32 +193,30 @@ stateDiagram-v2
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
+│  RetryAgent 内部数据流                                       │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
 │  输入层                                                      │
-│  ├── ProblemStatement ──► 问题描述                           │
-│  ├── AgentConfig[] ─────► 多种尝试配置                       │
-│  └── RetryLoopConfig ───► 重试策略（成本、次数限制）         │
-└──────────────────────────┬──────────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
+│   ├── ProblemStatement ──► 问题描述                          │
+│   ├── AgentConfig[] ─────► 多种尝试配置                      │
+│   └── RetryLoopConfig ───► 重试策略（成本、次数限制）        │
+│                                                              │
 │  尝试管理层                                                  │
-│  ├── _i_attempt: 当前尝试计数                                │
-│  ├── _attempt_data[]: 所有尝试的轨迹数据                     │
-│  ├── _total_instance_stats: 累计成本统计                     │
-│  └── _rloop: 重试循环控制器（Score/Chooser）                 │
-└──────────────────────────┬──────────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
+│   ├── _i_attempt: 当前尝试计数                               │
+│   ├── _attempt_data[]: 所有尝试的轨迹数据                    │
+│   ├── _total_instance_stats: 累计成本统计                    │
+│   └── _rloop: 重试循环控制器（Score/Chooser）                │
+│                                                              │
 │  子 Agent 层                                                 │
-│  ├── 每次尝试创建新的 DefaultAgent                           │
-│  ├── 独立的 ToolConfig 和 ModelConfig                        │
-│  └── 独立的输出目录 (attempt_{n})                            │
-└──────────────────────────┬──────────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
+│   ├── 每次尝试创建新的 DefaultAgent                          │
+│   ├── 独立的 ToolConfig 和 ModelConfig                       │
+│   └── 独立的输出目录 (attempt_{n})                           │
+│                                                              │
 │  结果选择层                                                  │
-│  ├── Reviewer: 评分机制                                      │
-│  ├── Chooser: LLM 选择                                       │
-│  └── get_best(): 返回最佳尝试索引                            │
+│   ├── Reviewer: 评分机制                                     │
+│   ├── Chooser: LLM 选择                                      │
+│   └── get_best(): 返回最佳尝试索引                           │
+│                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -374,6 +394,34 @@ flowchart LR
     style Selection fill:#f5e1f5,stroke:#333
 ```
 
+### 4.3 异常/边界流程
+
+```mermaid
+flowchart TD
+    A[开始尝试] --> B{环境重置成功?}
+    B -->|否| C[抛出异常]
+    B -->|是| D[执行 Agent Loop]
+    D --> E{执行成功?}
+    E -->|是| F[提交 Reviewer]
+    E -->|否| G[尝试自动提交]
+    F --> H{评分 >= 阈值?}
+    H -->|是| I[提前终止]
+    H -->|否| J{还有预算?}
+    G --> J
+    J -->|是| K[继续下一次尝试]
+    J -->|否| L[选择最佳]
+    I --> L
+    K --> A
+    L --> M[返回结果]
+    C --> N[终止]
+    M --> O[结束]
+    N --> O
+
+    style C fill:#FFB6C1
+    style I fill:#90EE90
+    style G fill:#FFD700
+```
+
 ---
 
 ## 5. 关键代码实现
@@ -409,6 +457,8 @@ class ReviewSubmission(BaseModel):
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```python
 # sweagent/agent/agents.py:397-441
 @retry_after_exception
@@ -443,12 +493,37 @@ async def run(self, problem_statement: ProblemStatement, env: SWEEnv, output_dir
     return StepOutput(...)
 ```
 
-**代码要点**：
+**设计意图**：
 
 1. **串行 while 循环**：使用 `while True` 串行执行尝试，非并行
 2. **显式状态管理**：通过 `_i_attempt` 跟踪尝试次数
 3. **Reviewer 集成**：每次尝试后提交给 Reviewer 评估
 4. **条件重试**：`retry()` 方法综合成本、次数、评分决定是否继续
+
+<details>
+<summary>查看完整实现</summary>
+
+```python
+# sweagent/agent/agents.py:304-321
+def _setup_attempt(self) -> None:
+    """Set up a new attempt with the next agent config."""
+    # 轮换使用配置
+    config = self.config.agent_configs[self._i_attempt % len(self.config.agent_configs)]
+    self._agent = get_agent_from_config(config)
+    self._agent.setup(
+        env=self._env,
+        problem_statement=self._problem_statement,
+        output_dir=self._output_dir / f"attempt_{self._i_attempt}",
+    )
+
+# sweagent/agent/agents.py:321-327
+def _next_attempt(self) -> None:
+    """Switch to the next attempt."""
+    self._i_attempt += 1
+    self._attempt_data.append(self._agent.get_trajectory_data())
+```
+
+</details>
 
 ### 5.3 关键调用链
 
@@ -481,6 +556,7 @@ RetryAgent.run()                          [sweagent/agent/agents.py:397]
 | 选择机制 | 外部 Reviewer/Chooser | 内部自我评估 | 评估更客观，但增加额外 LLM 调用成本 |
 | 环境隔离 | 环境重置 | 共享环境状态 | 尝试间无干扰，但重置有开销 |
 | 配置策略 | 配置轮换 | 动态配置调整 | 简单可预测，但不够灵活 |
+| 停止条件 | 成本/次数/评分综合 | 固定次数 | 更智能，但逻辑复杂 |
 
 ### 6.2 为什么这样设计？
 
@@ -516,14 +592,19 @@ gitGraph
     branch "Kimi CLI"
     checkout "Kimi CLI"
     commit id: "D-Mail 子任务"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "递归 continuation"
 ```
 
 | 项目 | 核心差异 | 适用场景 |
 |-----|---------|---------|
-| SWE-agent | 串行多尝试 + 外部选择器 | 批处理任务，资源受限，需要可复现性 |
-| OpenCode | 并发 Subagent，支持任务委派 | 复杂任务需要并行探索 |
-| Kimi CLI | D-Mail 子任务系统 | 需要子任务状态持久化和回滚 |
-| Gemini CLI | 递归 continuation | 深度任务分解 |
+| **SWE-agent** | 串行多尝试 + 外部选择器 | 批处理任务，资源受限，需要可复现性 |
+| **OpenCode** | 并发 Subagent，支持任务委派 | 复杂任务需要并行探索 |
+| **Kimi CLI** | D-Mail 子任务系统，支持状态持久化 | 需要子任务状态持久化和回滚 |
+| **Gemini CLI** | 递归 continuation，深度任务分解 | 复杂多步骤任务分解 |
+| **Codex** | 基于 Actor 的消息驱动子任务 | 企业级安全控制场景 |
 
 ---
 
@@ -580,13 +661,15 @@ if self._total_instance_stats.instance_cost > 1.1 * self.config.retry_loop.cost_
 
 - 前置知识：`docs/swe-agent/04-swe-agent-agent-loop.md`
 - 相关机制：`docs/swe-agent/06-swe-agent-mcp-integration.md`
+- 对比分析：`docs/opencode/questions/opencode-subagent-implementation.md`（OpenCode 的并行 Subagent）
+- 对比分析：`docs/kimi-cli/questions/kimi-cli-dmail-subtask.md`（Kimi CLI 的 D-Mail 子任务）
 - 竞争运行配置：`SWE-agent/docs/usage/competitive_runs.md`
 - 批处理模式：`SWE-agent/docs/usage/batch_mode.md`
 
 ---
 
 *✅ Verified: 基于 SWE-agent/sweagent/agent/agents.py:257-441, SWE-agent/sweagent/agent/reviewer.py:292-665 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-03-03*
 
 ---
 

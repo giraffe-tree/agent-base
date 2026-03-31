@@ -1,10 +1,31 @@
 # OpenCode 工具调用错误处理机制
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `docs/opencode/04-opencode-agent-loop.md`、`docs/opencode/06-opencode-mcp-integration.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：OpenCode 的工具错误处理机制是一套**多层级、Provider 感知的错误解析与恢复系统**，涵盖 API 错误、上下文溢出、权限拒绝、重复调用检测等多种场景。
 
 OpenCode 的核心取舍：**Provider-specific 错误解析 + Doom loop 检测 + resetTimeoutOnProgress**（对比 Codex 的 CancellationToken 取消机制、Kimi CLI 的 Checkpoint 回滚方案）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 错误解析 | Provider-specific 正则匹配 | `opencode/packages/opencode/src/provider/error.ts:14-27` |
+| 溢出检测 | OVERFLOW_PATTERNS 12+ 模式 | `opencode/packages/opencode/src/provider/error.ts:16-27` |
+| 重试策略 | Retry-After 三种格式 + 指数退避 | `opencode/packages/opencode/src/session/retry.ts:110-139` |
+| 循环检测 | Doom Loop（最近 3 次调用） | `opencode/packages/opencode/src/session/processor.ts:151-176` |
+| 权限控制 | 规则引擎 + 用户确认 | `opencode/packages/opencode/src/permission/next.ts:226-291` |
 
 ---
 
@@ -746,45 +767,36 @@ SessionProcessor.process()    [session/processor.ts:45]
 **核心问题**：如何在多 Provider 环境下统一处理错误，同时保持灵活性和用户体验？
 
 **OpenCode 的解决方案**：
-- 代码依据：`provider/error.ts:14-27`
-- 设计意图：通过正则模式覆盖主流 Provider 的溢出错误，避免硬编码 Provider 特定逻辑
-- 带来的好处：
+- **代码依据**：`provider/error.ts:14-27`
+- **设计意图**：通过正则模式覆盖主流 Provider 的溢出错误，避免硬编码 Provider 特定逻辑
+- **带来的好处**：
   - 新增 Provider 只需添加正则模式
   - 统一错误类型便于上层处理
   - 保留原始响应供调试
-- 付出的代价：
+- **付出的代价**：
   - 正则模式需要持续维护
   - 可能无法覆盖所有边缘情况
 
 ### 6.3 与其他项目的对比
 
 ```mermaid
-flowchart LR
-    subgraph OpenCode["OpenCode"]
-        O1[Provider 正则匹配]
-        O2[Doom Loop 检测]
-        O3[resetTimeoutOnProgress]
-    end
-
-    subgraph Codex["Codex"]
-        C1[CancellationToken]
-        C2[沙箱隔离]
-    end
-
-    subgraph Kimi["Kimi CLI"]
-        K1[Checkpoint 回滚]
-        K2[D-Mail 恢复]
-    end
-
-    subgraph Gemini["Gemini CLI"]
-        G1[Scheduler 状态机]
-        G2[分层内存]
-    end
-
-    style OpenCode fill:#e1f5e1
-    style Codex fill:#fff3e0
-    style Kimi fill:#e3f2fd
-    style Gemini fill:#f3e5f5
+gitGraph
+    commit id: "传统方案: 统一错误码"
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "Provider-specific 解析"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "CancellationToken 取消"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "Checkpoint 回滚"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "Scheduler 状态机"
 ```
 
 | 项目 | 核心差异 | 适用场景 |
@@ -794,6 +806,22 @@ flowchart LR
 | Kimi CLI | Checkpoint 文件回滚 + D-Mail 恢复 | 需要对话状态回滚的场景 |
 | Gemini CLI | Scheduler 状态机 + 递归 continuation | 复杂状态管理，UX 优先 |
 | SWE-agent | forward_with_handling() + autosubmit | 错误恢复，自动重试 |
+
+**详细对比**：
+
+| 特性 | OpenCode | Codex | Kimi CLI | Gemini CLI |
+|-----|----------|-------|----------|-----------|
+| 错误解析 | Provider 正则匹配 | 统一错误类型 | 简单错误判断 | 状态机处理 |
+| 重试机制 | Retry-After + 指数退避 | CancellationToken | Checkpoint 回滚 | Scheduler 重试 |
+| 循环检测 | Doom Loop (3次) | 无 | 无 | 无 |
+| 权限控制 | 规则引擎 | 沙箱隔离 | 配置文件 | 无显式控制 |
+| 超时处理 | resetTimeoutOnProgress | 固定超时 | 命令超时 | Scheduler 超时 |
+
+**对比分析**：
+
+- **vs Codex**：Codex 使用 Rust 的 CancellationToken 实现强制取消，OpenCode 使用 JavaScript 的异步超时，前者更可靠但平台受限
+- **vs Kimi CLI**：Kimi 的 Checkpoint 回滚是状态级恢复，OpenCode 的错误处理是调用级恢复，两者互补
+- **vs Gemini CLI**：Gemini 的 Scheduler 状态机集中管理错误，OpenCode 的组件分散处理，前者适合复杂状态，后者更灵活
 
 ---
 
@@ -867,4 +895,4 @@ return client.callTool(
 ---
 
 *✅ Verified: 基于 opencode/packages/opencode/src/provider/error.ts:33、session/processor.ts:151、session/retry.ts:110、permission/next.ts:226、mcp/index.ts:142 等源码分析*
-*基于版本：opencode (baseline 2026-02-08) | 最后更新：2026-02-24*
+*基于版本：opencode (baseline 2026-02-08) | 最后更新：2026-03-03*

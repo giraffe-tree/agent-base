@@ -1,3 +1,14 @@
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置文档 | `01-qwen-code-overview.md`、`04-qwen-code-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 # Prompt 组织（Qwen Code）
 
 ## TL;DR（结论先行）
@@ -5,6 +16,17 @@
 一句话定义：Prompt 组织是 Code Agent 的"指令系统"，负责将系统指令、工具描述和动态上下文组合成 LLM 可理解的完整提示。
 
 Qwen Code 的核心取舍：**分层动态组装 + 模型自适应工具示例**（对比 Gemini CLI 的静态模板、Kimi CLI 的简洁指令）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 系统指令 | 内置模板 + QWEN_SYSTEM_MD 环境变量覆盖 | `packages/core/src/core/prompts.ts:111` |
+| 模型适配 | 3 种工具调用格式自动选择（qwen-coder/qwen-vl/general） | `packages/core/src/core/prompts.ts:771` |
+| 动态提醒 | Plan 模式、子代理提醒运行时条件追加 | `packages/core/src/core/prompts.ts:829` |
+| 用户记忆 | 统一后缀追加（`---` 分隔符） | `packages/core/src/core/prompts.ts:644` |
+| 自定义指令 | 多格式输入支持（string/PartUnion/Content） | `packages/core/src/core/prompts.ts:77` |
+| 工具声明 | ToolRegistry 独立生成 FunctionDeclaration | `packages/core/src/tools/tool-registry.ts:419` |
 
 ---
 
@@ -95,20 +117,20 @@ sequenceDiagram
     end
     P->>P: 3. 追加 userMemory
     P->>P: 4. 注入 getToolCallExamples(model)
-    P-->>C: 返回完整 systemInstruction
+    P-->>C: 5. 返回完整 systemInstruction
 
-    C->>T: 5. getFunctionDeclarations()
-    T-->>C: 返回工具 schema 数组
+    C->>T: 6. getFunctionDeclarations()
+    T-->>C: 7. 返回工具 schema 数组
 
-    C->>C: 6. 构建 GeminiChat 配置
+    C->>C: 8. 构建 GeminiChat 配置
 
-    C->>P: 7. getSubagentSystemReminder(subagents)
-    P-->>C: 返回子代理提醒
+    C->>P: 9. getSubagentSystemReminder(subagents)
+    P-->>C: 10. 返回子代理提醒
 
-    C->>P: 8. getPlanModeSystemReminder(sdkMode)
-    P-->>C: 返回 Plan 模式提醒
+    C->>P: 11. getPlanModeSystemReminder(sdkMode)
+    P-->>C: 12. 返回 Plan 模式提醒
 
-    C->>C: 9. 合并所有 prompt 发送到 LLM
+    C->>C: 13. 合并所有 prompt 发送到 LLM
 ```
 
 **关键交互说明**：
@@ -116,10 +138,10 @@ sequenceDiagram
 | 步骤 | 交互内容 | 设计意图 |
 |-----|---------|---------|
 | 1 | 请求核心系统指令 | 统一入口，支持用户记忆注入 |
-| 2-4 | 环境变量检查与示例注入 | 支持自定义系统指令，模型自适应 |
-| 5-6 | 获取工具声明 | 职责分离，prompt 模块不直接依赖工具实现 |
-| 7-8 | 动态提醒追加 | 根据运行时状态动态调整行为 |
-| 9 | 合并发送 | 统一输出格式，确保 LLM 收到完整上下文 |
+| 2-5 | 环境变量检查与示例注入 | 支持自定义系统指令，模型自适应 |
+| 6-8 | 获取工具声明 | 职责分离，prompt 模块不直接依赖工具实现 |
+| 9-12 | 动态提醒追加 | 根据运行时状态动态调整行为 |
+| 13 | 合并发送 | 统一输出格式，确保 LLM 收到完整上下文 |
 
 ---
 

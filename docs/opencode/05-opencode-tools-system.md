@@ -1,10 +1,31 @@
 # Tool System（opencode）
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置文档 | `01-opencode-overview.md`、`04-opencode-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：OpenCode 的工具系统是「**Zod Schema 类型安全 + 动态注册扩展 + 权限驱动执行**」的架构。
 
 OpenCode 的核心取舍：**Zod Schema 运行时验证 + 工厂函数定义 + 细粒度权限控制**（对比 SWE-agent 的 YAML 配置、Kimi CLI 的函数装饰器）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 工具定义 | Zod Schema + 工厂函数封装 | `packages/opencode/src/tool/tool.ts:109` |
+| 动态注册 | 文件系统扫描 + 插件系统 | `packages/opencode/src/tool/registry.ts:223` |
+| 权限控制 | 细粒度 ctx.ask() 接口 | `packages/opencode/src/tool/tool.ts:101` |
+| 输出管理 | Truncate.output 自动截断 | `packages/opencode/src/tool/tool.ts:137` |
+| 模型适配 | 运行时过滤（GPT/usePatch） | `packages/opencode/src/tool/registry.ts:305` |
 
 ---
 
@@ -125,6 +146,43 @@ sequenceDiagram
 #### 职责定位
 
 `Tool.define` 是工具定义的入口，提供统一的工厂函数封装，内置参数验证和输出截断能力。
+
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Uninitialized: 系统启动
+    Uninitialized --> Initializing: Tool.define() 调用
+    Initializing --> Ready: init() 完成
+    Initializing --> Failed: 初始化失败
+    Ready --> Executing: execute() 调用
+    Executing --> Validating: 参数验证
+    Validating --> Executing: 验证通过
+    Validating --> Error: Zod 验证失败
+    Executing --> PermissionCheck: 需要权限
+    PermissionCheck --> Executing: 用户允许
+    PermissionCheck --> Blocked: 用户拒绝
+    Executing --> Completed: 执行成功
+    Executing --> Error: 执行失败
+    Completed --> [*]
+    Error --> [*]
+    Blocked --> [*]
+    Failed --> [*]
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Uninitialized | 未初始化 | 系统启动 | 调用 Tool.define() |
+| Initializing | 初始化中 | 开始执行 init 函数 | init 完成或失败 |
+| Ready | 就绪状态 | init 成功返回 | execute 被调用 |
+| Executing | 执行中 | execute 被调用 | 验证/权限/完成/错误 |
+| Validating | 参数验证 | 执行前自动验证 | 验证通过或失败 |
+| PermissionCheck | 权限检查 | 需要用户确认 | 用户允许或拒绝 |
+| Completed | 完成 | 执行成功 | 自动终止 |
+| Error | 错误 | 验证或执行失败 | 自动终止 |
+| Blocked | 被阻止 | 用户拒绝权限 | 自动终止 |
 
 #### 内部数据流
 
@@ -581,6 +639,10 @@ gitGraph
     branch "codex"
     checkout "codex"
     commit id: "Rust 强类型"
+    checkout main
+    branch "gemini-cli"
+    checkout "gemini-cli"
+    commit id: "声明式 + 策略"
 ```
 
 | 项目 | 核心差异 | 适用场景 |
@@ -589,6 +651,18 @@ gitGraph
 | SWE-agent | YAML 配置 + 代码生成 | 快速定义工具，无需编写代码 |
 | Kimi CLI | Python 函数装饰器 + 运行时反射 | Python 生态，简洁定义 |
 | Codex | Rust 强类型 + 编译时检查 | 最高性能和安全要求 |
+| Gemini CLI | 声明式工具 + 权限策略 | 需要细粒度权限控制的场景 |
+
+**详细对比**：
+
+| 特性 | OpenCode | SWE-agent | Kimi CLI | Codex | Gemini CLI |
+|-----|----------|-----------|----------|-------|------------|
+| 定义方式 | Zod Schema + 工厂函数 | YAML 配置 | Python 装饰器 | Rust 类型 | 声明式定义 |
+| 类型安全 | 运行时验证 | 配置解析 | 运行时反射 | 编译时检查 | 运行时验证 |
+| 动态扩展 | 文件扫描 + 插件 | 配置文件热加载 | 不支持 | 不支持 | MCP 集成 |
+| 权限控制 | 细粒度 ctx.ask() | 预定义级别 | 预定义级别 | 沙箱隔离 | 策略引擎 |
+| 输出截断 | 自动 Truncate | 手动控制 | 手动控制 | 自动截断 | 自动截断 |
+| 模型适配 | 运行时过滤 | 静态配置 | 静态配置 | 静态配置 | 运行时过滤 |
 
 ---
 

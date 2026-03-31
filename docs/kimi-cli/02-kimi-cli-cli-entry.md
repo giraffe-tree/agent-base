@@ -1,14 +1,31 @@
 # CLI Entry（kimi-cli）
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | `01-kimi-cli-overview.md` |
+> | 文档结构 | 速览 → 架构 → 组件 → 数据流 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Kimi CLI Entry 是 `kimi` 命令的总入口与分发层，采用「**Typer 框架 + 多模式架构**」设计，支持 shell/print/acp/wire 四种运行模式，集成会话管理和 MCP 服务器配置。
 
-核心取舍：
-- **CLI 框架**：使用 Typer 实现类型安全的参数解析（对比 Gemini CLI 的 yargs、Codex 的 clap）
-- **模式架构**：显式区分四种运行模式（shell/print/acp/wire），通过参数互斥检查避免冲突
-- **会话管理**：内置会话创建、恢复、清理生命周期管理
-- **配置分层**：命令行参数 > 配置文件 > 环境变量 > 默认值
+核心取舍：**Typer 类型安全参数解析 + 显式模式区分 + 运行时冲突检查**（对比 Gemini CLI 的 yargs 自动检测、Codex 的 clap 编译期检查）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| CLI 框架 | Typer 实现类型安全参数解析 | `kimi-cli/src/kimi_cli/cli/__init__.py:34` |
+| 模式区分 | 显式 --print/--acp/--wire 标志 | `kimi-cli/src/kimi_cli/cli/__init__.py:357` |
+| 参数验证 | 运行时显式冲突检查 | `kimi-cli/src/kimi_cli/cli/__init__.py:357` |
+| 会话管理 | Session 创建/查找/继续 | `kimi-cli/src/kimi_cli/cli/__init__.py:457` |
+| 子命令组织 | Typer add_typer() 模块化 | `kimi-cli/src/kimi_cli/cli/__init__.py:623` |
 
 ---
 

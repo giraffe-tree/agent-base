@@ -1,14 +1,35 @@
 # 工具调用错误处理（Qwen Code）
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置文档 | `docs/qwen-code/04-qwen-code-agent-loop.md`、`docs/qwen-code/05-qwen-code-tools-system.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Qwen Code 的工具调用错误处理机制是一个**分层、类型化的错误捕获与恢复系统**，通过 `ToolErrorType` 枚举定义 40+ 种错误类型，在工具调度器（`CoreToolScheduler`）中实现统一的错误封装和回传，确保所有错误都能被 LLM 理解并用于后续决策。
 
 Qwen Code 的核心取舍：**类型化错误 + 统一错误回传**（对比 Gemini CLI 的递归 continuation、Kimi CLI 的 Checkpoint 回滚、Codex 的 Actor 消息驱动）
 
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 错误类型 | 40+ 种细粒度枚举（ToolErrorType） | `packages/core/src/tools/tool-error.ts:10` |
+| 错误捕获 | 分层捕获（查找/验证/执行三层） | `packages/core/src/core/coreToolScheduler.ts:765` |
+| 错误回传 | functionResponse 格式回传 LLM | `packages/core/src/core/coreToolScheduler.ts:270` |
+| 状态管理 | 状态机驱动（validating/executing/error） | `packages/core/src/core/coreToolScheduler.ts:365` |
+| MCP 错误 | 统一映射到 ToolErrorType.MCP_TOOL_ERROR | `packages/core/src/tools/mcp-tool.ts:241` |
+
 ---
 
-## 1. 为什么需要这个机制？
+## 1. 为什么需要这个机制？（解决什么问题）
 
 ### 1.1 问题场景
 
@@ -516,6 +537,8 @@ export enum ToolErrorType {
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```typescript
 // packages/core/src/core/coreToolScheduler.ts:765-948
 private async executeTool(
@@ -576,11 +599,80 @@ private async executeTool(
 }
 ```
 
-**代码要点**：
+**设计意图**：
 
 1. **分层错误处理**：权限检查 → 参数验证 → 执行捕获，每层独立处理
 2. **统一错误封装**：使用 `createErrorResponse` 统一格式
 3. **异常兜底**：最外层 try-catch 确保任何异常都不会穿透
+
+<details>
+<summary>📋 查看完整实现</summary>
+
+```typescript
+// packages/core/src/core/coreToolScheduler.ts:765-1000
+private async executeTool(
+  toolCall: ValidatingToolCall | ScheduledToolCall,
+  signal: AbortSignal,
+): Promise<void> {
+  const { request, tool, invocation } = toolCall;
+
+  // 权限检查
+  if (!this.shouldExecuteTool(tool)) {
+    const errorResponse = createErrorResponse(
+      request,
+      new Error(`Tool execution denied: ${request.name}`),
+      ToolErrorType.EXECUTION_DENIED,
+    );
+    this.setStatusInternal(request.callId, 'error', errorResponse);
+    return;
+  }
+
+  // 参数验证和构建
+  let toolInvocation: ToolInvocation;
+  if (invocation) {
+    toolInvocation = invocation;
+  } else {
+    const invocationOrError = this.buildInvocation(tool, request.args);
+    if (invocationOrError instanceof Error) {
+      const response = createErrorResponse(
+        request,
+        invocationOrError,
+        ToolErrorType.INVALID_TOOL_PARAMS,
+      );
+      this.setStatusInternal(request.callId, 'error', response);
+      return;
+    }
+    toolInvocation = invocationOrError;
+  }
+
+  // 执行
+  try {
+    this.setStatusInternal(request.callId, 'executing');
+    const result = await toolInvocation.execute(signal);
+
+    if (result.error) {
+      const errorResponse = createErrorResponse(
+        request,
+        new Error(result.error.message),
+        result.error.type,
+      );
+      this.setStatusInternal(request.callId, 'error', errorResponse);
+    } else {
+      const response = this.createSuccessResponse(request, result);
+      this.setStatusInternal(request.callId, 'success', response);
+    }
+  } catch (error) {
+    const errorResponse = createErrorResponse(
+      request,
+      error instanceof Error ? error : new Error(String(error)),
+      ToolErrorType.UNHANDLED_EXCEPTION,
+    );
+    this.setStatusInternal(request.callId, 'error', errorResponse);
+  }
+}
+```
+
+</details>
 
 ### 5.3 错误响应创建
 
@@ -641,13 +733,13 @@ CoreToolScheduler.schedule()          [packages/core/src/core/coreToolScheduler.
 
 **Qwen Code 的解决方案**：
 
-- 代码依据：`packages/core/src/tools/tool-error.ts:10`
-- 设计意图：通过细粒度的错误类型枚举，让 LLM 能够区分"文件不存在"、"权限不足"、"参数错误"等不同场景
-- 带来的好处：
+- **代码依据**：`packages/core/src/tools/tool-error.ts:10`
+- **设计意图**：通过细粒度的错误类型枚举，让 LLM 能够区分"文件不存在"、"权限不足"、"参数错误"等不同场景
+- **带来的好处**：
   - LLM 可以给出针对性的修复建议（如权限不足时建议使用 sudo）
   - 便于统计和分析错误分布
   - 支持按错误类型进行特殊处理
-- 付出的代价：
+- **付出的代价**：
   - 需要维护大量错误类型
   - 新增工具时需要定义新的错误类型
   - 错误类型可能遗漏或重复
@@ -672,6 +764,10 @@ gitGraph
     branch "Codex"
     checkout "Codex"
     commit id: "Actor 消息驱动"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "resetTimeoutOnProgress"
 ```
 
 | 项目 | 核心差异 | 适用场景 |
@@ -680,6 +776,7 @@ gitGraph
 | **Gemini CLI** | 递归 continuation 模式，错误作为状态流转的一部分 | 复杂多步任务，需要状态回溯的场景 |
 | **Kimi CLI** | Checkpoint 机制，支持对话回滚 | 需要撤销操作、回到之前状态的场景 |
 | **Codex** | Actor 模型，错误作为消息传递 | 高并发、需要隔离失败的场景 |
+| **OpenCode** | resetTimeoutOnProgress 支持长任务 | 需要长时间运行的任务 |
 
 **对比分析**：
 
@@ -811,4 +908,4 @@ if (!fileExists) {
 ---
 
 *✅ Verified: 基于 qwen-code/packages/core/src/tools/tool-error.ts:10、qwen-code/packages/core/src/core/coreToolScheduler.ts:365 等源码分析*
-*基于版本：2025-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

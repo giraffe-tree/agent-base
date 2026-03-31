@@ -1,10 +1,31 @@
 # Kimi CLI：Checkpoint 不做文件回滚的权衡
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置文档 | `docs/kimi-cli/04-kimi-cli-agent-loop.md`、`docs/kimi-cli/questions/kimi-cli-checkpoint-implementation.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 **一句话定义**：Checkpoint 是 Kimi CLI 中用于回滚对话/推理状态的机制，而非外部世界状态的事务机制。
 
 Kimi CLI 的核心取舍：**仅回滚上下文状态（Context），不回滚文件系统副作用**（对比 Gemini CLI 的 Git 集成快照、OpenCode 的 Snapshot 补丁回滚）。
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 回滚范围 | 仅 Context（消息历史），不回滚文件系统 | `kimi-cli/src/kimi_cli/soul/context.py:80` |
+| 设计意图 | 明确区分"内生状态"与"外生状态" | `kimi-cli/src/kimi_cli/soul/denwarenji.py:9` |
+| 触发方式 | LLM 主动发送 D-Mail 触发回滚 | `kimi-cli/src/kimi_cli/soul/kimisoul.py:377` |
+| 文件备份 | 文件轮转（rotate）机制，非 Git 快照 | `kimi-cli/src/kimi_cli/soul/context.py:101` |
+| TODO 标记 | 明确标注未来可能支持文件恢复 | `kimi-cli/src/kimi_cli/soul/denwarenji.py:9` |
 
 ---
 
@@ -38,7 +59,7 @@ Agent：→ 读取文件 A
 
 ---
 
-## 2. 整体架构（ASCII 图）
+## 2. 整体架构
 
 ### 2.1 在系统中的位置
 
@@ -540,26 +561,23 @@ class DMail(BaseModel):
 ### 6.3 与其他项目的对比
 
 ```mermaid
-flowchart LR
-    subgraph Kimi["Kimi CLI"]
-        K1[Context 回滚] --> K2[文件: 不回滚]
-        K2 --> K3[D-Mail 触发]
-    end
-
-    subgraph Gemini["Gemini CLI"]
-        G1[Context 回滚] --> G2[文件: Git 快照]
-        G2 --> G3[Rewind 命令]
-    end
-
-    subgraph OpenCode["OpenCode"]
-        O1[Context 回滚] --> O2[文件: Patch 回滚]
-        O2 --> O3[Snapshot 系统]
-    end
-
-    subgraph Codex["Codex"]
-        C1[Context 回滚] --> C2[文件: 沙箱隔离]
-        C2 --> C3[Thread Rollback]
-    end
+gitGraph
+    commit id: "传统方案: 无状态回滚"
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "仅 Context 回滚"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "Git 快照 + 文件回滚"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "Snapshot + Patch 回滚"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "沙箱隔离 + 无回滚"
 ```
 
 | 项目 | 核心差异 | 适用场景 |
@@ -578,6 +596,7 @@ flowchart LR
 | 实现复杂度 | 低 | 中 | 中 | 高 |
 | 存储开销 | 低（仅 JSON） | 中（Git 对象） | 中（Patch 历史） | 高（沙箱快照） |
 | 用户干预 | 需理解限制 | 自动/手动 | 自动 | 自动 |
+| 回滚粒度 | Turn 内 | 工具调用级 | 事务级 | Session 级 |
 
 ---
 
@@ -634,7 +653,8 @@ if rotated_file_path is None:
 
 - 前置知识：`docs/kimi-cli/04-kimi-cli-agent-loop.md`
 - 相关机制：`docs/kimi-cli/07-kimi-cli-memory-context.md`
-- 深度分析：`docs/comm/comm-checkpoint-comparison.md`（跨项目对比）
+- 深度分析：`docs/kimi-cli/questions/kimi-cli-checkpoint-implementation.md` - Checkpoint 实现详解
+- 跨项目对比：`docs/comm/comm-checkpoint-comparison.md`（跨项目对比）
 - Gemini CLI 对比：`docs/gemini-cli/04-gemini-cli-agent-loop.md`
 - OpenCode 对比：`docs/opencode/04-opencode-agent-loop.md`
 
@@ -687,4 +707,4 @@ class FileToolLedger:
 
 *✅ Verified: 基于 kimi-cli/src/kimi_cli/soul/context.py:68, kimi-cli/src/kimi_cli/soul/denwarenji.py:6, kimi-cli/src/kimi_cli/soul/kimisoul.py:531 等源码分析*
 
-*基于版本：kimi-cli 2026-02-08 | 最后更新：2026-02-24*
+*基于版本：kimi-cli 2026-02-08 | 最后更新：2026-03-03*

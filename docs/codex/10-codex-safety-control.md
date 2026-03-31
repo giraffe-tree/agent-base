@@ -1,15 +1,36 @@
 # Safety Control（codex）
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-30 分钟 |
+> | 前置文档 | `04-codex-agent-loop.md`、`05-codex-tools-system.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Codex 的 Safety Control 是**策略配置 + 执行前门控 + 审批分支 + 失败分级**的分层安全框架，从配置注入到工具执行多点生效。
 
 Codex 的核心取舍：**中心化策略注入 + 显式审批门控**（对比 Gemini CLI 的静态分析、Kimi CLI 的自动确认超时）
 
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 审批策略 | AskForApproval 五级枚举 | `protocol/src/protocol.rs:177` |
+| 自动拒绝 | RejectConfig 细粒度控制 | `protocol/src/protocol.rs:185` |
+| 执行策略 | ExecPolicy 规则匹配 | `core/src/exec_policy.rs:113` |
+| 沙箱编排 | SandboxOrchestrator 权限控制 | `core/src/tools/sandboxing.rs:178` |
+| 错误分级 | Fatal/Respond/Hook 三级处理 | `core/src/tools/registry.rs:545` |
+
 **近期重要更新**：
-- **Shell 提权安全重构**：zsh-fork 从 zsh_exec_bridge 迁移至 shell-escalation，采用 FD-based 通信机制，比 Unix Domain Socket 更防篡改
-- **host_executable() 规则**：执行策略新增 basename-aware 匹配，允许规则如 `['git']` 匹配 `/usr/bin/git`
-- **网络审批持久化**：网络策略审批结果现在持久化存储在 execpolicy 中，跨会话保持一致
+- **Shell 提权安全重构**：zsh-fork 从 zsh_exec_bridge 迁移至 shell-escalation，采用 FD-based 通信机制
+- **host_executable() 规则**：执行策略新增 basename-aware 匹配
+- **网络审批持久化**：网络策略审批结果持久化存储在 execpolicy 中
 
 ---
 
@@ -75,13 +96,13 @@ MCP 调用 → 作用域验证 → 授权检查 → 受控执行 → 返回
 
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
-| `AskForApproval` | 审批策略枚举 | `protocol/src/protocol.rs` |
-| `RejectConfig` | 自动拒绝配置 | `protocol/src/protocol.rs` |
+| `AskForApproval` | 审批策略枚举 | `protocol/src/protocol.rs:177` |
+| `RejectConfig` | 自动拒绝配置 | `protocol/src/protocol.rs:185` |
 | `SafetyChecker` | 补丁安全评估 | `core/src/safety.rs:54` |
 | `ExecPolicy` | 执行策略检查 | `core/src/exec_policy.rs:113` |
 | `SandboxOrchestrator` | 沙箱权限编排 | `core/src/tools/sandboxing.rs:178` |
 | **EscalateServer** | **Shell 提权服务器（FD-based）** | `shell-escalation/src/unix/escalate_server.rs:103` |
-| **Policy** | **执行策略引擎（含 host_executable 匹配）** | `execpolicy/src/policy.rs:39` |
+| **Policy** | **执行策略引擎（含 host_executable 匹配）** | `execpolicy/src/policy.rs:307` |
 | **NetworkPolicyAmendment** | **网络策略审批持久化** | `execpolicy/src/amend.rs:86` |
 
 ### 2.3 核心组件交互关系
@@ -169,10 +190,22 @@ stateDiagram-v2
     Decline --> [*]
 ```
 
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Never | 完全自动模式 | 配置为 Never | 无需审批直接执行 |
+| OnFailure | 仅失败时询问 | 配置为 OnFailure | 执行失败时询问 |
+| OnRequest | 每次请求询问 | 配置为 OnRequest | 每次执行前询问 |
+| UnlessTrusted | 可信时自动 | 配置为 UnlessTrusted | 检查信任列表 |
+| Reject | 自动拒绝模式 | 配置为 Reject | 根据 RejectConfig 拒绝 |
+
 #### 关键算法逻辑
 
+**关键代码**（核心结构）：
+
 ```rust
-// protocol/src/protocol.rs
+// codex-rs/protocol/src/protocol.rs:177-190
 
 pub enum AskForApproval {
     Never,                    // 完全自动，不询问
@@ -189,19 +222,60 @@ pub struct RejectConfig {
 }
 ```
 
-**算法要点**：
-
+**设计意图**：
 1. **策略分层**：从完全自动到完全拒绝的五级策略
 2. **细粒度控制**：RejectConfig 针对三类场景独立配置
 3. **贯穿全链路**：同一策略在多个检查点生效
+
+<details>
+<summary>查看 RejectConfig 完整实现</summary>
+
+```rust
+// codex-rs/protocol/src/protocol.rs:185-210
+
+impl RejectConfig {
+    /// 是否拒绝沙箱审批请求
+    pub fn rejects_sandbox_approval(&self) -> bool {
+        self.sandbox_approval
+    }
+
+    /// 是否拒绝规则触发的审批
+    pub fn rejects_rules_approval(&self) -> bool {
+        self.rules
+    }
+
+    /// 是否拒绝 MCP 引导请求
+    pub fn rejects_mcp_elicitations(&self) -> bool {
+        self.mcp_elicitations
+    }
+
+    /// 检查是否完全拒绝（所有类型）
+    pub fn is_fully_rejective(&self) -> bool {
+        self.sandbox_approval && self.rules && self.mcp_elicitations
+    }
+}
+
+// 默认配置：只拒绝 MCP 引导
+impl Default for RejectConfig {
+    fn default() -> Self {
+        Self {
+            sandbox_approval: false,
+            rules: false,
+            mcp_elicitations: true,
+        }
+    }
+}
+```
+
+</details>
 
 #### 关键接口
 
 | 接口 | 输入 | 输出 | 说明 | 代码位置 |
 |-----|------|------|------|---------|
-| `rejects_sandbox_approval()` | - | bool | 是否拒绝沙箱审批 | `protocol.rs` |
-| `rejects_rules_approval()` | - | bool | 是否拒绝规则审批 | `protocol.rs` |
-| `rejects_mcp_elicitations()` | - | bool | 是否拒绝 MCP 引导 | `protocol.rs` |
+| `rejects_sandbox_approval()` | - | bool | 是否拒绝沙箱审批 | `protocol.rs:192` |
+| `rejects_rules_approval()` | - | bool | 是否拒绝规则审批 | `protocol.rs:197` |
+| `rejects_mcp_elicitations()` | - | bool | 是否拒绝 MCP 引导 | `protocol.rs:202` |
 
 ### 3.2 ExecPolicy 执行策略内部结构
 
@@ -211,8 +285,10 @@ ExecPolicy 负责根据配置和规则判断命令执行前的审批要求。
 
 #### 关键算法逻辑
 
+**关键代码**（核心逻辑）：
+
 ```rust
-// core/src/exec_policy.rs:113-123
+// codex-rs/core/src/exec_policy.rs:113-130
 
 AskForApproval::Reject(reject_config) => {
     if prompt_is_rule {
@@ -225,11 +301,58 @@ AskForApproval::Reject(reject_config) => {
 }
 ```
 
-**代码要点**：
-
+**设计意图**：
 1. **规则区分**：区分策略触发(rule)和沙箱升级(sandbox)两类审批
 2. **提前拦截**：在执行前返回拒绝原因，避免危险操作
 3. **统一理由**：标准化拒绝理由，便于日志和调试
+
+<details>
+<summary>查看完整策略检查逻辑</summary>
+
+```rust
+// codex-rs/core/src/exec_policy.rs:95-145
+
+pub fn check_approval_requirement(
+    &self,
+    command: &Command,
+    policy: &AskForApproval,
+    prompt_is_rule: bool,
+) -> Option<&'static str> {
+    match policy {
+        AskForApproval::Never => None,
+        AskForApproval::OnFailure => None,
+        AskForApproval::OnRequest => {
+            // 每次请求都需要审批
+            Some("Approval required by policy")
+        }
+        AskForApproval::UnlessTrusted => {
+            // 检查是否在信任列表
+            if self.is_trusted(command) {
+                None
+            } else {
+                Some("Command not in trusted list")
+            }
+        }
+        AskForApproval::Reject(reject_config) => {
+            if prompt_is_rule {
+                if reject_config.rejects_rules_approval() {
+                    Some(REJECT_RULES_APPROVAL_REASON)
+                } else {
+                    None
+                }
+            } else {
+                if reject_config.rejects_sandbox_approval() {
+                    Some(REJECT_SANDBOX_APPROVAL_REASON)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+```
+
+</details>
 
 ### 3.3 SandboxOrchestrator 内部结构
 
@@ -240,7 +363,7 @@ SandboxOrchestrator 负责沙箱权限的编排，确保工具在受控环境中
 #### 关键算法逻辑
 
 ```rust
-// core/src/tools/sandboxing.rs:178
+// codex-rs/core/src/tools/sandboxing.rs:178-195
 
 if needs_approval && matches!(
     policy,
@@ -272,7 +395,7 @@ if needs_approval && matches!(
 #### 关键代码
 
 ```rust
-// linux-sandbox/src/proxy_routing.rs:70-119
+// codex-rs/linux-sandbox/src/proxy_routing.rs:70-95
 
 pub(crate) fn prepare_host_proxy_route_spec() -> io::Result<String> {
     let env: HashMap<String, String> = std::env::vars().collect();
@@ -319,8 +442,10 @@ pub(crate) fn prepare_host_proxy_route_spec() -> io::Result<String> {
 
 #### 关键代码
 
+**关键代码**（FD-based 提权）：
+
 ```rust
-// shell-escalation/src/unix/escalate_server.rs:103-147
+// codex-rs/shell-escalation/src/unix/escalate_server.rs:103-130
 
 pub async fn exec(
     &self,
@@ -350,8 +475,16 @@ pub async fn exec(
 }
 ```
 
+**设计意图**：
+1. **内核级通道**：socketpair 创建的 FD 无法被外部拦截
+2. **FD 继承**：子进程通过环境变量获取 FD 编号
+3. **防篡改**：无网络路径，避免中间人攻击
+
+<details>
+<summary>查看 Unix 提权集成实现</summary>
+
 ```rust
-// core/src/tools/runtimes/shell/unix_escalation.rs:160-172
+// codex-rs/core/src/tools/runtimes/shell/unix_escalation.rs:160-185
 
 // CoreShellActionProvider 实现 EscalationPolicy trait
 let escalation_policy = CoreShellActionProvider {
@@ -374,6 +507,8 @@ let exec_result = escalate_server
     .await?;
 ```
 
+</details>
+
 ### 3.6 执行策略增强（host_executable）
 
 #### 职责定位
@@ -393,10 +528,13 @@ host_executable 匹配（basename 回退）：
 
 #### 关键代码
 
-```rust
-// execpolicy/src/policy.rs:307-334
+**关键代码**（basename-aware 匹配）：
 
-fn match_host_executable_rules(&self, cmd: &[String]) -> Vec<RuleMatch> {
+```rust
+// codex-rs/execpolicy/src/policy.rs:307-330
+
+fn match_host_executable_rules(&self, cmd: &[String]
+) -> Vec<RuleMatch> {
     let Some(first) = cmd.first() else {
         return Vec::new();
     };
@@ -428,6 +566,11 @@ fn match_host_executable_rules(&self, cmd: &[String]) -> Vec<RuleMatch> {
 }
 ```
 
+**设计意图**：
+1. **basename 匹配**：简化规则定义，无需完整路径
+2. **路径白名单**：确保匹配的命令来自可信路径
+3. **向后兼容**：传统精确匹配仍然有效
+
 #### 配置示例
 
 ```starlark
@@ -457,8 +600,10 @@ prefix_rule(
 
 #### 关键代码
 
+**关键代码**（网络规则追加）：
+
 ```rust
-// execpolicy/src/amend.rs:86-126
+// codex-rs/execpolicy/src/amend.rs:86-110
 
 /// 追加网络规则到策略文件（带文件锁）
 pub fn blocking_append_network_rule(
@@ -496,8 +641,16 @@ pub fn blocking_append_network_rule(
 }
 ```
 
+**设计意图**：
+1. **文件锁保护**：并发安全地追加规则
+2. **序列化字段**：确保规则格式正确
+3. **持久化存储**：跨会话保持一致
+
+<details>
+<summary>查看网络策略决策转换</summary>
+
 ```rust
-// core/src/network_policy_decision.rs:93-121
+// codex-rs/core/src/network_policy_decision.rs:93-125
 
 /// 将网络策略修订转换为 execpolicy 格式
 pub(crate) fn execpolicy_network_rule_amendment(
@@ -523,6 +676,8 @@ pub(crate) fn execpolicy_network_rule_amendment(
     }
 }
 ```
+
+</details>
 
 #### 持久化流程
 
@@ -681,8 +836,8 @@ sequenceDiagram
 |-----|------|------|------|---------|
 | 策略检查 | ToolInvocation | 匹配 ExecPolicy | ApprovalRequirement | `exec_policy.rs:113` |
 | 审批请求 | ApprovalRequirement | 用户交互 | ApprovalDecision | `sandboxing.rs:178` |
-| 沙箱编排 | ApprovalDecision | 权限配置 | SandboxConfig | `sandboxing.rs` |
-| 错误分级 | ToolOutput | 分类处理 | Error/Continue | `registry.rs` |
+| 沙箱编排 | ApprovalDecision | 权限配置 | SandboxConfig | `sandboxing.rs:200` |
+| 错误分级 | ToolOutput | 分类处理 | Error/Continue | `registry.rs:545` |
 
 ### 4.2 数据流向图
 
@@ -723,7 +878,7 @@ flowchart LR
 ### 5.1 核心数据结构
 
 ```rust
-// protocol/src/protocol.rs
+// codex-rs/protocol/src/protocol.rs:177-190
 
 pub enum AskForApproval {
     Never,
@@ -750,8 +905,10 @@ pub struct RejectConfig {
 
 ### 5.2 主链路代码
 
+**关键代码**（策略检查）：
+
 ```rust
-// core/src/exec_policy.rs:113-123
+// codex-rs/core/src/exec_policy.rs:113-125
 
 AskForApproval::Reject(reject_config) => {
     if prompt_is_rule {
@@ -763,14 +920,14 @@ AskForApproval::Reject(reject_config) => {
     }
 }
 
-// core/src/safety.rs:54-58
+// codex-rs/core/src/safety.rs:54-60
 let rejects_sandbox_approval = matches!(policy, AskForApproval::Never)
     || matches!(
         policy,
         AskForApproval::Reject(reject_config) if reject_config.sandbox_approval
     );
 
-// core/src/tools/sandboxing.rs:178
+// codex-rs/core/src/tools/sandboxing.rs:178-185
 if needs_approval && matches!(
     policy,
     AskForApproval::Reject(reject_config) if reject_config.rejects_sandbox_approval()
@@ -779,11 +936,51 @@ if needs_approval && matches!(
 }
 ```
 
-**代码要点**：
-
+**设计意图**：
 1. **统一枚举**：`AskForApproval::Reject` 贯穿所有审批检查点
 2. **细粒度控制**：三类拒绝场景独立配置
 3. **提前拦截**：在执行前返回拒绝，避免副作用
+
+<details>
+<summary>查看完整错误分级处理</summary>
+
+```rust
+// codex-rs/core/src/tools/registry.rs:540-570
+
+fn handle_tool_error(
+    &self,
+    error: ToolError,
+    hook_result: Option<HookResult>,
+) -> ToolResult {
+    match error {
+        ToolError::Fatal(msg) => {
+            // 严重错误，中止当前 Turn
+            ToolResult::Fatal(msg)
+        }
+        ToolError::RespondToModel(msg) => {
+            // 返回错误给模型，继续对话
+            ToolResult::Success(ToolOutput::text(msg))
+        }
+    }
+    .and_then(|result| {
+        // 应用 hook 结果
+        match hook_result {
+            Some(HookResult::FailedContinue) => {
+                // 记录警告，继续执行
+                warn!("Tool hook failed but continuing");
+                result
+            }
+            Some(HookResult::FailedAbort) => {
+                // 中止回合
+                ToolResult::Fatal("Hook aborted".to_string())
+            }
+            _ => result,
+        }
+    })
+}
+```
+
+</details>
 
 ### 5.3 关键调用链
 
@@ -820,7 +1017,7 @@ dispatch_tool_call()          [tools/router.rs:372]
 **核心问题**：如何在保证安全的前提下，不牺牲用户体验？
 
 **Codex 的解决方案**：
-- 代码依据：`protocol/src/protocol.rs` 的 `AskForApproval` 枚举设计
+- 代码依据：`protocol/src/protocol.rs:177` 的 `AskForApproval` 枚举设计
 - 设计意图：从完全自动到完全拒绝的五级策略，适应不同场景
 - 带来的好处：
   - 可信环境可完全自动化
@@ -834,10 +1031,11 @@ dispatch_tool_call()          [tools/router.rs:372]
 
 | 项目 | 核心差异 | 适用场景 |
 |-----|---------|---------|
-| Codex | 显式审批 + RejectConfig | 需要精细控制的企业环境 |
+| Codex | 显式审批 + RejectConfig + FD-based 提权 | 需要精细控制的企业环境 |
 | Gemini CLI | 静态分析 + 自动确认超时 | 快速迭代，低摩擦 |
 | Kimi CLI | 自动确认 + 超时回退 | 开发效率优先 |
 | OpenCode | 基于策略的自动审批 | 规则明确的场景 |
+| SWE-agent | 沙箱 + 自动执行 | 自动化任务场景 |
 
 ---
 
@@ -848,15 +1046,16 @@ dispatch_tool_call()          [tools/router.rs:372]
 | 终止原因 | 触发条件 | 代码位置 |
 |---------|---------|---------|
 | 策略拒绝 | RejectConfig 匹配 | `exec_policy.rs:113` |
-| 用户拒绝 | 审批对话框选择 Decline | `sandboxing.rs` |
-| Fatal 错误 | 严重执行错误 | `registry.rs` |
-| Hook 中止 | after_tool_use 返回 FailedAbort | `registry.rs:545` |
-| 沙箱配置错误 | 权限编排失败 | `sandboxing.rs` |
+| 用户拒绝 | 审批对话框选择 Decline | `sandboxing.rs:195` |
+| Fatal 错误 | 严重执行错误 | `registry.rs:545` |
+| Hook 中止 | after_tool_use 返回 FailedAbort | `registry.rs:565` |
+| 沙箱配置错误 | 权限编排失败 | `sandboxing.rs:210` |
 
 ### 7.2 超时/资源限制
 
 ```rust
 // MCP 工具调用超时
+codex-rs/protocol/src/protocol.rs
 pub tool_timeout_sec: Option<Duration>,
 
 // 服务器启动超时
@@ -869,9 +1068,9 @@ pub startup_timeout_sec: Option<Duration>,
 |---------|---------|---------|
 | `RespondToModel` | 返回错误给模型，继续对话 | `router.rs:411` |
 | `Fatal` | 中止当前 Turn | `router.rs:410` |
-| `FailedContinue` | 记录警告，继续执行 | `registry.rs` |
-| `FailedAbort` | 中止回合 | `registry.rs:545` |
-| 审批拒绝 | 构造拒绝响应返回模型 | `sandboxing.rs` |
+| `FailedContinue` | 记录警告，继续执行 | `registry.rs:555` |
+| `FailedAbort` | 中止回合 | `registry.rs:565` |
+| 审批拒绝 | 构造拒绝响应返回模型 | `sandboxing.rs:195` |
 
 ---
 
@@ -879,15 +1078,15 @@ pub startup_timeout_sec: Option<Duration>,
 
 | 功能 | 文件 | 行号 | 说明 |
 |-----|------|------|------|
-| 审批策略 | `protocol/src/protocol.rs` | - | AskForApproval 枚举 |
-| 拒绝配置 | `protocol/src/protocol.rs` | 245 | RejectConfig 结构 |
+| 审批策略 | `protocol/src/protocol.rs` | 177 | AskForApproval 枚举 |
+| 拒绝配置 | `protocol/src/protocol.rs` | 185 | RejectConfig 结构 |
 | 执行策略 | `core/src/exec_policy.rs` | 113 | 策略检查逻辑 |
 | 补丁安全 | `core/src/safety.rs` | 54 | 安全评估 |
 | 沙箱编排 | `core/src/tools/sandboxing.rs` | 178 | 权限编排 |
 | MCP 拒绝 | `core/src/mcp_connection_manager.rs` | 245 | MCP 引导检查 |
 | 代理沙箱 | `linux-sandbox/src/proxy_routing.rs` | 70 | Proxy-Only 实现 |
 | **Shell 提权** | `shell-escalation/src/unix/escalate_server.rs` | 103 | FD-based 提权服务器 |
-| **Unix 提权实现** | `core/src/tools/runtimes/shell/unix_escalation.rs` | 53 | zsh-fork 提权集成 |
+| **Unix 提权实现** | `core/src/tools/runtimes/shell/unix_escalation.rs` | 160 | zsh-fork 提权集成 |
 | **host_executable** | `execpolicy/src/policy.rs` | 307 | basename-aware 匹配 |
 | **策略解析** | `execpolicy/src/parser.rs` | 437 | host_executable() 解析 |
 | **网络规则追加** | `execpolicy/src/amend.rs` | 86 | 网络审批持久化 |
@@ -907,4 +1106,4 @@ pub startup_timeout_sec: Option<Duration>,
 *⚠️ Inferred: Shell Escalation 重构基于 commit 3ca0e7673b77303db6e0d686c1d9d34fc2ed63e0*
 *⚠️ Inferred: host_executable() 基于 commit b148d98e0eaed114b38c461e6cd9ef845bb491d1*
 *⚠️ Inferred: 网络审批持久化基于 commit c3048ff90a4c41160d3bfb0186fba969aacb2cef*
-*基于版本：2026-02-08 | 最后更新：2026-03-02*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

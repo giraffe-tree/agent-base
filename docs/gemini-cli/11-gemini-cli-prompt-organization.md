@@ -1,10 +1,31 @@
 # Prompt Organization（gemini-cli）
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置文档 | `01-gemini-cli-overview.md`、`04-gemini-cli-agent-loop.md` |
+> | 文档结构 | TL;DR → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：gemini-cli 采用**模块化 snippet 架构 + 环境变量覆盖**的 Prompt 组织方式，通过 `PromptProvider` 类动态组合多个代码片段，支持技能系统（Skills）和命令特定提示词，允许通过 `GEMINI_SYSTEM_MD` 环境变量进行完全覆盖。
 
 gemini-cli 的核心取舍：**函数式动态模板 + 分层组合**（对比 Kimi CLI 的 YAML 配置 + Jinja2 渲染、Codex 的编译时静态嵌入）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 核心机制 | 函数式 snippet + 分层组合 | `packages/core/src/prompts/snippets.ts` |
+| Prompt 组装 | PromptProvider 动态渲染 | `packages/core/src/prompts/prompt_provider.ts` |
+| 扩展机制 | Skills 系统 + 命令特定文件 | `.gemini/skills/`、`.gemini/commands/` |
+| 覆盖机制 | GEMINI_SYSTEM_MD 环境变量 | 环境变量 |
+| 分隔符 | `---` 分隔不同片段 | `prompt_provider.ts` |
 
 ---
 
@@ -45,13 +66,13 @@ gemini-cli 的核心取舍：**函数式动态模板 + 分层组合**（对比 K
 ```text
 ┌─────────────────────────────────────────────────────────────┐
 │ Agent Loop / Session Runtime                                 │
-│ gemini-cli/packages/core/src/                                │
+│ packages/core/src/                                           │
 └───────────────────────┬─────────────────────────────────────┘
                         │ 构建 Prompt
                         ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ ▓▓▓ Prompt Organization ▓▓▓                                 │
-│ gemini-cli/packages/core/src/prompts/                        │
+│ packages/core/src/prompts/                                   │
 │ - snippets.ts       : 核心代码片段定义                       │
 │ - prompt_provider.ts: PromptProvider 类实现                  │
 │ - skills/           : 技能系统目录                           │
@@ -555,6 +576,8 @@ type SnippetFunction = (context?: PromptContext) => string;
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```typescript
 // packages/core/src/prompts/snippets.ts（概念结构）
 
@@ -586,7 +609,7 @@ ${files.map(f => `- ${f}`).join('\n')}
 };
 ```
 
-**代码要点**：
+**设计意图**：
 
 1. **函数式定义**：snippets 是函数而非静态字符串，支持运行时变量
 2. **分层组织**：core/rules/tools/context 对应不同 Layer
@@ -605,7 +628,11 @@ Agent Loop::run()
     -> loadSkills()                    [skills/ 目录]
     -> loadCommandSnippet()            [commands/ 目录]
     -> assemblePrompt()                [组合各层]
-      - parts.join('\n\n---\n\n')
+      - parts.join('
+
+---
+
+')
 ```
 
 ---
@@ -626,14 +653,14 @@ Agent Loop::run()
 **核心问题**：如何在保持灵活性的同时，实现 Prompt 的可扩展和可定制？
 
 **gemini-cli 的解决方案**：
-- 代码依据：`snippets.ts` 的函数式定义
-- 设计意图：将 Prompt 拆分为可组合的模块，支持分层叠加
-- 带来的好处：
+- **代码依据**：`snippets.ts` 的函数式定义
+- **设计意图**：将 Prompt 拆分为可组合的模块，支持分层叠加
+- **带来的好处**：
   - 模块化组织，易于维护和扩展
   - 技能系统支持团队知识共享
   - 环境变量覆盖支持快速实验
   - 函数式渲染确保运行时信息准确
-- 付出的代价：
+- **付出的代价**：
   - 模板功能较简单，复杂逻辑需在代码中处理
   - 分层组装逻辑分散，追踪最终 Prompt 需理解各层
   - 技能文件需遵循约定目录结构
@@ -641,19 +668,28 @@ Agent Loop::run()
 ### 6.3 与其他项目的对比
 
 ```mermaid
-gitGraph
-    commit id: "传统方案"
-    branch "gemini-cli"
-    checkout "gemini-cli"
-    commit id: "函数式+分层"
-    checkout main
-    branch "kimi-cli"
-    checkout "kimi-cli"
-    commit id: "YAML+Jinja2"
-    checkout main
-    branch "codex"
-    checkout "codex"
-    commit id: "编译时嵌入"
+flowchart LR
+    subgraph Gemini["Gemini CLI"]
+        G1[函数式渲染]
+        G2[分层组合]
+        G3[Skills 系统]
+    end
+
+    subgraph Kimi["Kimi CLI"]
+        K1[Jinja2 模板]
+        K2[YAML 配置]
+        K3[AgentSpec 继承]
+    end
+
+    subgraph Codex["Codex"]
+        C1[编译时嵌入]
+        C2[静态字符串]
+        C3[模板分层]
+    end
+
+    G1 --> G2 --> G3
+    K1 --> K2 --> K3
+    C1 --> C2 --> C3
 ```
 
 | 项目 | Prompt 结构 | 动态组装 | 扩展机制 | 适用场景 |
@@ -997,6 +1033,4 @@ User command: explain main.py
 
 ---
 
-*✅ Verified: 基于 gemini-cli/packages/core/src/prompts/ 源码结构分析*
-*⚠️ Inferred: 部分代码细节基于项目结构和类似实现推断*
 *基于版本：2026-02-08 | 最后更新：2026-02-24*

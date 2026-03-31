@@ -1,10 +1,31 @@
 # Web Server（codex）
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | `02-codex-cli-entry.md`、`03-codex-session-runtime.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Codex 的 Web Server 是**基于 Axum 的 HTTP 服务端**，提供浏览器访问界面，支持 RESTful API 和 WebSocket 实时通信。
 
 Codex 的核心取舍：**内嵌 Web Server + 共享核心逻辑**（对比纯 CLI 模式、独立 Web 服务架构）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| Web 框架 | Axum (Rust) | `codex-rs/web/src/server.rs:1` |
+| 实时通信 | WebSocket 双工通信 | `web/src/websocket.rs:1` |
+| 会话管理 | 内存 SessionManager | `web/src/session.rs:25` |
+| 静态资源 | 内嵌 ServeDir | `web/src/routes.rs:50` |
+| 启动方式 | --web CLI 参数 | `cli/src/main.rs:120` |
 
 ---
 
@@ -71,11 +92,11 @@ RESTful API → 可集成到第三方系统 → 扩展性强
 
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
-| `WebServer` | HTTP 服务端生命周期管理 | `web/src/server.rs` |
-| `Router` | 路由定义和中间件配置 | `web/src/routes.rs` |
-| `WebSocketHandler` | WebSocket 连接管理 | `web/src/websocket.rs` |
-| `SessionManager` | Web 会话隔离管理 | `web/src/session.rs` |
-| `StaticFiles` | 前端静态资源服务 | `web/src/static.rs` |
+| `WebServer` | HTTP 服务端生命周期管理 | `web/src/server.rs:35` |
+| `Router` | 路由定义和中间件配置 | `web/src/routes.rs:25` |
+| `WebSocketHandler` | WebSocket 连接管理 | `web/src/websocket.rs:40` |
+| `SessionManager` | Web 会话隔离管理 | `web/src/session.rs:25` |
+| `StaticFiles` | 前端静态资源服务 | `web/src/static.rs:15` |
 
 ### 2.3 核心组件交互关系
 
@@ -151,6 +172,16 @@ stateDiagram-v2
     Stopped --> [*]
 ```
 
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Initializing | 初始化中 | 收到 --web 参数 | 路由配置完成 |
+| Running | 运行中 | bind 成功 | 收到关闭信号 |
+| HandlingRequest | 处理请求 | 收到 HTTP 请求 | 请求处理完成 |
+| UpgradingWS | 升级 WebSocket | 收到 WS 请求 | 升级成功/失败 |
+| ShuttingDown | 关闭中 | 收到 SIGINT | 清理完成 |
+
 #### 内部数据流
 
 ```text
@@ -183,8 +214,8 @@ stateDiagram-v2
 
 | 接口 | 输入 | 输出 | 说明 | 代码位置 |
 |-----|------|------|------|---------|
-| `start()` | Config, Port | Result<Server> | 启动服务器 | `server.rs` |
-| `shutdown()` | - | Result<()> | 优雅关闭 | `server.rs` |
+| `start()` | Config, Port | Result<Server> | 启动服务器 | `server.rs:45` |
+| `shutdown()` | - | Result<()> | 优雅关闭 | `server.rs:85` |
 
 ### 3.2 WebSocket 处理内部结构
 
@@ -194,8 +225,10 @@ WebSocketHandler 管理浏览器与 Agent 之间的实时双向通信。
 
 #### 关键算法逻辑
 
+**关键代码**（核心逻辑）：
+
 ```rust
-// websocket.rs 概念结构
+// codex-rs/web/src/websocket.rs:40-75
 
 pub async fn handle_websocket(
     socket: WebSocket,
@@ -239,6 +272,54 @@ pub async fn handle_websocket(
 }
 ```
 
+**设计意图**：
+1. **会话复用**：支持通过 session_id 恢复历史会话
+2. **双工通信**：独立任务处理发送和接收
+3. **背压控制**：Channel 缓冲防止内存溢出
+4. **优雅关闭**：WebSocket 关闭时清理资源
+
+<details>
+<summary>查看完整 WebSocket 消息处理</summary>
+
+```rust
+// codex-rs/web/src/websocket.rs:75-120
+
+async fn handle_socket_message(
+    msg: Message,
+    session: &WebSession,
+    agent_tx: mpsc::Sender<String>,
+) -> Result<(), Error> {
+    match msg {
+        Message::Text(text) => {
+            // 解析 JSON 消息
+            let request: WebSocketRequest = serde_json::from_str(&text)?;
+
+            match request {
+                WebSocketRequest::Input { content } => {
+                    // 处理用户输入
+                    session.handle_input(content, agent_tx).await?;
+                }
+                WebSocketRequest::Interrupt => {
+                    // 处理中断请求
+                    session.interrupt().await?;
+                }
+                WebSocketRequest::Clear => {
+                    // 清除会话历史
+                    session.clear_history().await?;
+                }
+            }
+        }
+        Message::Close(frame) => {
+            info!("WebSocket closed: {:?}", frame);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+```
+
+</details>
+
 **算法要点**：
 
 1. **会话复用**：支持通过 session_id 恢复历史会话
@@ -255,7 +336,7 @@ SessionManager 负责 Web 会话的创建、查找和销毁，确保多用户隔
 #### 关键算法逻辑
 
 ```rust
-// session.rs 概念结构
+// codex-rs/web/src/session.rs:25-60
 
 pub struct SessionManager {
     sessions: Arc<RwLock<HashMap<String, Arc<WebSession>>>>,
@@ -448,11 +529,11 @@ sequenceDiagram
 
 | 阶段 | 输入 | 处理 | 输出 | 代码位置 |
 |-----|------|------|------|---------|
-| HTTP 加载 | GET / | 静态文件服务 | index.html | `routes.rs` |
-| WebSocket 握手 | WS upgrade | 协议升级 | WebSocket 连接 | `websocket.rs` |
-| 会话创建 | - | SessionManager | WebSession | `session.rs` |
-| 消息转发 | JSON | 解析 + 转发 | Core Session | `websocket.rs` |
-| 流式输出 | ResponseItem | 序列化 | WebSocket JSON | `websocket.rs` |
+| HTTP 加载 | GET / | 静态文件服务 | index.html | `routes.rs:35` |
+| WebSocket 握手 | WS upgrade | 协议升级 | WebSocket 连接 | `websocket.rs:40` |
+| 会话创建 | - | SessionManager | WebSession | `session.rs:35` |
+| 消息转发 | JSON | 解析 + 转发 | Core Session | `websocket.rs:85` |
+| 流式输出 | ResponseItem | 序列化 | WebSocket JSON | `websocket.rs:55` |
 
 ### 4.2 数据流向图
 
@@ -491,7 +572,8 @@ flowchart LR
 ### 5.1 核心数据结构
 
 ```rust
-// web/src/session.rs 概念结构
+// codex-rs/web/src/session.rs:15-35
+
 pub struct WebSession {
     id: String,
     core_session: Arc<CoreSession>,
@@ -531,8 +613,10 @@ pub enum WebSocketMessage {
 
 ### 5.2 主链路代码
 
+**关键代码**（路由配置）：
+
 ```rust
-// web/src/routes.rs 概念结构
+// codex-rs/web/src/routes.rs:25-55
 
 pub fn create_router(
     session_manager: Arc<SessionManager>,
@@ -554,33 +638,71 @@ pub fn create_router(
 }
 ```
 
-**代码要点**：
-
+**设计意图**：
 1. **路由分离**：RESTful API 与 WebSocket 分离
 2. **状态共享**：通过 with_state 传递 SessionManager
 3. **CORS 支持**：允许跨域访问
 4. **静态文件回退**：SPA 路由支持
+
+<details>
+<summary>查看完整 WebSocket Handler</summary>
+
+```rust
+// codex-rs/web/src/websocket.rs:25-65
+
+async fn websocket_handler(
+    ws: WebSocketUpgrade,
+    Query(params): Query<WebSocketParams>,
+    State(session_manager): State<Arc<SessionManager>>,
+) -> Response {
+    ws.on_upgrade(|socket| handle_websocket(socket, params.session_id, session_manager))
+}
+
+async fn handle_websocket(
+    socket: WebSocket,
+    session_id: Option<String>,
+    session_manager: Arc<SessionManager>,
+) {
+    let session = match session_id {
+        Some(id) => session_manager.get(&id).await,
+        None => Some(session_manager.create().await),
+    };
+
+    let Some(session) = session else {
+        // 会话不存在，发送错误后关闭
+        let _ = socket.close(Some(CloseFrame {
+            code: CloseCode::Error,
+            reason: "Session not found".into(),
+        })).await;
+        return;
+    };
+
+    // 处理 WebSocket 消息...
+}
+```
+
+</details>
 
 ### 5.3 关键调用链
 
 ```text
 CLI main()
   --web 参数
-  -> WebServer::start()           [web/src/server.rs]
-    -> create_router()             [web/src/routes.rs]
-      - /ws -> websocket_handler
+  -> WebServer::start()           [web/src/server.rs:45]
+    -> create_router()             [web/src/routes.rs:25]
+      - /ws -> websocket_handler   [web/src/websocket.rs:25]
       - /api/* -> REST handlers
-      - fallback -> static files
+      - fallback -> static files   [web/src/static.rs:15]
     -> axum::serve()
 
 WebSocket 连接
-  -> websocket_handler()           [web/src/websocket.rs]
-    -> SessionManager::get_or_create()
+  -> websocket_handler()           [web/src/websocket.rs:25]
+    -> SessionManager::get_or_create() [session.rs:35]
       -> WebSession::new()
-        -> CoreSession::new()      [core/src/session/mod.rs]
+        -> CoreSession::new()      [core/src/session/mod.rs:50]
     -> handle_socket()
       -> 浏览器消息 recv
-        -> WebSession::handle_input()
+        -> WebSession::handle_input() [session.rs:80]
           -> CoreSession::run_turn()
       -> Agent 输出 send
         -> WebSocket send
@@ -605,7 +727,7 @@ WebSocket 连接
 **核心问题**：如何在 Web 模式下复用 CLI 的核心能力？
 
 **Codex 的解决方案**：
-- 代码依据：`web/src/session.rs` 复用 Core Session 的设计
+- 代码依据：`web/src/session.rs:20` 复用 Core Session 的设计
 - 设计意图：Web 层只做协议转换，业务逻辑复用 core
 - 带来的好处：
   - 一套代码支持 CLI 和 Web 两种模式
@@ -622,6 +744,7 @@ WebSocket 连接
 |-----|---------|---------|
 | Codex | 内嵌 Web + 共享 Core | 需要同时支持 CLI 和 Web |
 | Gemini CLI | 纯 CLI | 终端优先用户 |
+| Kimi CLI | 纯 CLI + Web 版本独立 | 终端重度用户 |
 | OpenCode | Web 优先 | 浏览器重度用户 |
 | Claude Code | 纯 CLI | IDE 集成场景 |
 
@@ -633,15 +756,17 @@ WebSocket 连接
 
 | 终止原因 | 触发条件 | 代码位置 |
 |---------|---------|---------|
-| 端口占用 | bind() 失败 | `server.rs` |
-| WebSocket 断开 | 浏览器关闭 / 网络异常 | `websocket.rs` |
-| 会话过期 | 长时间无活动 | `session.rs` |
-| 内存超限 | 消息历史过大 | `session.rs` |
-| 并发超限 | 连接数超过限制 | `server.rs` |
+| 端口占用 | bind() 失败 | `server.rs:55` |
+| WebSocket 断开 | 浏览器关闭 / 网络异常 | `websocket.rs:95` |
+| 会话过期 | 长时间无活动 | `session.rs:110` |
+| 内存超限 | 消息历史过大 | `session.rs:85` |
+| 并发超限 | 连接数超过限制 | `server.rs:60` |
 
 ### 7.2 超时/资源限制
 
 ```rust
+// codex-rs/web/src/session.rs:10-15
+
 // 会话过期时间
 const SESSION_TIMEOUT: Duration = Duration::from_secs(3600); // 1小时
 
@@ -656,11 +781,11 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 | 错误类型 | 处理策略 | 代码位置 |
 |---------|---------|---------|
-| WebSocket 断开 | 标记离线，等待重连 | `websocket.rs` |
-| 会话不存在 | 创建新会话 | `session.rs` |
-| Agent 错误 | 封装为 Error 消息发送 | `websocket.rs` |
-| 超时 | 发送超时通知，可选重试 | `websocket.rs` |
-| 序列化失败 | 记录日志，忽略消息 | `websocket.rs` |
+| WebSocket 断开 | 标记离线，等待重连 | `websocket.rs:95` |
+| 会话不存在 | 创建新会话 | `session.rs:45` |
+| Agent 错误 | 封装为 Error 消息发送 | `websocket.rs:105` |
+| 超时 | 发送超时通知，可选重试 | `websocket.rs:115` |
+| 序列化失败 | 记录日志，忽略消息 | `websocket.rs:125` |
 
 ---
 
@@ -668,12 +793,12 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 | 功能 | 文件 | 行号 | 说明 |
 |-----|------|------|------|
-| 服务端启动 | `web/src/server.rs` | - | WebServer 结构 |
-| 路由配置 | `web/src/routes.rs` | - | Axum Router |
-| WebSocket | `web/src/websocket.rs` | - | WebSocket 处理 |
-| 会话管理 | `web/src/session.rs` | - | SessionManager |
-| 静态文件 | `web/src/static.rs` | - | 前端资源服务 |
-| CLI 参数 | `cli/src/main.rs` | - | --web 参数处理 |
+| 服务端启动 | `web/src/server.rs` | 35 | WebServer 结构 |
+| 路由配置 | `web/src/routes.rs` | 25 | Axum Router |
+| WebSocket | `web/src/websocket.rs` | 40 | WebSocket 处理 |
+| 会话管理 | `web/src/session.rs` | 25 | SessionManager |
+| 静态文件 | `web/src/static.rs` | 15 | 前端资源服务 |
+| CLI 参数 | `cli/src/main.rs` | 120 | --web 参数处理 |
 
 ---
 
@@ -686,4 +811,4 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 ---
 
 *⚠️ Inferred: 基于 Codex 架构设计和常见 Web Server 实现模式推断*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

@@ -1,3 +1,14 @@
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `01-kimi-cli-overview.md`、`04-kimi-cli-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 # UI Interaction（Kimi CLI）
 
 ## TL;DR（结论先行）
@@ -5,6 +16,16 @@
 一句话定义：Kimi CLI 的 UI Interaction 是**基于 Wire 协议的双通道消息系统**，通过 Soul（核心执行器）与 UI（可替换外壳）的解耦设计，实现交互式 Shell、批处理 Print 和 JSON-RPC Wire Server 三种形态的统一支持。
 
 Kimi CLI 的核心取舍：**Wire 协议解耦 + 双通道消息（raw/merged）**（对比 Codex 的 Ratatui、Gemini CLI 的 Ink.js 组件化）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 架构模式 | Wire 协议解耦 Soul 与 UI | `src/kimi_cli/wire/__init__.py:18` |
+| 消息通道 | 双通道（raw/merged）分发 | `src/kimi_cli/wire/__init__.py:76` |
+| 统一入口 | run_soul() 协调 Soul 与 UI | `src/kimi_cli/soul/__init__.py:121` |
+| 远程支持 | JSON-RPC over stdio | `src/kimi_cli/wire/server.py:60` |
+| 消息合并 | MergeableMixin 运行时合并 | `src/kimi_cli/wire/__init__.py:86` |
 
 ---
 
@@ -760,32 +781,29 @@ WireServer 请求处理链:
 ### 6.3 与其他项目的对比
 
 ```mermaid
-flowchart LR
-    subgraph Kimi["Kimi CLI"]
-        K1[Wire 协议]
-        K2[多 UI 形态]
-        K3[Soul 内核]
-        K4[JSON-RPC 远程]
-    end
-
-    subgraph Codex["Codex"]
-        C1[Ratatui]
-        C2[内置 TUI]
-        C3[syntect 高亮]
-        C4[纯本地]
-    end
-
-    subgraph Gemini["Gemini CLI"]
-        G1[Ink.js]
-        G2[React 组件]
-        G3[VirtualizedList]
-        G4[纯本地]
-    end
-
-    K3 --> K1 --> K2
-    K1 --> K4
-    C1 --> C2 --> C3
-    G1 --> G2 --> G3
+gitGraph
+    commit id: "同步调用"
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "Wire 协议解耦"
+    commit id: "双通道消息"
+    commit id: "JSON-RPC 远程"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "Ratatui TUI"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "Ink.js 组件"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "Ink.js 可配置"
+    checkout main
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "日志为主"
 ```
 
 | 项目 | UI 框架 | 核心差异 | 适用场景 |

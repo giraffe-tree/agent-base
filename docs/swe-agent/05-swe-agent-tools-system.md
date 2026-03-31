@@ -1,10 +1,31 @@
 # Tool System（SWE-agent）
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `01-swe-agent-overview.md`、`04-swe-agent-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 SWE-agent 的工具系统采用"Bundle 配置驱动 + Command 抽象 + 多解析器适配"架构：工具按 Bundle 组织并通过 YAML 配置定义，Command 抽象统一描述命令签名和参数，多种 ParseFunction 适配不同模型的输出格式（Function Calling、Thought-Action、JSON 等）。
 
-SWE-agent 的核心取舍：**YAML 配置 + 多解析器策略模式**（对比 Codex 的 Rust trait 系统、Kimi CLI 的 Python 装饰器注册）
+SWE-agent 的核心取舍：**YAML 配置 + 多解析器策略模式**（对比 Codex 的 Rust trait 系统、Kimi CLI 的 Python 装饰器注册、Gemini CLI 的 TypeScript 类型系统）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 工具定义 | YAML 配置驱动，Bundle 模块化组织 | `sweagent/tools/tools.py:75` |
+| 命令抽象 | Command 类统一描述签名和参数 | `sweagent/tools/commands.py:100` |
+| 解析策略 | 策略模式支持 7 种解析器 | `sweagent/tools/parsing.py:1` |
+| 安全过滤 | 三层 blocklist 机制 | `sweagent/tools/tools.py:370` |
+| 执行方式 | 本地函数调用 + Docker 隔离 | `sweagent/tools/tools.py:312` |
 
 ---
 
@@ -43,7 +64,7 @@ Code Agent 需要执行各种操作来修改代码、运行测试、搜索文件
 ```text
 ┌─────────────────────────────────────────────────────────────┐
 │ Agent Loop                                                  │
-│ sweagent/agent/agents.py                                    │
+│ sweagent/agent/agents.py:800                                │
 └───────────────────────┬─────────────────────────────────────┘
                         │ 调用
                         ▼
@@ -65,6 +86,7 @@ Code Agent 需要执行各种操作来修改代码、运行测试、搜索文件
 ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
 │ Bundle       │ │ ParseFunction│ │ Environment  │
 │ 工具包       │ │ 输出解析器   │ │ 执行环境     │
+│ config.yaml  │ │ 7种策略      │ │ SWEEnv       │
 └──────────────┘ └──────────────┘ └──────────────┘
 ```
 
@@ -72,11 +94,11 @@ Code Agent 需要执行各种操作来修改代码、运行测试、搜索文件
 
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
-| `ToolHandler` | 工具生命周期管理 | `sweagent/tools/tools.py:200+` |
-| `Bundle` | 工具包组织 | `sweagent/tools/tools.py` |
-| `Command` | 命令抽象定义 | `sweagent/tools/commands.py` |
-| `ParseFunction` | 模型输出解析 | `sweagent/tools/parsing.py` |
-| `ToolFilterConfig` | 安全过滤配置 | `sweagent/tools/tools.py` |
+| `ToolHandler` | 工具生命周期管理 | `sweagent/tools/tools.py:200` |
+| `Bundle` | 工具包组织 | `sweagent/tools/tools.py:150` |
+| `Command` | 命令抽象定义 | `sweagent/tools/commands.py:100` |
+| `ParseFunction` | 模型输出解析 | `sweagent/tools/parsing.py:50` |
+| `ToolFilterConfig` | 安全过滤配置 | `sweagent/tools/tools.py:370` |
 
 ### 2.3 核心组件交互关系
 
@@ -127,6 +149,33 @@ sequenceDiagram
 #### 职责定位
 
 Bundle 是工具的模块化组织单位，通过 YAML 配置定义工具集，便于复用和版本控制。
+
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unloaded: 初始化
+    Unloaded --> Loading: install() 调用
+    Loading --> Installed: 脚本执行成功
+    Loading --> Failed: 安装失败
+    Installed --> Ready: 命令注册完成
+    Failed --> Loading: 重试安装
+    Ready --> Executing: execute() 调用
+    Executing --> Ready: 执行完成
+    Executing --> Error: 执行异常
+    Error --> Ready: 错误处理
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Unloaded | 未加载 | 初始化 | 调用 install() |
+| Loading | 安装中 | 开始安装 | 安装完成/失败 |
+| Installed | 已安装 | 脚本执行成功 | 开始注册命令 |
+| Ready | 就绪 | 命令注册完成 | 执行调用 |
+| Executing | 执行中 | 收到执行请求 | 执行完成 |
+| Failed | 失败 | 安装失败 | 重试或终止 |
 
 #### 目录结构
 
@@ -210,7 +259,7 @@ Command 是对工具的抽象定义，统一描述命令的签名、参数和文
 #### 核心实现
 
 ```python
-# sweagent/tools/commands.py
+# sweagent/tools/commands.py:100-140
 class Command(BaseModel):
     name: str                          # 命令名称
     docstring: str | None             # 功能描述
@@ -262,7 +311,7 @@ ParseFunction 负责将模型输出解析为可执行的动作，支持多种格
 #### 解析器接口
 
 ```python
-# sweagent/tools/parsing.py
+# sweagent/tools/parsing.py:50-80
 class AbstractParseFunction(ABC):
     error_message: str
 
@@ -277,7 +326,7 @@ class AbstractParseFunction(ABC):
 #### ThoughtActionParser 实现
 
 ```python
-# sweagent/tools/parsing.py
+# sweagent/tools/parsing.py:200-230
 class ThoughtActionParser(AbstractParseFunction, BaseModel):
     type: Literal["thought_action"] = "thought_action"
 
@@ -366,7 +415,7 @@ ToolFilterConfig 提供三层安全过滤机制，防止危险命令执行。
 #### 配置示例
 
 ```python
-# sweagent/tools/tools.py
+# sweagent/tools/tools.py:370-390
 class ToolFilterConfig(BaseModel):
     blocklist: list[str] = [      # 前缀匹配阻止
         "vim", "vi", "emacs", "nano",  # 交互式编辑器
@@ -427,12 +476,41 @@ sequenceDiagram
 
 | 阶段 | 输入 | 处理 | 输出 | 代码位置 |
 |-----|------|------|------|---------|
-| 模型输出 | model_response | ParseFunction | (thought, action) | `sweagent/tools/parsing.py` |
+| 模型输出 | model_response | ParseFunction | (thought, action) | `sweagent/tools/parsing.py:200` |
 | 安全检查 | action | ToolFilterConfig | allowed/blocked | `sweagent/tools/tools.py:475` |
 | 多行处理 | action | guard_multiline_input | 格式化后 action | `sweagent/tools/tools.py:501` |
-| 命令查找 | action | Command 匹配 | Command 实例 | `sweagent/tools/tools.py` |
+| 命令查找 | action | Command 匹配 | Command 实例 | `sweagent/tools/tools.py:312` |
 | 参数格式化 | Command + args | invoke_format | 执行字符串 | `sweagent/tools/commands.py:167` |
-| 环境执行 | 执行字符串 | SWEEnv.communicate | observation | `sweagent/environment/swe_env.py` |
+| 环境执行 | 执行字符串 | SWEEnv.communicate | observation | `sweagent/environment/swe_env.py:150` |
+
+### 4.3 异常流程（错误恢复）
+
+```mermaid
+flowchart TD
+    E[发生错误] --> E1{错误类型}
+    E1 -->|FormatError| R1[重采样 requery]
+    E1 -->|BlockedActionError| R2[返回错误提示]
+    E1 -->|CommandNotFoundError| R3[返回可用命令列表]
+    E1 -->|TimeoutError| R4[标记超时并继续]
+
+    R1 --> R1A[Agent.forward_with_handling]
+    R1A -->|成功| R1B[继续主路径]
+    R1A -->|失败| R2
+
+    R2 --> R2A[返回 blocked 信息]
+    R3 --> R3A[返回 command 列表]
+    R4 --> R4A[记录超时日志]
+
+    R1B --> End[结束]
+    R2A --> End
+    R3A --> End
+    R4A --> End
+
+    style R1 fill:#90EE90
+    style R2 fill:#FFD700
+    style R3 fill:#87CEEB
+    style R4 fill:#FFA500
+```
 
 ---
 
@@ -441,7 +519,7 @@ sequenceDiagram
 ### 5.1 核心数据结构
 
 ```python
-# sweagent/tools/commands.py
+# sweagent/tools/commands.py:50-90
 class Command(BaseModel):
     name: str                          # 命令名称
     docstring: str | None             # 功能描述
@@ -457,7 +535,7 @@ class Argument(BaseModel):
     enum: list[str] | None      # 枚举值
     argument_format: str = "{{value}}"  # Jinja2 格式模板
 
-# sweagent/tools/tools.py
+# sweagent/tools/tools.py:75-95
 class ToolConfig(BaseModel):
     bundles: list[Bundle] = Field(default_factory=list)
     enable_bash_tool: bool = True
@@ -468,10 +546,56 @@ class ToolConfig(BaseModel):
     execution_timeout: int = 30
 ```
 
+**字段说明**：
+
+| 字段 | 类型 | 用途 |
+|-----|------|------|
+| `name` | `str` | 命令唯一标识 |
+| `signature` | `str | None` | 调用签名模板 |
+| `arguments` | `list[Argument]` | 参数定义列表 |
+| `parse_function` | `ParseFunction` | 模型输出解析策略 |
+| `filter` | `ToolFilterConfig` | 安全过滤配置 |
+
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```python
-# sweagent/tools/tools.py:200+ (简化)
+# sweagent/tools/tools.py:475-505
+class ToolHandler:
+    def should_block_action(self, action: str) -> bool:
+        """检查命令是否应该被阻止 - 三层过滤机制"""
+        action = action.strip()
+        if not action:
+            return False
+
+        # 1. 前缀匹配阻止
+        if any(action.startswith(f) for f in self.config.filter.blocklist):
+            return True
+
+        # 2. 完全匹配阻止
+        if action in self.config.filter.blocklist_standalone:
+            return True
+
+        # 3. 条件阻止 - 正则匹配才允许
+        name = action.split()[0]
+        if name in self.config.filter.block_unless_regex:
+            if not re.search(self.config.filter.block_unless_regex[name], action):
+                return True
+
+        return False
+```
+
+**设计意图**：
+1. **三层过滤**：前缀匹配、完全匹配、条件匹配，层层递进
+2. **性能优先**：前缀匹配 O(1)，避免不必要的正则计算
+3. **灵活配置**：通过 YAML 配置调整安全策略
+
+<details>
+<summary>📋 查看完整实现</summary>
+
+```python
+# sweagent/tools/tools.py:200-260
 class ToolHandler:
     def __init__(self, config: ToolConfig):
         self.config = config.model_copy(deep=True)
@@ -488,15 +612,15 @@ class ToolHandler:
         if not action:
             return False
 
-        # 1. 前缀匹配阻止
+        # 前缀匹配阻止
         if any(action.startswith(f) for f in self.config.filter.blocklist):
             return True
 
-        # 2. 完全匹配阻止
+        # 完全匹配阻止
         if action in self.config.filter.blocklist_standalone:
             return True
 
-        # 3. 条件阻止
+        # 条件阻止
         name = action.split()[0]
         if name in self.config.filter.block_unless_regex:
             if not re.search(self.config.filter.block_unless_regex[name], action):
@@ -510,25 +634,21 @@ class ToolHandler:
         return self._run_command(command, args, env)
 ```
 
-**代码要点**：
-1. **配置驱动**：ToolConfig 集中管理所有工具配置
-2. **策略模式**：ParseFunction 支持多种解析策略
-3. **三层过滤**：前缀、完全匹配、条件阻止
-4. **统一执行**：所有工具通过 execute() 入口
+</details>
 
 ### 5.3 关键调用链
 
 ```text
 Agent.step()                       [sweagent/agent/agents.py:800]
-  -> tools.parse_actions()          [sweagent/tools/tools.py]
-    -> parse_function.parse()       [sweagent/tools/parsing.py]
-      -> FunctionCallingParser      [sweagent/tools/parsing.py]
-      -> ThoughtActionParser        [sweagent/tools/parsing.py]
+  -> tools.parse_actions()          [sweagent/tools/tools.py:220]
+    -> parse_function.parse()       [sweagent/tools/parsing.py:50]
+      -> FunctionCallingParser      [sweagent/tools/parsing.py:150]
+      -> ThoughtActionParser        [sweagent/tools/parsing.py:200]
   -> tools.should_block_action()    [sweagent/tools/tools.py:475]
-  -> tools.execute()                [sweagent/tools/tools.py]
-    -> _parse_action()
-    -> _run_command()
-      -> env.communicate()          [sweagent/environment/swe_env.py]
+  -> tools.execute()                [sweagent/tools/tools.py:312]
+    -> _parse_action()              [sweagent/tools/tools.py:280]
+    -> _run_command()               [sweagent/tools/tools.py:300]
+      -> env.communicate()          [sweagent/environment/swe_env.py:150]
 ```
 
 ---
@@ -550,7 +670,7 @@ Agent.step()                       [sweagent/agent/agents.py:800]
 **核心问题**：如何在支持多模型、保证安全的前提下，实现灵活可扩展的工具系统？
 
 **SWE-agent 的解决方案**：
-- 代码依据：`sweagent/tools/tools.py:200+`
+- 代码依据：`sweagent/tools/tools.py:200`
 - 设计意图：通过 YAML 配置实现工具的声明式定义，通过策略模式支持多种模型输出格式，通过三层过滤保证安全
 - 带来的好处：
   - 工具定义与代码分离，便于维护
@@ -563,12 +683,37 @@ Agent.step()                       [sweagent/agent/agents.py:800]
 
 ### 6.3 与其他项目的对比
 
+```mermaid
+gitGraph
+    commit id: "传统硬编码"
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "YAML + 多解析器"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "Rust trait 系统"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "Python 装饰器"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "TypeScript 类型系统"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "MCP 集成"
+```
+
 | 项目 | 核心差异 | 适用场景 |
 |-----|---------|---------|
 | SWE-agent | YAML 配置 + 多解析器 | 学术研究、多模型适配 |
 | Codex | Rust trait + 原生实现 | 企业级、高性能 |
 | Kimi CLI | Python 装饰器注册 | 快速开发、简单场景 |
 | Gemini CLI | TypeScript 类型系统 | Node.js 生态 |
+| OpenCode | MCP 协议集成 | 外部服务集成 |
 
 ---
 
@@ -578,30 +723,30 @@ Agent.step()                       [sweagent/agent/agents.py:800]
 
 | 终止原因 | 触发条件 | 代码位置 |
 |---------|---------|---------|
-| 解析失败 | 无法匹配任何格式 | `sweagent/tools/parsing.py` |
+| 解析失败 | 无法匹配任何格式 | `sweagent/tools/parsing.py:200` |
 | 动作被阻止 | 命中 blocklist | `sweagent/tools/tools.py:475` |
-| 命令未找到 | 未注册的命令 | `sweagent/tools/tools.py` |
-| 参数错误 | 缺少必需参数 | `sweagent/tools/parsing.py` |
-| 执行超时 | 超过 execution_timeout | `sweagent/tools/tools.py` |
-| 环境错误 | runtime 崩溃 | `sweagent/environment/swe_env.py` |
+| 命令未找到 | 未注册的命令 | `sweagent/tools/tools.py:312` |
+| 参数错误 | 缺少必需参数 | `sweagent/tools/parsing.py:150` |
+| 执行超时 | 超过 execution_timeout | `sweagent/tools/tools.py:30` |
+| 环境错误 | runtime 崩溃 | `sweagent/environment/swe_env.py:150` |
 
-### 7.2 错误恢复策略
+### 7.2 超时/资源限制
+
+```python
+# sweagent/tools/tools.py:30
+class ToolConfig:
+    execution_timeout: int = 30  # 命令执行超时（秒）
+    filter: ToolFilterConfig     # 安全过滤配置
+```
+
+### 7.3 错误恢复策略
 
 | 错误类型 | 处理策略 | 代码位置 |
 |---------|---------|---------|
 | FormatError | 重采样（requery） | `sweagent/agent/agents.py:forward_with_handling` |
 | BlockedActionError | 重采样 + 错误提示 | `sweagent/agent/agents.py:forward_with_handling` |
-| CommandNotFoundError | 返回错误信息 | `sweagent/tools/tools.py` |
-| TimeoutError | 标记并继续 | `sweagent/tools/tools.py` |
-
-### 7.3 资源限制
-
-```python
-# 关键配置参数
-class ToolConfig:
-    execution_timeout: int = 30  # 命令执行超时（秒）
-    filter: ToolFilterConfig     # 安全过滤配置
-```
+| CommandNotFoundError | 返回错误信息 | `sweagent/tools/tools.py:312` |
+| TimeoutError | 标记并继续 | `sweagent/tools/tools.py:30` |
 
 ---
 
@@ -609,16 +754,16 @@ class ToolConfig:
 
 | 功能 | 文件 | 行号 | 说明 |
 |-----|------|------|------|
-| ToolHandler | `sweagent/tools/tools.py` | 200+ | 工具生命周期管理 |
+| ToolHandler | `sweagent/tools/tools.py` | 200 | 工具生命周期管理 |
 | ToolConfig | `sweagent/tools/tools.py` | 75 | 工具配置 |
-| Command | `sweagent/tools/commands.py` | - | 命令抽象 |
-| Argument | `sweagent/tools/commands.py` | - | 参数定义 |
-| ParseFunction | `sweagent/tools/parsing.py` | - | 解析器基类 |
-| FunctionCallingParser | `sweagent/tools/parsing.py` | - | 函数调用解析 |
-| ThoughtActionParser | `sweagent/tools/parsing.py` | - | 思考-行动解析 |
-| ToolFilterConfig | `sweagent/tools/tools.py` | - | 安全过滤配置 |
+| Command | `sweagent/tools/commands.py` | 100 | 命令抽象 |
+| Argument | `sweagent/tools/commands.py` | 50 | 参数定义 |
+| ParseFunction | `sweagent/tools/parsing.py` | 50 | 解析器基类 |
+| FunctionCallingParser | `sweagent/tools/parsing.py` | 150 | 函数调用解析 |
+| ThoughtActionParser | `sweagent/tools/parsing.py` | 200 | 思考-行动解析 |
+| ToolFilterConfig | `sweagent/tools/tools.py` | 370 | 安全过滤配置 |
 | should_block_action | `sweagent/tools/tools.py` | 475 | 安全检查 |
-| Bundle | `sweagent/tools/tools.py` | - | 工具包 |
+| Bundle | `sweagent/tools/tools.py` | 150 | 工具包 |
 
 ---
 
@@ -631,4 +776,4 @@ class ToolConfig:
 ---
 
 *✅ Verified: 基于 sweagent/tools/tools.py、sweagent/tools/parsing.py 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

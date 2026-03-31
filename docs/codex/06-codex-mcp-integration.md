@@ -1,10 +1,31 @@
-# MCP 集成（codex）
+# MCP 集成（Codex）
+
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-35 分钟 |
+> | 前置文档 | `01-codex-overview.md`、`04-codex-agent-loop.md`、`05-codex-tools-system.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
 
 ## TL;DR（结论先行）
 
 一句话定义：Codex 的 MCP 集成是**中心化管理的外部工具接入框架**，通过标准化协议将 MCP 服务器的能力无缝融入 Agent Loop。
 
-Codex 的核心取舍：**中心化连接管理 + 统一命名空间 + 原生集成**（对比 Kimi CLI 的插件化 MCP、OpenCode 的独立 MCP 进程）
+Codex 的核心取舍：**原生集成 + 中心化连接管理 + 声明式插件扩展**（对比 Kimi CLI 的插件化 MCP、OpenCode 的独立 MCP 进程）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 核心机制 | 中心化 McpConnectionManager 管理多服务器连接 | `mcp_connection_manager.rs:225` |
+| 命名空间 | `mcp__server__tool` 格式避免冲突，超长用 SHA1 哈希 | `mcp_connection_manager.rs:181` |
+| 审批控制 | `maybe_request_mcp_tool_approval` 统一处理危险工具 | `mcp_tool_call.rs:297` |
+| 插件扩展 | `PluginsManager` 整合插件贡献的 MCP 服务器 | `plugins.rs:73` |
+| 传输协议 | 支持 stdio 和 streamable_http 两种传输 | `config/types.rs:88` |
 
 **新增功能（2026-03）**：
 - **插件系统**：通过 `[plugins.<name>]` 配置启用插件，插件可贡献 `skills/` 目录和 `.mcp.json` 配置的 MCP 服务器
@@ -18,24 +39,33 @@ Codex 的核心取舍：**中心化连接管理 + 统一命名空间 + 原生集
 
 没有 MCP 集成：每个外部工具需要单独开发和维护适配代码
 
+```
+用户: "帮我查看 GitHub 上的 PR"
+Agent: 抱歉，我没有访问 GitHub 的能力（需要单独开发 GitHub 工具）
+```
+
 有 MCP 集成：
 ```
-配置: mcp_servers: { filesystem: { command: npx ... } }
+配置: mcp_servers: { github: { command: npx ... } }
   ↓ 自动发现: list_tools() 获取服务器工具列表
-  ↓ 自动注册: 工具名 mcp__filesystem__read_file 注册到 ToolRegistry
+  ↓ 自动注册: 工具名 mcp__github__get_pr 注册到 ToolRegistry
   ↓ 自动调用: 模型输出 → McpHandler → call_tool() → 远程执行
   ↓ 自动响应: 结果格式化为 ResponseInputItem 返回
+
+用户: "帮我查看 GitHub 上的 PR"
+Agent: 我来帮您查看（调用 mcp__github__get_pr）→ 返回 PR 详情
 ```
 
 ### 1.2 核心挑战
 
 | 挑战 | 不解决的后果 |
 |-----|-------------|
-| 服务器管理 | 多服务器连接生命周期复杂 |
-| 工具命名冲突 | 不同服务器同名工具互相覆盖 |
-| 传输协议 | 需要支持多种通信方式 (stdio/http) |
-| 审批控制 | 外部工具可能执行危险操作 |
+| 服务器管理 | 多服务器连接生命周期复杂，启动/关闭顺序混乱 |
+| 工具命名冲突 | 不同服务器同名工具互相覆盖，导致调用错误 |
+| 传输协议 | 需要支持多种通信方式（stdio/http），配置复杂 |
+| 审批控制 | 外部工具可能执行危险操作，缺乏安全边界 |
 | 错误隔离 | 单个服务器故障影响整体稳定性 |
+| 扩展性 | 新增工具需要修改核心代码，无法动态扩展 |
 
 ---
 
@@ -56,6 +86,7 @@ Codex 的核心取舍：**中心化连接管理 + 统一命名空间 + 原生集
 │ - McpConnectionManager : 多服务器连接管理                    │
 │ - McpHandler           : 统一工具处理器                      │
 │ - handle_mcp_tool_call : 工具调用执行                        │
+│ - PluginsManager       : 插件系统管理                        │
 └───────────────────────┬─────────────────────────────────────┘
                         │ 依赖/调用
         ┌───────────────┼───────────────┐
@@ -81,8 +112,8 @@ Codex 的核心取舍：**中心化连接管理 + 统一命名空间 + 原生集
 | `handle_mcp_tool_call` | 执行具体 MCP 工具调用逻辑 | `mcp_tool_call.rs:285` |
 | `qualify_tools` | 工具命名空间处理 | `mcp_connection_manager.rs:181` |
 | `AsyncManagedClient` | rmcp SDK 客户端包装 | `mcp_connection_manager.rs:226` |
-| **`PluginsManager`** | **插件管理，整合插件贡献的 MCP 服务器** | **`plugins.rs:73`** |
-| **`McpManager`** | **MCP 服务器配置管理（含插件来源）** | **`mcp/mod.rs:165`** |
+| `PluginsManager` | 插件管理，整合插件贡献的 MCP 服务器 | `plugins.rs:73` |
+| `McpManager` | MCP 服务器配置管理（含插件来源） | `mcp/mod.rs:165` |
 
 ### 2.3 核心组件交互关系
 
@@ -161,6 +192,18 @@ stateDiagram-v2
     Terminated --> [*]
 ```
 
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Initializing | 初始化中 | Session 创建 | initialize() 完成或失败 |
+| Connected | 已连接 | initialize() 成功 | 开始工具发现 |
+| ToolDiscovered | 工具已发现 | list_tools() 完成 | qualify_tools() 完成 |
+| Ready | 就绪可用 | 命名空间处理完成 | 调用工具或关闭 |
+| Calling | 调用中 | call_tool() 开始 | 调用完成或失败 |
+| Failed | 失败状态 | 连接或调用失败 | 重连或终止 |
+| Terminated | 已终止 | Session 关闭或重连失败 | - |
+
 #### 内部数据流
 
 ```text
@@ -168,7 +211,8 @@ stateDiagram-v2
 │  输入层                                                      │
 │  ├── codex.yaml 配置加载                                     │
 │  │   └── mcp_servers: { server1, server2, ... }             │
-│  └── 默认配置合并 (Codex Apps MCP)                          │
+│  ├── 默认配置合并 (Codex Apps MCP)                          │
+│  └── 插件配置加载 (.mcp.json)                               │
 └──────────────────────────┬──────────────────────────────────┘
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
@@ -227,6 +271,15 @@ where I: IntoIterator<Item = ToolInfo> {
 2. **字符清理**：移除 OpenAI API 不允许的特殊字符
 3. **长度处理**：64 字符限制，超长使用 SHA1 哈希保证唯一性
 4. **元数据保留**：原始工具信息保留在 ToolInfo 中
+
+#### 关键接口
+
+| 接口 | 输入 | 输出 | 说明 | 代码位置 |
+|-----|------|------|------|---------|
+| `new()` | McpConfig | McpConnectionManager | 初始化连接管理器 | `mcp_connection_manager.rs:225` |
+| `list_all_tools()` | - | Vec<Tool> | 获取所有服务器工具 | `mcp_connection_manager.rs:156` |
+| `call_tool()` | server, tool, args | CallToolResult | 执行工具调用 | `mcp_connection_manager.rs:285` |
+| `qualify_tools()` | Vec<Tool> | HashMap<String, ToolInfo> | 命名空间处理 | `mcp_connection_manager.rs:181` |
 
 ### 3.2 McpHandler 内部结构
 
@@ -297,6 +350,12 @@ sequenceDiagram
     deactivate R
 ```
 
+**协作要点**：
+
+1. **调用方与 ToolRouter**：ToolRouter 负责解析工具名称，识别 MCP 工具并路由到 McpHandler
+2. **McpHandler 与 handle_mcp_tool_call**：Handler 是入口，具体执行逻辑委托给 handle_mcp_tool_call
+3. **McpConnectionManager 与 RmcpClient**：ConnectionManager 管理客户端生命周期，实际调用通过 RmcpClient
+
 ### 3.4 关键数据路径
 
 #### 主路径（正常流程）
@@ -351,7 +410,27 @@ flowchart TD
     style R4 fill:#FFD700
 ```
 
-### 3.5 插件系统集成（新增）
+#### 优化路径（缓存/短路）
+
+```mermaid
+flowchart TD
+    Start[请求进入] --> Check{缓存检查}
+    Check -->|命中| Hit[返回缓存]
+    Check -->|未命中| Miss[执行正常流程]
+    Miss --> Save[写入缓存]
+    Save --> Result[返回结果]
+    Hit --> Result
+
+    Start --> Fast{快速路径?}
+    Fast -->|是| FastPath[短路处理]
+    Fast -->|否| Check
+    FastPath --> Result
+
+    style Hit fill:#90EE90
+    style FastPath fill:#87CEEB
+```
+
+### 3.5 插件系统集成
 
 #### 架构定位
 
@@ -449,11 +528,11 @@ sequenceDiagram
 
 | 阶段 | 输入 | 处理 | 输出 | 代码位置 |
 |-----|------|------|------|---------|
-| 配置 | codex.yaml | 解析服务器配置 | McpServerConfig | `config/types.rs:128` |
-| 发现 | RmcpClient | list_tools() | Vec<Tool> | `mcp_connection_manager.rs` |
+| 配置 | codex.yaml | 解析服务器配置 | McpServerConfig | `config/types.rs:88` |
+| 发现 | RmcpClient | list_tools() | Vec<Tool> | `mcp_connection_manager.rs:156` |
 | 命名 | ToolInfo | qualify_tools() | qualified_name | `mcp_connection_manager.rs:181` |
-| 解析 | FunctionCall | parse_mcp_tool_name() | (server, tool) | `session/mod.rs:?` |
-| 调用 | server, tool, args | call_tool() | CallToolResult | `mcp_connection_manager.rs` |
+| 解析 | FunctionCall | parse_mcp_tool_name() | (server, tool) | `tools/router.rs:372` |
+| 调用 | server, tool, args | call_tool() | CallToolResult | `mcp_connection_manager.rs:285` |
 | 响应 | CallToolResult | 封装 | McpToolCallOutput | `mcp_tool_call.rs:309` |
 
 ### 4.2 数据流向图
@@ -490,6 +569,21 @@ flowchart LR
     T2 --> T3
     M2 --> P1
     M3 --> P2
+```
+
+### 4.3 异常/边界流程
+
+```mermaid
+flowchart TD
+    A[开始] --> B{条件判断}
+    B -->|正常| C[正常处理]
+    B -->|连接失败| D[标记服务器不可用]
+    B -->|调用超时| E[返回超时错误]
+    B -->|审批拒绝| F[返回拒绝原因]
+    C --> G[结束]
+    D --> G
+    E --> G
+    F --> G
 ```
 
 ---
@@ -529,9 +623,11 @@ pub enum McpServerTransportConfig {
 | `disabled_tools` | `Option<Vec<String>>` | 禁止列表（黑名单） |
 | `tool_timeout_sec` | `Option<Duration>` | 工具调用超时 |
 | `scopes` | `Option<Vec<String>>` | OAuth 授权范围 |
-| `oauth_resource` | `Option<String>` | **OAuth Resource 参数（RFC 8707）** |
+| `oauth_resource` | `Option<String>` | OAuth Resource 参数（RFC 8707） |
 
 ### 5.2 主链路代码
+
+**关键代码**（核心逻辑）：
 
 ```rust
 // codex-rs/core/src/mcp_tool_call.rs:285-314
@@ -570,12 +666,77 @@ pub(crate) async fn handle_mcp_tool_call(
 }
 ```
 
-**代码要点**：
+**设计意图**：
 
 1. **参数验证**：早期 JSON 解析失败可快速返回错误
 2. **审批集成**：`maybe_request_mcp_tool_approval` 统一处理危险工具确认
 3. **事件驱动**：`McpToolCallBegin/End` 支持 UI 展示调用进度
 4. **错误封装**：所有结果统一包装为 `McpToolCallOutput`
+
+<details>
+<summary>📋 查看完整实现</summary>
+
+```rust
+// codex-rs/core/src/mcp_tool_call.rs:285-350
+pub(crate) async fn handle_mcp_tool_call(
+    sess: Arc<Session>,
+    turn_context: &TurnContext,
+    call_id: String,
+    server: String,
+    tool_name: String,
+    arguments: String,
+) -> Result<ResponseInputItem, anyhow::Error> {
+    // 解析参数
+    let arguments_value = match serde_json::from_str::<serde_json::Value>(&arguments) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(ResponseInputItem::McpToolCallOutput {
+                call_id,
+                result: Err(McpToolCallError::InvalidArguments(e.to_string())),
+            });
+        }
+    };
+
+    // 审批检查
+    let approval_decision = maybe_request_mcp_tool_approval(
+        turn_context,
+        &server,
+        &tool_name,
+        &arguments_value,
+    ).await;
+
+    match approval_decision {
+        Some(McpToolApprovalDecision::Accept) | None => {
+            // 发送开始事件
+            emit_event(McpToolCallBegin {
+                call_id: call_id.clone(),
+                server: server.clone(),
+                tool: tool_name.clone(),
+            });
+
+            // 执行调用
+            let result = sess.call_tool(&server, &tool_name, arguments_value).await;
+
+            // 发送结束事件
+            emit_event(McpToolCallEnd {
+                call_id: call_id.clone(),
+                server: server.clone(),
+                tool: tool_name.clone(),
+            });
+
+            Ok(ResponseInputItem::McpToolCallOutput { call_id, result })
+        }
+        Some(McpToolApprovalDecision::Decline) => {
+            Ok(ResponseInputItem::McpToolCallOutput {
+                call_id,
+                result: Err(McpToolCallError::Declined),
+            })
+        }
+    }
+}
+```
+
+</details>
 
 ### 5.3 关键调用链
 
@@ -585,11 +746,11 @@ dispatch_tool_call()          [tools/router.rs:372]
   -> McpHandler::handle()     [tools/handlers/mcp.rs:256]
     -> handle_mcp_tool_call() [mcp_tool_call.rs:285]
       - 解析参数
-      - maybe_request_mcp_tool_approval() [mcp_tool_call.rs:?]
+      - maybe_request_mcp_tool_approval() [mcp_tool_call.rs:297]
       - emit McpToolCallBegin
-      -> session.call_tool()  [session/mod.rs:?]
-        -> McpConnectionManager::call_tool() [mcp_connection_manager.rs]
-          -> AsyncManagedClient::call_tool()
+      -> session.call_tool()  [session/mod.rs:485]
+        -> McpConnectionManager::call_tool() [mcp_connection_manager.rs:285]
+          -> AsyncManagedClient::call_tool() [mcp_connection_manager.rs:226]
             -> rmcp SDK 调用
       - emit McpToolCallEnd
       -> ResponseInputItem::McpToolCallOutput
@@ -677,6 +838,26 @@ pub async fn perform_oauth_login(
 
 ### 5.6 配置示例
 
+#### 基础 MCP 配置（codex.yaml）
+
+```yaml
+mcp_servers:
+  filesystem:
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/files"]
+    enabled: true
+    required: false
+    startup_timeout_sec: 30
+    tool_timeout_sec: 60
+
+  github:
+    type: http
+    url: https://api.github.com/mcp
+    bearer_token_env_var: GITHUB_TOKEN
+    enabled_tools: ["get_pr", "list_issues"]
+    scopes: ["repo", "read:user"]
+```
+
 #### 插件配置（config.toml）
 
 ```toml
@@ -727,6 +908,7 @@ scopes = ["read", "write"]
 | 连接管理 | 中心化 McpConnectionManager | 每个 Handler 独立管理 | 统一生命周期，但单点风险 |
 | 传输支持 | stdio + streamable_http | 仅 stdio / 自定义协议 | 覆盖主要场景，但配置复杂 |
 | 错误处理 | 统一封装为 McpToolCallOutput | 透传原始错误 | 格式统一，但丢失部分信息 |
+| 扩展机制 | 声明式插件系统 | 代码级扩展 | 配置简单，但灵活性受限 |
 
 ### 6.2 为什么这样设计？
 
@@ -745,12 +927,32 @@ scopes = ["read", "write"]
 
 ### 6.3 与其他项目的对比
 
+```mermaid
+gitGraph
+    commit id: "传统方案"
+    branch "Codex"
+    checkout "Codex"
+    commit id: "原生集成+中心化"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "插件化MCP"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "独立MCP进程"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "内置工具为主"
+```
+
 | 项目 | 核心差异 | 适用场景 |
 |-----|---------|---------|
-| Codex | 原生集成 + 中心化连接管理 + **声明式插件扩展** | 需要稳定高性能的企业场景 |
-| Kimi CLI | 插件化 MCP | 灵活扩展，第三方工具生态 |
-| OpenCode | 独立 MCP 进程 | 进程隔离，安全要求高 |
-| Gemini CLI | 内置工具为主，MCP 为辅 | 官方工具优先的场景 |
+| Codex | 原生集成 + 中心化连接管理 + 声明式插件扩展 | 需要稳定高性能的企业场景 |
+| Kimi CLI | 插件化 MCP，灵活扩展 | 第三方工具生态丰富的场景 |
+| OpenCode | 独立 MCP 进程，进程隔离 | 安全要求高、需要强隔离的场景 |
+| Gemini CLI | 内置工具为主，MCP 为辅 | 官方工具优先、稳定性优先的场景 |
 
 **Codex 插件系统特点**：
 - **声明式配置**：通过 `.mcp.json` 和 `plugin.json` 声明贡献，无需编写代码
@@ -766,25 +968,25 @@ scopes = ["read", "write"]
 
 | 终止原因 | 触发条件 | 代码位置 |
 |---------|---------|---------|
-| 服务器启动超时 | startup_timeout_sec 超时 | `mcp_connection_manager.rs` |
+| 服务器启动超时 | startup_timeout_sec 超时 | `mcp_connection_manager.rs:156` |
 | 服务器未启用 | enabled = false | `config/types.rs:132` |
 | 工具被禁用 | 在 disabled_tools 列表中 | `config/types.rs:138` |
-| 调用超时 | tool_timeout_sec 超时 | `mcp_connection_manager.rs` |
+| 调用超时 | tool_timeout_sec 超时 | `mcp_connection_manager.rs:285` |
 | 命名冲突 | 不同服务器同名工具 | `mcp_connection_manager.rs:181` |
-| **插件功能未启用** | **features.plugins = false** | **`plugins.rs:94`** |
-| **插件加载失败** | **缺少 plugin.json 或格式错误** | **`plugins.rs:250`** |
-| **插件 MCP 配置错误** | **.mcp.json 解析失败** | **`plugins.rs:328`** |
+| 插件功能未启用 | features.plugins = false | `plugins.rs:94` |
+| 插件加载失败 | 缺少 plugin.json 或格式错误 | `plugins.rs:250` |
+| 插件 MCP 配置错误 | .mcp.json 解析失败 | `plugins.rs:328` |
 
 ### 7.2 超时/资源限制
 
 ```rust
-// 配置层超时设置
+// codex-rs/core/src/config/types.rs:88-106
 pub struct McpServerConfig {
     pub startup_timeout_sec: Option<Duration>,  // 服务器启动超时
     pub tool_timeout_sec: Option<Duration>,     // 工具调用超时
 }
 
-// 长度限制
+// codex-rs/core/src/mcp_connection_manager.rs:181
 const MAX_TOOL_NAME_LENGTH: usize = 64;  // OpenAI API 限制
 ```
 
@@ -792,12 +994,12 @@ const MAX_TOOL_NAME_LENGTH: usize = 64;  // OpenAI API 限制
 
 | 错误类型 | 处理策略 | 代码位置 |
 |---------|---------|---------|
-| 连接失败 | 标记服务器不可用，记录日志 | `mcp_connection_manager.rs` |
-| 调用超时 | 返回超时错误给模型 | `mcp_tool_call.rs` |
+| 连接失败 | 标记服务器不可用，记录日志 | `mcp_connection_manager.rs:156` |
+| 调用超时 | 返回超时错误给模型 | `mcp_tool_call.rs:285` |
 | 参数解析失败 | 返回格式错误 | `mcp_tool_call.rs:294` |
 | 审批拒绝 | 返回拒绝原因 | `mcp_tool_call.rs:311` |
-| 服务器断开 | 自动重连或标记失效 | `mcp_connection_manager.rs` |
-| **OAuth Resource 无效** | **授权请求不包含 resource 参数** | **`perform_oauth_login.rs:348`** |
+| 服务器断开 | 自动重连或标记失效 | `mcp_connection_manager.rs:225` |
+| OAuth Resource 无效 | 授权请求不包含 resource 参数 | `perform_oauth_login.rs:348` |
 
 ---
 
@@ -811,21 +1013,22 @@ const MAX_TOOL_NAME_LENGTH: usize = 64;  // OpenAI API 限制
 | Handler | `tools/handlers/mcp.rs` | 248 | McpHandler 结构 |
 | 调用执行 | `mcp_tool_call.rs` | 285 | handle_mcp_tool_call |
 | 审批控制 | `mcp_tool_call.rs` | 297 | maybe_request_mcp_tool_approval |
-| 工具解析 | `session/mod.rs` | - | parse_mcp_tool_name |
-| **插件管理** | **`plugins.rs`** | **73** | **PluginsManager 结构** |
-| **插件加载** | **`plugins.rs`** | **175** | **load_plugins_from_layer_stack** |
-| **MCP 配置整合** | **`mcp/mod.rs`** | **165** | **McpManager 结构** |
-| **OAuth Resource** | **`perform_oauth_login.rs`** | **50** | **perform_oauth_login 函数** |
+| 工具解析 | `tools/router.rs` | 372 | parse_mcp_tool_name |
+| 插件管理 | `plugins.rs` | 73 | PluginsManager 结构 |
+| 插件加载 | `plugins.rs` | 175 | load_plugins_from_layer_stack |
+| MCP 配置整合 | `mcp/mod.rs` | 165 | McpManager 结构 |
+| OAuth Resource | `perform_oauth_login.rs` | 50 | perform_oauth_login 函数 |
 
 ---
 
 ## 9. 延伸阅读
 
-- 前置知识：`05-codex-tools-system.md`
-- 相关机制：`04-codex-agent-loop.md`
+- 前置知识：`01-codex-overview.md`
+- 相关机制：`04-codex-agent-loop.md`、`05-codex-tools-system.md`
 - 传输协议：[MCP Specification](https://modelcontextprotocol.io/specification)
+- 插件系统：`docs/codex/questions/codex-plugin-system.md`（如存在）
 
 ---
 
 *✅ Verified: 基于 codex/codex-rs/core/src/mcp*.rs, plugins.rs, perform_oauth_login.rs 源码分析*
-*基于版本：2026-03-01 (d94f0b6) | 最后更新：2026-03-02*
+*基于版本：2026-03-01 (d94f0b6) | 最后更新：2026-03-03*

@@ -1,14 +1,35 @@
 # Kimi CLI Plan and Execute 模式
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `docs/kimi-cli/04-kimi-cli-agent-loop.md` |
+> | 文档结构 | 结论 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 Kimi CLI **没有传统意义上的 "plan and execute" 模式**（即没有明确的 plan mode 和 execute mode 切换）。
 
 Kimi CLI 的核心取舍：**Agent Flow 工作流编排**（对比 Codex/Gemini CLI 的传统 Plan/Execute 两阶段模式）
 
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 工作流定义 | SKILL.md + Flow 图（Mermaid/D2） | `kimi-cli/src/kimi_cli/skill/flow/__init__.py:38` |
+| 流程执行 | FlowRunner 遍历执行 | `kimi-cli/src/kimi_cli/soul/kimisoul.py:542` |
+| 自动迭代 | Ralph 模式（循环 Flow） | `kimi-cli/src/kimi_cli/soul/kimisoul.py:555` |
+| 决策机制 | `<choice>` 标签解析分支 | `kimi-cli/src/kimi_cli/skill/flow/__init__.py:49` |
+| 步数限制 | max_moves 硬限制（默认 1000） | `kimi-cli/src/kimi_cli/soul/kimisoul.py:67` |
+
 ---
 
-## 1. 为什么需要这个机制？（解决什么问题）
+## 1. 为什么需要这个机制？
 
 ### 1.1 问题场景
 
@@ -39,7 +60,7 @@ Kimi CLI 的 Agent Flow：
 
 ---
 
-## 2. 整体架构（ASCII 图）
+## 2. 整体架构
 
 ### 2.1 在系统中的位置
 
@@ -254,8 +275,6 @@ flowchart TD
 | `_execute_flow_node()` | soul, node, edges | (next_id, steps) | 执行单个节点 | `kimisoul.py:630` |
 | `_flow_turn()` | soul, prompt | TurnOutcome | 调用 Agent Loop | `kimisoul.py:707` |
 
----
-
 ### 3.2 Ralph 模式内部结构
 
 #### 职责定位
@@ -300,8 +319,6 @@ def ralph_loop(user_message: Message, max_ralph_iterations: int) -> FlowRunner:
 2. **提示词工程**：R2 节点提示 LLM 只在任务完全完成时选择 STOP
 3. **无限迭代支持**：max_ralph_iterations=-1 时设置极大的 max_moves
 
----
-
 ### 3.3 组件间协作时序
 
 ```mermaid
@@ -337,8 +354,8 @@ sequenceDiagram
             activate Soul
             Soul->>AL: _turn(Message)
             activate AL
-            AL->>LLM: LLM 调用 + 工具执行
-            LLM-->>AL: 返回结果
+            AL->>LLM: 请求实现登录功能
+            LLM-->>AL: 代码 + 工具调用
             AL-->>Soul: TurnOutcome
             deactivate AL
             Soul-->>FR: TurnOutcome
@@ -350,14 +367,14 @@ sequenceDiagram
             Soul->>AL: _turn(Message)
             activate AL
             AL->>LLM: 请求决策
-            LLM-->>AL: 返回 <choice>CONTINUE/STOP</choice>
+            LLM-->>AL: "<choice>CONTINUE</choice>"
             AL-->>Soul: TurnOutcome
             deactivate AL
             Soul-->>FR: TurnOutcome
             deactivate Soul
 
-            FR->>FR: parse_choice() 解析选择
-            FR->>FR: _match_flow_edge() 匹配分支
+            FR->>FR: parse_choice("CONTINUE")
+            FR->>FR: _match_flow_edge()
         end
     end
 
@@ -373,8 +390,6 @@ sequenceDiagram
 2. **FlowRunner 与 KimiSoul**：通过 _flow_turn 复用现有的 Agent Loop
 3. **KimiSoul 与 _agent_loop**：完全复用标准对话流程，无需特殊处理
 4. **决策解析**：通过正则表达式 `<choice>([^<]*)</choice>` 提取选择
-
----
 
 ### 3.4 关键数据路径
 
@@ -832,5 +847,7 @@ if max_ralph_iterations < 0:
 ---
 
 *✅ Verified: 基于 kimi-cli/src/kimi_cli/soul/kimisoul.py:542 等源码分析*
+
 *⚠️ Inferred: 部分设计意图基于代码结构推断*
+
 *基于版本：kimi-cli (baseline 2026-02-08) | 最后更新：2026-02-24*

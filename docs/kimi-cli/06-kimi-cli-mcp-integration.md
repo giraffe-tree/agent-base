@@ -1,10 +1,33 @@
-# MCP 集成（kimi-cli）
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `01-kimi-cli-overview.md`、`05-kimi-cli-tools-system.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
+# MCP Integration（Kimi CLI）
 
 ## TL;DR（结论先行）
 
 一句话定义：Kimi CLI 的 MCP 集成采用"**ACP 协议桥接 + fastmcp 执行引擎**"的设计，通过 ACP (Agent Client Protocol) 获取 MCP 服务器配置并转换为标准 MCP 配置，由 `fastmcp` 库负责实际的工具调用执行。Web 模式下支持从全局 `mcp.json` 自动加载配置，并具备错误降级机制。
 
 Kimi CLI 的核心取舍：**协议层桥接 + 第三方库执行**（对比 Codex 的原生 Rust 实现、Gemini CLI 的自研 McpClient、OpenCode 的 AI SDK 原生集成）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 协议桥接 | ACP → MCP 配置转换 | `src/kimi_cli/acp/mcp.py:13` |
+| 执行引擎 | fastmcp 第三方库 | `src/kimi_cli/soul/toolset.py:203` |
+| 传输支持 | HTTP/SSE/Stdio 三种方式 | `src/kimi_cli/acp/mcp.py:25` |
+| 异步加载 | 后台加载不阻塞启动 | `src/kimi_cli/soul/toolset.py:291` |
+| 状态管理 | MCPServerInfo 显式状态 | `src/kimi_cli/soul/toolset.py:349` |
+| 审批集成 | 运行时权限检查 | `src/kimi_cli/soul/toolset.py:380` |
+| Web 自动加载 | 全局 mcp.json 自动发现 | `src/kimi_cli/web/runner/worker.py:37` |
 
 ---
 
@@ -246,9 +269,11 @@ stateDiagram-v2
     connecting --> failed: 连接/发现失败
     connecting --> unauthorized: OAuth 未授权
 
+    connected --> disconnected: 连接断开
     connected --> [*]: 会话结束
     failed --> [*]: 清理资源
     unauthorized --> [*]: 等待授权
+    disconnected --> connecting: 重新连接
 
     note right of pending
         初始状态
@@ -854,45 +879,27 @@ ACPServer.new_session()              [src/kimi_cli/acp/server.py:108]
 ### 6.3 与其他项目的对比
 
 ```mermaid
-flowchart TD
-    subgraph Kimi["Kimi CLI"]
-        K1[ACP 协议桥接]
-        K2[fastmcp 执行]
-        K3[异步加载]
-        K4[CLI 配置管理]
-    end
-
-    subgraph Codex["Codex"]
-        C1[原生 Rust 实现]
-        C2[RmcpClient]
-        C3[同步初始化]
-        C4[配置文件]
-    end
-
-    subgraph Gemini["Gemini CLI"]
-        G1[自研 McpClient]
-        G2[多传输自动回退]
-        G3[完整 OAuth 2.0]
-        G4[Extension 集成]
-    end
-
-    subgraph OpenCode["OpenCode"]
-        O1[AI SDK 原生集成]
-        O2[dynamicTool 转换]
-        O3[状态驱动管理]
-        O4[多级配置]
-    end
-
-    subgraph SWE["SWE-agent"]
-        S1[无 MCP 实现]
-        S2[传统 @tool 装饰器]
-    end
-
-    style Kimi fill:#e3f2fd
-    style Codex fill:#fff3e0
-    style Gemini fill:#e1f5e1
-    style OpenCode fill:#f3e5f5
-    style SWE fill:#ffebee
+gitGraph
+    commit id: "传统方案"
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "无 MCP 实现"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "ACP + fastmcp"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "原生 Rust"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "自研 McpClient"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "AI SDK 集成"
 ```
 
 #### 详细对比表
@@ -910,6 +917,14 @@ flowchart TD
 | **审批控制** | 运行时审批 | 白名单/黑名单 | Policy Engine + trust | 配置 enabled | - |
 | **加载策略** | 异步后台加载 | 同步初始化 | 同步初始化 | 状态驱动初始化 | - |
 | **Prompt/Resource** | 依赖 fastmcp | 工具为主 | 完整支持 | 完整支持 | - |
+
+| 项目 | 核心差异 | 适用场景 |
+|-----|---------|---------|
+| **Kimi CLI** | ACP 桥接 + fastmcp 执行 + 异步加载 | 已使用 Moonshot ACP 生态的用户，需要快速集成 MCP |
+| **Codex** | 原生 Rust 实现 + 命名空间隔离 | 追求高性能和稳定性的企业场景 |
+| **Gemini CLI** | 完整 OAuth 2.0 + 多传输自动回退 | 需要访问 Google Workspace 等企业服务 |
+| **OpenCode** | AI SDK 原生集成 + 状态驱动 | 使用 Vercel AI SDK 的项目 |
+| **SWE-agent** | 无 MCP 实现，传统工具装饰器 | 专注于 SWE 任务，不需要 MCP 生态 |
 
 #### 各项目适用场景
 
@@ -1006,12 +1021,13 @@ result = await client.call_tool(
 - ACP 协议：`src/kimi_cli/acp/AGENTS.md`
 - 传输协议：[MCP Specification](https://modelcontextprotocol.io/specification)
 - fastmcp 库：[fastmcp 文档](https://github.com/modelcontextprotocol/python-sdk)
-- 跨项目对比：`../comm/06-comm-mcp-integration.md`
-- Codex MCP：`../codex/06-codex-mcp-integration.md`
-- Gemini CLI MCP：`../gemini-cli/06-gemini-cli-mcp-integration.md`
-- OpenCode MCP：`../opencode/06-opencode-mcp-integration.md`
+- 跨项目对比：`docs/comm/06-comm-mcp-integration.md`
+- 其他项目 MCP Integration：
+  - `docs/codex/06-codex-mcp-integration.md`
+  - `docs/gemini-cli/06-gemini-cli-mcp-integration.md`
+  - `docs/opencode/06-opencode-mcp-integration.md`
 
 ---
 
 *✅ Verified: 基于 kimi-cli/src/kimi_cli/acp/mcp.py、kimi-cli/src/kimi_cli/soul/toolset.py、kimi-cli/src/kimi_cli/cli/mcp.py、kimi-cli/src/kimi_cli/web/runner/worker.py 源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-03-02*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

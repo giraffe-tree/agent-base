@@ -1,10 +1,31 @@
-# OpenCode UI 交互系统
+# UI 交互系统（opencode）
+
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-35 分钟 |
+> | 前置文档 | `01-opencode-overview.md`、`04-opencode-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
 
 ## TL;DR（结论先行）
 
 一句话定义：OpenCode 的 UI 交互系统是一套基于 **SolidJS 响应式状态管理** 的现代化界面架构，通过分层状态容器（Context）实现用户输入、会话管理和界面布局的松耦合协作。
 
-OpenCode 的核心取舍：**SolidJS Store + 细粒度响应式更新**（对比其他项目的 React/Vue 方案）
+OpenCode 的核心取舍：**SolidJS Store + 细粒度响应式更新 + 乐观更新策略**（对比 Gemini CLI 的 React + 状态机、Kimi CLI 的 Python CLI 交互）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 前端框架 | SolidJS 细粒度响应式 | `packages/app/src/context/prompt.tsx:198` |
+| 状态管理 | SolidJS Store + Context 分层 | `packages/app/src/context/sync.tsx:93` |
+| 输入处理 | 多段式输入（PromptPart）解析 | `packages/app/src/context/prompt.tsx:63-82` |
+| 乐观更新 | 立即更新 UI + 失败回滚 | `packages/app/src/context/sync.tsx:44-63` |
+| 命令系统 | 声明式命令 + 快捷键绑定 | `packages/app/src/context/command.tsx:130-146` |
 
 ---
 
@@ -55,11 +76,11 @@ OpenCode 的核心取舍：**SolidJS Store + 细粒度响应式更新**（对比
 └───────────────────────┬─────────────────────────────────────┘
                         │ 状态变更/数据流
                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 全局状态层          │ 平台适配层          │ 服务端通信       │
-│ global-sync.tsx     │ platform.tsx        │ sdk/client       │
-│ local.tsx           │                     │                  │
-└─────────────────────┴─────────────────────┴──────────────────┘
+┌───────────────────────┬───────────────────────┬─────────────┐
+│ 全局状态层             │ 平台适配层             │ 服务端通信   │
+│ global-sync.tsx       │ platform.tsx           │ sdk/client   │
+│ local.tsx             │                        │              │
+└───────────────────────┴───────────────────────┴─────────────┘
 ```
 
 ### 2.2 核心组件职责
@@ -603,6 +624,10 @@ gitGraph
     branch "Kimi CLI"
     checkout "Kimi CLI"
     commit id: "Python CLI + Prompt"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "Rust + TypeScript Actor"
 ```
 
 | 项目 | 核心差异 | 适用场景 |
@@ -675,4 +700,4 @@ const timeout = new Promise<Awaited<ReturnType<typeof WorktreeState.wait>>>((res
 ---
 
 *✅ Verified: 基于 opencode/packages/app/src/context/*.tsx 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

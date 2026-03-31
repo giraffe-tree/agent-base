@@ -1,10 +1,32 @@
 # Safety Control（gemini-cli）
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置文档 | `01-gemini-cli-overview.md`、`05-gemini-cli-tools-system.md`、`06-gemini-cli-mcp-integration.md` |
+> | 文档结构 | TL;DR → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Gemini CLI 的 Safety Control 是**规则引擎主导的前置拦截模型**，核心链路为 `Settings/CLI/TOML -> PolicyEngine -> Scheduler.checkPolicy -> ALLOW | ASK_USER | DENY`，并支持动态规则沉淀（会话级或落盘）。新增 **Conseca 安全框架** 提供基于 LLM 的动态策略生成能力。
 
 Gemini CLI 的核心取舍：**中心化策略引擎 + 显式审批门控 + LLM 动态策略生成**（对比 Codex 的沙箱隔离 + 分级拒绝、Kimi CLI 的审批状态机 + YOLO 模式）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 核心机制 | PolicyEngine 三级决策（ALLOW/ASK_USER/DENY） | `packages/core/src/policy/policy-engine.ts` |
+| 策略来源 | Settings + CLI + TOML 多层配置 | `packages/core/src/policy/config.ts` |
+| 动态规则 | 用户"总是允许"沉淀为持久化规则 | `packages/core/src/policy/config.ts` |
+| LLM 动态策略 | Conseca 框架基于用户提示生成策略 | `packages/core/src/safety/conseca/conseca.ts:24` |
+| URL 安全 | 欺骗性 URL 检测（Punycode/Unicode） | `packages/cli/src/ui/utils/urlSecurityUtils.ts:25` |
+| 终端安全 | Unicode 控制字符过滤 | `packages/cli/src/ui/utils/textUtils.ts:120` |
 
 ---
 
@@ -59,6 +81,7 @@ MCP 调用 → 作用域验证 → 授权检查 → 受控执行 → 返回
 │ - config.ts           : 策略配置构建与合成                   │
 │ - toml-loader.ts      : TOML 策略文件解析                    │
 │ packages/cli/src/config/policy.ts : CLI 配置映射             │
+│ packages/core/src/safety/conseca/ : Conseca 动态策略框架     │
 └───────────────────────┬─────────────────────────────────────┘
                         │ 依赖
         ┌───────────────┼───────────────┐
@@ -79,11 +102,11 @@ MCP 调用 → 作用域验证 → 授权检查 → 受控执行 → 返回
 | `TOMLLoader` | TOML 策略文件解析、校验、优先级处理 | `packages/core/src/policy/toml-loader.ts` |
 | `CLIToPolicyConfig` | CLI 配置到 PolicySettings 的映射 | `packages/cli/src/config/policy.ts` |
 | `Scheduler.checkPolicy` | 工具执行前策略检查主流程 | `packages/core/src/scheduler/scheduler.ts` |
-| `URLSecurityUtils` | 欺骗性 URL 检测 | `packages/cli/src/ui/utils/urlSecurityUtils.ts` |
-| `TextUtils` | Unicode 字符过滤 | `packages/cli/src/ui/utils/textUtils.ts` |
-| **ConsecaSafetyChecker** | **基于 LLM 的动态安全策略生成与执行** | `packages/core/src/safety/conseca/conseca.ts:24` |
-| **PolicyGenerator** | **根据用户提示生成上下文相关的安全策略** | `packages/core/src/safety/conseca/policy-generator.ts:100` |
-| **PolicyEnforcer** | **执行生成的安全策略并返回决策** | `packages/core/src/safety/conseca/policy-enforcer.ts:53` |
+| `URLSecurityUtils` | 欺骗性 URL 检测 | `packages/cli/src/ui/utils/urlSecurityUtils.ts:25` |
+| `TextUtils` | Unicode 字符过滤 | `packages/cli/src/ui/utils/textUtils.ts:120` |
+| `ConsecaSafetyChecker` | 基于 LLM 的动态安全策略生成与执行 | `packages/core/src/safety/conseca/conseca.ts:24` |
+| `PolicyGenerator` | 根据用户提示生成上下文相关的安全策略 | `packages/core/src/safety/conseca/policy-generator.ts:100` |
+| `PolicyEnforcer` | 执行生成的安全策略并返回决策 | `packages/core/src/safety/conseca/policy-enforcer.ts:53` |
 
 ### 2.3 核心组件交互关系
 
@@ -654,6 +677,8 @@ export interface PolicyConfig {
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```typescript
 // packages/core/src/scheduler/scheduler.ts
 
@@ -700,7 +725,7 @@ async function executeToolWithSafety(
 }
 ```
 
-**代码要点**：
+**设计意图**：
 
 1. **三级决策分支**：清晰的 ALLOW/ASK_USER/DENY 处理路径
 2. **动态规则沉淀**：用户"总是允许"即时生效并持久化
@@ -963,25 +988,25 @@ Agent Loop
 **核心问题**：如何在保证安全的前提下，提供灵活的配置和良好的用户体验？
 
 **Gemini CLI 的解决方案**：
-- 代码依据：`packages/core/src/policy/policy-engine.ts` 的三级决策设计
-- 设计意图：通过 PolicyEngine 集中管理多源策略，支持灵活的配置组合
-- 带来的好处：
+- **代码依据**：`packages/core/src/policy/policy-engine.ts` 的三级决策设计
+- **设计意图**：通过 PolicyEngine 集中管理多源策略，支持灵活的配置组合
+- **带来的好处**：
   - 企业环境可通过 Admin TOML 统一管控
   - 个人用户可通过 CLI 参数快速调整
   - 用户习惯可沉淀为动态规则
-- 付出的代价：
+- **付出的代价**：
   - 策略合并逻辑复杂
   - 需要理解多层配置的优先级
 
 **Conseca 框架的设计动机**：
-- 代码依据：`packages/core/src/safety/conseca/conseca.ts:24-170`
-- 核心问题：静态规则难以适应复杂多变的用户场景
-- 设计意图：利用 LLM 理解用户意图，动态生成最小权限策略
-- 带来的好处：
+- **代码依据**：`packages/core/src/safety/conseca/conseca.ts:24-170`
+- **核心问题**：静态规则难以适应复杂多变的用户场景
+- **设计意图**：利用 LLM 理解用户意图，动态生成最小权限策略
+- **带来的好处**：
   - **上下文感知**：策略基于实际用户请求生成，避免过度授权
   - **最小权限**：自动限制工具使用范围（如仅允许读取特定文件）
   - **动态适应**：不同任务自动应用不同安全策略
-- 付出的代价：
+- **付出的代价**：
   - 增加 LLM 调用开销（策略生成 + 执行验证各一次）
   - 策略生成延迟（首次调用时）
   - 依赖 LLM 可靠性（失败时回退到 ALLOW）
@@ -1114,5 +1139,4 @@ if (!isInteractive() && decision.action === PolicyDecision.ASK_USER) {
 
 ---
 
-*✅ Verified: 基于 gemini-cli/packages/core/src/policy/*.ts、packages/core/src/safety/conseca/*.ts 和 packages/cli/src/ui/utils/*.ts 源码分析*
 *基于版本：2026-02-08 | 最后更新：2026-03-02*

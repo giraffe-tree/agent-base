@@ -1,6 +1,29 @@
 # Kimi CLI 开发者入门（面向第一次做 Code Agent）
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-35 分钟 |
+> | 前置文档 | 无（本文档为入门首选） |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 → 延伸阅读 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 核心机制 | while 循环驱动多轮 LLM 调用 | `kimi-cli/src/kimi_cli/soul/kimisoul.py:302` |
+| 状态管理 | Checkpoint 文件保存对话状态，支持 D-Mail 回滚 | `kimi-cli/src/kimi_cli/soul/context.py:68` |
+| 错误处理 | 显式 step 上限，超限报错 | `kimi-cli/src/kimi_cli/soul/kimisoul.py:332` |
+| 工具系统 | 内置工具 + MCP 扩展，支持并发执行 | `kimi-cli/src/kimi_cli/soul/toolset.py:71` |
+| 会话管理 | Session 生命周期管理，支持恢复和继续 | `kimi-cli/src/kimi_cli/session.py:86` |
+
+---
 
 一句话定义：Kimi CLI 是一个基于 Python 实现的 AI Code Agent，通过**命令式 while 循环 + Checkpoint 回滚机制**驱动多轮 LLM 调用，实现从"一次性回答"到"多轮工具执行"的转变。
 

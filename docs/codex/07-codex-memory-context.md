@@ -1,10 +1,32 @@
 # Memory Context 管理（codex）
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置文档 | `04-codex-agent-loop.md`、`01-codex-overview.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
-一句话定义：Codex 的 Memory Context 是**双层存储 + 惰性压缩 + 可配置记忆系统**的对话历史管理方案，在内存中维护完整历史，通过字节启发式估算 Token 使用量，接近上下文窗口限制时触发 LLM 驱动的摘要压缩；同时支持跨会话的长期记忆（Memories），通过两阶段提取（Phase 1 原始记忆生成 + Phase 2 合并整理）实现知识的持久化与渐进式遗忘。
+一句话定义：Codex 的 Memory Context 是**双层存储 + 惰性压缩 + 可配置长期记忆**的对话历史管理方案，在内存中维护完整历史，通过字节启发式估算 Token 使用量，接近上下文窗口限制时触发 LLM 驱动的摘要压缩；同时支持跨会话的长期记忆，通过两阶段提取实现知识的持久化与渐进式遗忘。
 
 Codex 的核心取舍：**内存完整存储 + 惰性压缩 + 可选长期记忆**（对比 Gemini CLI 的分层记忆、Kimi CLI 的 Checkpoint 回滚）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 核心机制 | 内存存储完整历史，惰性触发压缩 | `context_manager/history.rs:106` |
+| Token 估算 | 字节启发式近似估算 | `truncate.rs` |
+| 历史规范化 | Call/Output 配对 + 孤儿清理 + 多模态过滤 | `context_manager/normalize.rs` |
+| 上下文压缩 | LLM 驱动摘要，渐进式移除重试 | `compact.rs:64` |
+| 长期记忆 | 两阶段提取（Phase 1 原始 + Phase 2 合并） | `memories/phase2.rs:43` |
+| 记忆遗忘 | 基于差异的渐进式清理 | `state/src/runtime/memories.rs:312` |
 
 ---
 
@@ -33,6 +55,7 @@ Codex 的核心取舍：**内存完整存储 + 惰性压缩 + 可选长期记忆
 | 上下文压缩 | 超限后无法继续对话 |
 | 持久化恢复 | 程序重启后丢失对话历史 |
 | 多模态支持 | 图片等非文本内容处理复杂 |
+| 长期记忆 | 跨会话知识无法积累 |
 
 ---
 
@@ -79,9 +102,9 @@ Codex 的核心取舍：**内存完整存储 + 惰性压缩 + 可选长期记忆
 | `compact` | 上下文压缩任务执行 | `compact.rs:64` |
 | `truncate` | Token 估算与截断策略 | `truncate.rs` |
 | `RolloutRecorder` | 持久化存储（JSON Lines） | `protocol/src/protocol.rs` |
-| **MemoriesConfig** | **记忆系统配置（启用/禁用、Phase 2 模型等）** | **`config/types.rs:396`** |
-| **Phase 1** | **原始记忆提取（单线程摘要生成）** | **`memories/phase_one.rs`** |
-| **Phase 2** | **记忆合并整理（跨线程知识整合）** | **`memories/phase2.rs:43`** |
+| `MemoriesConfig` | 记忆系统配置（启用/禁用、Phase 2 模型等） | `config/types.rs:396` |
+| `Phase 1` | 原始记忆提取（单线程摘要生成） | `memories/phase_one.rs` |
+| `Phase 2` | 记忆合并整理（跨线程知识整合） | `memories/phase2.rs:43` |
 
 ### 2.3 核心组件交互关系
 
@@ -156,6 +179,17 @@ stateDiagram-v2
     Truncated --> Recording: 继续对话
 ```
 
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Empty | 空状态 | 初始化完成 | 收到第一条消息 |
+| Recording | 记录中 | 调用 record_items | 需要检查 Token |
+| Checking | 检查 Token | 需要估算使用量 | 估算完成 |
+| Normal | 正常 | Token 未超限 | 新消息到达 |
+| Compacting | 压缩中 | Token 超限 | 压缩完成或失败 |
+| Truncating | 截断中 | 压缩后仍超限 | 截断完成 |
+
 #### 内部数据流
 
 ```text
@@ -192,11 +226,13 @@ stateDiagram-v2
 
 | 接口 | 输入 | 输出 | 说明 | 代码位置 |
 |-----|------|------|------|---------|
-| `new()` | - | ContextManager | 创建空管理器 | `history.rs:113` |
-| `record_items()` | Vec<ResponseInputItem> | - | 记录新项 | `history.rs:?` |
-| `for_prompt()` | modalities | Vec<ResponseItem> | 构建 Prompt | `history.rs:?` |
-| `estimate_token_count()` | BaseInstructions | Option<i64> | Token 估算 | `history.rs:398` |
-| `remove_first_item()` | - | Option<ResponseItem> | 移除最旧项 | `history.rs:?` |
+| `new()` | - | ContextManager | 创建空管理器 | `history.rs:113` ✅ |
+| `record_items()` | Vec<ResponseInputItem> | - | 记录新项 | `history.rs` ✅ |
+| `for_prompt()` | modalities | Vec<ResponseItem> | 构建 Prompt | `history.rs` ✅ |
+| `estimate_token_count()` | BaseInstructions | Option<i64> | Token 估算 | `history.rs:398` ✅ |
+| `remove_first_item()` | - | Option<ResponseItem> | 移除最旧项 | `history.rs` ✅ |
+
+---
 
 ### 3.2 历史规范化 (Normalize) 内部结构
 
@@ -225,6 +261,8 @@ fn normalize_history(&mut self, input_modalities: &[InputModality]) {
 1. **Call/Output 配对**：每个工具调用必须有对应的结果，否则模型无法关联
 2. **孤儿清理**：移除无效的历史项，减少 Token 消耗
 3. **多模态处理**：根据模型能力动态调整内容
+
+---
 
 ### 3.3 上下文压缩 (Compact) 内部结构
 
@@ -271,6 +309,8 @@ pub(crate) async fn run_compact_task_inner(...) -> CodexResult<()> {
 1. **渐进式压缩**：优先尝试完整压缩，失败则移除最旧项重试
 2. **自洽循环**：使用相同的 LLM API 进行摘要生成
 3. **幂等替换**：用 Compaction 项原子替换旧历史
+
+---
 
 ### 3.4 组件间协作时序
 
@@ -330,7 +370,15 @@ sequenceDiagram
     C-->>U: Prompt
 ```
 
-### 3.4 关键数据路径
+**协作要点**：
+
+1. **调用方与 ContextManager**：Agent Loop 通过 record_items/for_prompt 接口与 ContextManager 交互
+2. **ContextManager 与 Normalize**：规范化在 Prompt 构建前执行，确保数据完整性
+3. **Compact 与 LLM**：使用相同的 LLM API 进行摘要生成，保持处理一致性
+
+---
+
+### 3.5 关键数据路径
 
 #### 主路径（正常流程）
 
@@ -378,13 +426,15 @@ flowchart TD
 
 ---
 
-### 3.5 记忆系统配置（MemoriesConfig）
+### 3.6 长期记忆系统
 
-#### 职责定位
+#### 3.6.1 记忆系统配置（MemoriesConfig）
+
+##### 职责定位
 
 MemoriesConfig 控制 Codex 长期记忆系统的行为，允许用户通过配置文件启用/禁用记忆功能，并调整记忆提取和合并的参数。
 
-#### 配置结构
+##### 配置结构
 
 ```rust
 // codex-rs/core/src/config/types.rs:396-406
@@ -402,12 +452,12 @@ pub struct MemoriesConfig {
 }
 ```
 
-#### 配置项说明
+##### 配置项说明
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |-------|------|--------|------|
 | `generate_memories` | bool | true | 新线程是否存储记忆到 state DB |
-| **use_memories** | **bool** | **true** | **是否在开发者提示词中注入记忆使用说明** |
+| `use_memories` | bool | true | 是否在开发者提示词中注入记忆使用说明 |
 | `max_raw_memories_for_global` | usize | 256 | Phase 2 合并时保留的最大原始记忆数 |
 | `max_unused_days` | i64 | 30 | 超过此天数未使用的记忆不参与 Phase 2 |
 | `max_rollout_age_days` | i64 | 30 | 用于记忆的 rollout 最大年龄 |
@@ -415,7 +465,7 @@ pub struct MemoriesConfig {
 | `phase_1_model` | Option<String> | None | Phase 1 提取使用的模型 |
 | `phase_2_model` | Option<String> | None | Phase 2 合并使用的模型 |
 
-#### 配置示例（config.toml）
+##### 配置示例（config.toml）
 
 ```toml
 [memories]
@@ -427,9 +477,9 @@ min_rollout_idle_hours = 6
 phase_2_model = "o3-mini"
 ```
 
-#### use_memories 的作用
+##### use_memories 的作用
 
-当 `use_memories = false` 时，Codex 会跳过记忆使用说明的注入（`codex.rs:2989-2994`）：
+当 `use_memories = false` 时，Codex 会跳过记忆使用说明的注入：
 
 ```rust
 // codex-rs/core/src/codex.rs:2989-2994
@@ -444,15 +494,13 @@ if turn_context.features.enabled(Feature::MemoryTool)
 
 **设计意图**：允许用户完全禁用记忆功能，避免记忆内容影响当前对话，同时保留已生成的记忆文件供后续启用时使用。
 
----
+#### 3.6.2 记忆遗忘机制（Memory Forgetting）
 
-### 3.6 记忆遗忘机制（Memory Forgetting）
-
-#### 职责定位
+##### 职责定位
 
 Codex 的记忆系统支持基于差异（diff-based）的遗忘机制，在 Phase 2（合并阶段）通过对比当前选择与前一次成功的选择，识别需要移除的记忆条目。
 
-#### 核心数据结构
+##### 核心数据结构
 
 ```rust
 // codex-rs/state/src/model/memories.rs:32-38
@@ -465,7 +513,7 @@ pub struct Phase2InputSelection {
 }
 ```
 
-#### 遗忘判定逻辑
+##### 遗忘判定逻辑
 
 ```rust
 // codex-rs/state/src/runtime/memories.rs:294-422
@@ -502,45 +550,7 @@ pub async fn get_phase2_input_selection(
 }
 ```
 
-#### 合并提示词中的遗忘指令
-
-合并代理（Consolidation Agent）通过提示词模板接收差异信息：
-
-```markdown
-<!-- codex-rs/core/templates/memories/consolidation.md:124-143 -->
-
-Incremental thread diff snapshot (computed before the current artifact sync rewrites local files):
-
-**Diff since last consolidation:**
-{{ phase2_input_selection }}
-
-Incremental update and forgetting mechanism:
-- Use the diff provided
-- For each added thread id, search it in `raw_memories.md`...
-- For each removed thread id, search it in `MEMORY.md` and delete only the memory supported by that thread
-```
-
-#### 差异渲染格式
-
-```rust
-// codex-rs/core/src/memories/prompts.rs:56-90
-fn render_phase2_input_selection(selection: &Phase2InputSelection) -> String {
-    let retained = selection.retained_thread_ids.len();
-    let added = selection.selected.len().saturating_sub(retained);
-
-    format!(
-        "- selected inputs this run: {}\n\
-         - newly added since the last successful Phase 2 run: {added}\n\
-         - retained from the last successful Phase 2 run: {retained}\n\
-         - removed from the last successful Phase 2 run: {}\n\
-         ...",
-        selection.selected.len(),
-        selection.removed.len(),
-    )
-}
-```
-
-#### 遗忘执行流程
+##### 遗忘执行流程
 
 ```mermaid
 sequenceDiagram
@@ -618,11 +628,11 @@ sequenceDiagram
 
 | 阶段 | 输入 | 处理 | 输出 | 代码位置 |
 |-----|------|------|------|---------|
-| 记录 | ResponseInputItem | 应用 TruncationPolicy | 存储到 items | `history.rs:?` |
-| 估算 | BaseInstructions + items | approx_token_count() | token_count | `history.rs:398` |
-| 压缩 | 完整历史 | LLM 摘要 + 替换 | Compaction 项 | `compact.rs:64` |
-| 规范化 | raw items | ensure/remove/strip | clean items | `normalize.rs` |
-| 持久化 | TurnItem | RolloutRecorder | JSON Lines | `protocol.rs` |
+| 记录 | ResponseInputItem | 应用 TruncationPolicy | 存储到 items | `history.rs` ✅ |
+| 估算 | BaseInstructions + items | approx_token_count() | token_count | `history.rs:398` ✅ |
+| 压缩 | 完整历史 | LLM 摘要 + 替换 | Compaction 项 | `compact.rs:64` ✅ |
+| 规范化 | raw items | ensure/remove/strip | clean items | `normalize.rs` ✅ |
+| 持久化 | TurnItem | RolloutRecorder | JSON Lines | `protocol.rs` ✅ |
 
 ### 4.2 数据流向图
 
@@ -660,6 +670,23 @@ flowchart LR
     P3 --> P4
     P4 --> O1
     M1 --> O2
+```
+
+### 4.3 异常/边界流程
+
+```mermaid
+flowchart TD
+    A[开始] --> B{Token 检查}
+    B -->|正常| C[正常处理]
+    B -->|超限| D[触发压缩]
+    D --> E{压缩成功?}
+    E -->|是| C
+    E -->|否| F{还能移除?}
+    F -->|是| G[移除最旧项]
+    G --> D
+    F -->|否| H[返回错误]
+    C --> I[结束]
+    H --> I
 ```
 
 ---
@@ -707,8 +734,10 @@ pub(crate) fn estimate_token_count(
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```rust
-// codex-rs/core/src/context_manager/normalize.rs
+// context_manager/normalize.rs
 fn normalize_history(&mut self, input_modalities: &[InputModality]) {
     // 1. 确保每个 function call 都有对应的 output
     normalize::ensure_call_outputs_present(&mut self.items);
@@ -721,29 +750,65 @@ fn normalize_history(&mut self, input_modalities: &[InputModality]) {
 }
 ```
 
-**代码要点**：
+**设计意图**：
+1. **配对保证**：确保每个工具调用都有对应的结果返回，维持对话完整性
+2. **孤儿清理**：移除无效的历史项，减少 Token 浪费，避免模型困惑
+3. **多模态适配**：根据模型输入模态能力动态过滤，保证兼容性
 
-1. **配对保证**：确保每个工具调用都有对应的结果返回
-2. **孤儿清理**：移除无效的历史项，减少 Token 浪费
-3. **多模态适配**：根据模型输入模态能力动态过滤
+<details>
+<summary>📋 查看完整压缩实现</summary>
+
+```rust
+// compact.rs:64-120
+pub(crate) async fn run_compact_task_inner(
+    sess: &Session,
+    turn_context: Arc<TurnContext>,
+    initial_input_for_turn: ResponseInputItem,
+    policy: TruncationPolicy,
+) -> CodexResult<()> {
+    let mut history = sess.clone_history().await;
+    history.record_items(&[initial_input_for_turn.into()], policy);
+
+    loop {
+        let turn_input = history.for_prompt(&turn_context.model_info.input_modalities);
+        let prompt = Prompt {
+            input: turn_input,
+            base_instructions: sess.get_base_instructions().await,
+            ..Default::default()
+        };
+
+        match drain_to_completed(&sess, turn_context.clone(), prompt, ...).await {
+            Ok(()) => break,
+            Err(CodexErr::ContextWindowExceeded) => {
+                history.remove_first_item();
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+```
+
+</details>
 
 ### 5.3 关键调用链
 
 ```text
 Agent Loop::run_turn()
-  -> ContextManager::record_items()    [context_manager/history.rs]
-    -> apply TruncationPolicy           [truncate.rs]
+  -> ContextManager::record_items()    [context_manager/history.rs] ✅
+    -> apply TruncationPolicy           [truncate.rs] ✅
     -> items.extend()
-  -> ContextManager::estimate_token_count() [history.rs:398]
-    -> approx_token_count()             [truncate.rs]
+  -> ContextManager::estimate_token_count() [history.rs:398] ✅
+    -> approx_token_count()             [truncate.rs] ✅
     -> estimate_item_token_count()
-  -> [if needed] run_compact_task()     [compact.rs:64]
+  -> [if needed] run_compact_task()     [compact.rs:64] ✅
     -> clone_history()
-    -> for_prompt() -> normalize_history() [normalize.rs]
+    -> for_prompt() -> normalize_history() [normalize.rs] ✅
     -> drain_to_completed() -> LLM
     -> 生成 Compaction 项
-  -> ContextManager::for_prompt()       [history.rs]
-    -> normalize_history()              [normalize.rs]
+  -> ContextManager::for_prompt()       [history.rs] ✅
+    -> normalize_history()              [normalize.rs] ✅
     -> return items for Prompt
 ```
 
@@ -760,14 +825,14 @@ Agent Loop::run_turn()
 | 压缩策略 | 惰性压缩（触发式） | 实时压缩 (Gemini) | 减少压缩频率，但可能突增 |
 | 压缩粒度 | 整段历史摘要 | 逐条摘要 / 分层记忆 | 简单有效，但粒度粗 |
 | 持久化 | JSON Lines | 数据库 / 二进制 | 可读性好，但体积大 |
-| **长期记忆** | **两阶段提取 + Diff 遗忘** | **实时分层 (Gemini)** | **后台异步处理，渐进式清理** |
+| 长期记忆 | 两阶段提取 + Diff 遗忘 | 实时分层 (Gemini) | 后台异步处理，渐进式清理 |
 
 ### 6.2 为什么这样设计？
 
 **核心问题**：如何在有限的上下文窗口内支持长对话？
 
 **Codex 的解决方案**：
-- 代码依据：`compact.rs:64-120` 的渐进式压缩逻辑
+- 代码依据：`compact.rs:64-120` 的渐进式压缩逻辑 ✅
 - 设计意图：优先保留完整信息，超限后智能摘要
 - 带来的好处：
   - 短对话无压缩开销
@@ -780,12 +845,32 @@ Agent Loop::run_turn()
 
 ### 6.3 与其他项目的对比
 
+```mermaid
+gitGraph
+    commit id: "传统方案"
+    branch "Codex"
+    checkout "Codex"
+    commit id: "惰性压缩+字节估算"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "分层记忆+实时压缩"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "Checkpoint回滚"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "简单截断"
+```
+
 | 项目 | 核心差异 | 适用场景 |
 |-----|---------|---------|
 | Codex | 惰性压缩 + 字节估算 + 可选长期记忆 | 通用场景，平衡性能与精度；需要跨会话知识积累 |
-| Gemini CLI | 分层记忆 (Working/Short/Long) | 需要精细记忆管理的场景 |
-| Kimi CLI | Checkpoint 回滚 | 需要精确状态恢复的场景 |
-| OpenCode | 简单截断 | 资源受限的场景 |
+| Gemini CLI | 分层记忆 (Working/Short/Long) + 实时压缩 | 需要精细记忆管理的场景 |
+| Kimi CLI | Checkpoint 回滚机制 | 需要精确状态恢复的场景 |
+| OpenCode | 简单截断策略 | 资源受限的场景 |
 
 ---
 
@@ -795,12 +880,12 @@ Agent Loop::run_turn()
 
 | 终止原因 | 触发条件 | 代码位置 |
 |---------|---------|---------|
-| 历史为空 | 对话刚开始 | `history.rs:106` |
-| 压缩后仍超限 | 移除所有可移除项后仍超限 | `compact.rs` |
-| Token 估算溢出 | i64::MAX 上限 | `history.rs:398` |
-| 规范化后为空 | 所有项被过滤 | `normalize.rs` |
+| 历史为空 | 对话刚开始 | `history.rs:106` ✅ |
+| 压缩后仍超限 | 移除所有可移除项后仍超限 | `compact.rs` ✅ |
+| Token 估算溢出 | i64::MAX 上限 | `history.rs:398` ✅ |
+| 规范化后为空 | 所有项被过滤 | `normalize.rs` ✅ |
 
-### 7.2 截断策略
+### 7.2 超时/资源限制
 
 ```rust
 // truncate.rs
@@ -827,20 +912,20 @@ impl TruncationPolicy {
 
 | 错误类型 | 处理策略 | 代码位置 |
 |---------|---------|---------|
-| 上下文超限 | 触发压缩任务 | `agent_loop.rs` |
-| 压缩失败 | 移除最旧项重试 | `compact.rs` |
-| 孤儿 output | 移除孤立项 | `normalize.rs` |
-| 图片不支持 | 从消息中移除 | `normalize.rs` |
+| 上下文超限 | 触发压缩任务 | `agent_loop.rs` ⚠️ |
+| 压缩失败 | 移除最旧项重试 | `compact.rs` ✅ |
+| 孤儿 output | 移除孤立项 | `normalize.rs` ✅ |
+| 图片不支持 | 从消息中移除 | `normalize.rs` ✅ |
 
 ### 7.4 记忆系统边界情况
 
 | 边界情况 | 处理策略 | 代码位置 |
 |---------|---------|---------|
-| **记忆功能禁用** | `use_memories = false` 时跳过记忆提示注入 | `codex.rs:2989` |
-| **Phase 2 无输入** | `raw_memories.is_empty()` 时直接标记成功 | `phase2.rs:115-127` |
-| **记忆提取失败** | 标记 job 失败并记录错误原因 | `phase2.rs:59-68` |
-| **合并代理失败** | 心跳丢失时标记失败并关闭代理 | `phase2.rs:370-384` |
-| **记忆过期** | 超过 `max_unused_days` 的记忆不参与 Phase 2 | `memories.rs:320` |
+| 记忆功能禁用 | `use_memories = false` 时跳过记忆提示注入 | `codex.rs:2989` ✅ |
+| Phase 2 无输入 | `raw_memories.is_empty()` 时直接标记成功 | `phase2.rs:115-127` ✅ |
+| 记忆提取失败 | 标记 job 失败并记录错误原因 | `phase2.rs:59-68` ✅ |
+| 合并代理失败 | 心跳丢失时标记失败并关闭代理 | `phase2.rs:370-384` ✅ |
+| 记忆过期 | 超过 `max_unused_days` 的记忆不参与 Phase 2 | `memories.rs:320` ✅ |
 
 ---
 
@@ -855,13 +940,13 @@ impl TruncationPolicy {
 | 截断 | `truncate.rs` | - | TruncationPolicy |
 | 持久化 | `protocol/src/protocol.rs` | - | RolloutItem |
 | Token 计算 | `truncate.rs` | - | approx_token_count |
-| **记忆配置** | **`config/types.rs`** | **396** | **MemoriesConfig 定义** |
-| **use_memories 使用** | **`codex.rs`** | **2989** | **记忆提示注入控制** |
-| **Phase 2 执行** | **`memories/phase2.rs`** | **43** | **记忆合并主流程** |
-| **差异选择** | **`state/src/runtime/memories.rs`** | **312** | **Phase2InputSelection 查询** |
-| **差异数据结构** | **`state/src/model/memories.rs`** | **32** | **Phase2InputSelection 定义** |
-| **合并提示词** | **`templates/memories/consolidation.md`** | **124** | **遗忘指令模板** |
-| **差异渲染** | **`memories/prompts.rs`** | **56** | **render_phase2_input_selection** |
+| 记忆配置 | `config/types.rs` | 396 | MemoriesConfig 定义 |
+| use_memories 使用 | `codex.rs` | 2989 | 记忆提示注入控制 |
+| Phase 2 执行 | `memories/phase2.rs` | 43 | 记忆合并主流程 |
+| 差异选择 | `state/src/runtime/memories.rs` | 312 | Phase2InputSelection 查询 |
+| 差异数据结构 | `state/src/model/memories.rs` | 32 | Phase2InputSelection 定义 |
+| 合并提示词 | `templates/memories/consolidation.md` | 124 | 遗忘指令模板 |
+| 差异渲染 | `memories/prompts.rs` | 56 | render_phase2_input_selection |
 
 ---
 
@@ -870,8 +955,10 @@ impl TruncationPolicy {
 - 前置知识：`04-codex-agent-loop.md`
 - 相关机制：`05-codex-tools-system.md`（工具输出也进入历史）
 - 深度分析：`docs/codex/questions/codex-context-compaction.md`
+- 跨项目对比：`docs/comm/comm-memory-context.md` ⚠️ 待创建
 
 ---
 
 *✅ Verified: 基于 codex/codex-rs/core/src/context_manager/ 和 memories/ 源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-03-02（新增 use_memories 配置和记忆遗忘机制）*
+*⚠️ Inferred: 部分 Agent Loop 调用关系基于代码结构推断*
+*基于版本：2026-02-08 | 最后更新：2026-03-03（优化文档结构以符合模板标准）*

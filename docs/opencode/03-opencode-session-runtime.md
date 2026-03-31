@@ -1,10 +1,31 @@
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-30 分钟 |
+> | 前置文档 | `01-opencode-overview.md`、`02-opencode-session-management.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 # OpenCode Session Runtime
 
 ## TL;DR（结论先行）
 
 一句话定义：Session Runtime 是 OpenCode 的核心运行时引擎，负责管理会话生命周期、协调 LLM 调用、处理工具执行和上下文压缩。
 
-OpenCode 的核心取舍：**基于事件总线的模块化架构 + 显式状态机管理**（对比 Gemini CLI 的递归 continuation、Kimi CLI 的 Checkpoint 回滚）
+OpenCode 的核心取舍：**基于事件总线的模块化架构 + 显式状态机管理**（对比 Gemini CLI 的递归 continuation、Kimi CLI 的 Checkpoint 回滚、Codex 的 Actor 消息驱动）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 架构模式 | 模块化 Namespace + 事件总线（Bus） | `packages/opencode/src/session/processor.ts:19` |
+| 状态管理 | 显式状态机（idle/busy/retry） | `packages/opencode/src/session/status.ts:6-76` |
+| 流处理 | 拉模式（for await...of）消费 AI SDK 流 | `packages/opencode/src/session/processor.ts:55-120` |
+| 错误恢复 | 指数退避重试 + Doom Loop 检测 | `packages/opencode/src/session/processor.ts:20` |
+| 上下文压缩 | 自动检测 + 手动触发，保留 40K Token | `packages/opencode/src/session/compaction.ts:30` |
 
 ---
 
@@ -258,7 +279,7 @@ flowchart TD
 | 接口 | 输入 | 输出 | 说明 | 代码位置 |
 |-----|------|------|------|---------|
 | `create()` | assistantMessage, sessionID, model, abort | Processor 实例 | 创建处理器 | `processor.ts:26` |
-| `process()` | StreamInput | "continue" | "stop" | "compact" | 核心处理方法 | `processor.ts:45` |
+| `process()` | StreamInput | "continue" \| "stop" \| "compact" | 核心处理方法 | `processor.ts:45` |
 | `partFromToolCall()` | toolCallID | ToolPart | 查找工具调用对应的 part | `processor.ts:42` |
 
 ---
@@ -697,13 +718,13 @@ SessionPrompt.prompt()     [packages/opencode/src/session/prompt.ts:1]
 
 **OpenCode 的解决方案**：
 
-- 代码依据：`packages/opencode/src/session/processor.ts:19`
-- 设计意图：通过模块化和事件驱动，实现关注点分离
-- 带来的好处：
+- **代码依据**：`packages/opencode/src/session/processor.ts:19` ✅ Verified
+- **设计意图**：通过模块化和事件驱动，实现关注点分离
+- **带来的好处**：
   - 每个模块职责单一，易于测试和维护
   - 事件总线解耦组件，支持插件扩展
   - 显式状态机便于调试和监控
-- 付出的代价：
+- **付出的代价**：
   - 调用链较长，需要理解整体架构
   - 事件顺序依赖，需要小心处理竞态条件
 
@@ -735,6 +756,17 @@ gitGraph
 | Kimi CLI | Checkpoint 文件回滚 + D-Mail 机制 | 需要对话状态回滚的场景 |
 | Gemini CLI | 递归 continuation + 分层内存 | 复杂多步骤任务，需要精细控制 |
 | Codex | Rust Actor 模型 + 原生沙箱 | 企业级安全要求高的场景 |
+
+**详细对比维度**：
+
+| 维度 | OpenCode | Kimi CLI | Gemini CLI | Codex |
+|-----|----------|----------|------------|-------|
+| 架构模式 | 模块化 + 事件总线 | 面向对象类 | 递归 continuation | Actor 模型 |
+| 状态管理 | 显式状态机 | Checkpoint 文件 | 递归状态 | 监督者模式 |
+| 流处理 | for await...of | 自定义 SSE | 自定义流 | 消息传递 |
+| 错误恢复 | 指数退避重试 | 完整回滚 | 递归重试 | 监督者重启 |
+| 扩展性 | 事件总线插件 | 装饰器扩展 | 配置扩展 | 协议扩展 |
+| 调试难度 | 中等 | 低 | 高 | 中等 |
 
 **关键差异分析**：
 
@@ -808,4 +840,4 @@ const PRUNE_PROTECT = 40_000      // 剪枝保护 Token 数
 ---
 
 *✅ Verified: 基于 opencode/packages/opencode/src/session/*.ts 源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

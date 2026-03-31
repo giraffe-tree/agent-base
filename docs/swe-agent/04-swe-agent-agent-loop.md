@@ -1,10 +1,31 @@
 # Agent Loop（SWE-agent）
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `docs/swe-agent/01-swe-agent-overview.md`、`docs/swe-agent/03-swe-agent-session-runtime.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Agent Loop 是 Code Agent 的控制核心，让 LLM 从"一次性回答"变成"多轮执行"。
 
 SWE-agent 的核心取舍：**双层循环 + 错误重采样 + attempt 级重试**（对比 Kimi CLI 的单层 while 循环、Gemini CLI 的递归 continuation、Codex 的 Actor 消息驱动）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 循环结构 | 双层循环（外层 attempt + 内层 step） | `sweagent/agent/agents.py:257,400` |
+| 错误恢复 | forward_with_handling 重采样机制 | `sweagent/agent/agents.py:700` |
+| 重试策略 | attempt 级重试 + 结果选优 | `sweagent/agent/agents.py:257` |
+| 环境重置 | hard_reset() 完全重置 | `sweagent/environment/swe_env.py` |
+| 提交机制 | submit 命令显式检测 | `sweagent/agent/agents.py` |
 
 ---
 
@@ -17,6 +38,7 @@ Code Agent 需要处理复杂的软件工程任务，面临以下挑战：
 - 工具执行失败（命令语法错误、被拦截）
 - 单次尝试无法完成任务（需要多次尝试）
 - 环境状态污染（失败后需要重置）
+- 结果质量不确定（无法保证最优输出）
 
 没有完善的 Loop 机制：
 - 一次格式错误导致整个任务失败
@@ -265,9 +287,9 @@ stateDiagram-v2
 #### 关键算法逻辑
 
 ```python
-# sweagent/agent/agents.py:700-750 (简化)
+# sweagent/agent/agents.py:700-750
 def forward_with_handling(self, messages: list[dict]) -> StepOutput:
-    """模型调用 + 错误重采样"""
+    """模型调用 + 错误重采样：在 max_requeries 范围内自动恢复"""
     for attempt in range(self.config.max_requeries):
         try:
             # 1. 调用模型
@@ -286,7 +308,7 @@ def forward_with_handling(self, messages: list[dict]) -> StepOutput:
 
         except BlockedActionError as e:
             # 5. 被拦截动作：requery
-            messages = self._add_blocked_template(messages, e)
+            messages = self._add_error_template(messages, e)
             continue
 
         except ContextWindowExceededError:
@@ -334,6 +356,16 @@ stateDiagram-v2
 
     Choose --> [*]: 返回最优结果
 ```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Init | 初始化 | RetryAgent.run() 被调用 | 开始第 1 次 attempt |
+| AttemptN | 第 N 次尝试 | 初始化完成或前一次结束 | 完成或失败 |
+| SubmittedN | 第 N 次提交 | 检测到 submit | retry() 决策 |
+| FailedN | 第 N 次失败 | 发生错误 | retry() 决策 |
+| Choose | 选优 | 达到最大尝试次数或不再重试 | 返回最优结果 |
 
 ---
 
@@ -573,10 +605,40 @@ class AgentInfo(BaseModel):
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```python
-# sweagent/agent/agents.py:400-434 (简化)
+# sweagent/agent/agents.py:400-434
 def run(self, env: SWEEnv, problem_statement: ProblemStatement, output_dir: Path) -> AgentRunResult:
-    """主循环入口"""
+    """主循环入口：简洁的 while 循环驱动多轮执行"""
+    # 1. 初始化 Session
+    self.setup(env, problem_statement, output_dir)
+    self._chook.on_run_start()
+
+    # 2. 核心 Agent Loop
+    step_output = None
+    while not step_output or not step_output.done:
+        step_output = self.step()           # 执行单步
+        self.save_trajectory()              # 每步持久化
+
+    # 3. 完成处理
+    self._chook.on_run_done(trajectory=self.trajectory, info=self.info)
+    return AgentRunResult(info=self.info, trajectory=self.trajectory)
+```
+
+**设计意图**：
+1. **简洁的主循环**：setup -> while not done -> step -> save
+2. **Hook 系统**：在关键节点触发回调
+3. **即时持久化**：每步保存 trajectory
+4. **结果封装**：返回完整的 AgentRunResult
+
+<details>
+<summary>查看完整实现（含异常处理、日志等）</summary>
+
+```python
+# sweagent/agent/agents.py:400-434
+def run(self, env: SWEEnv, problem_statement: ProblemStatement, output_dir: Path) -> AgentRunResult:
+    """Run the agent on a problem statement"""
     self.setup(env, problem_statement, output_dir)
     self._chook.on_run_start()
 
@@ -589,11 +651,7 @@ def run(self, env: SWEEnv, problem_statement: ProblemStatement, output_dir: Path
     return AgentRunResult(info=self.info, trajectory=self.trajectory)
 ```
 
-**代码要点**：
-1. **简洁的主循环**：setup -> while not done -> step -> save
-2. **Hook 系统**：在关键节点触发回调
-3. **即时持久化**：每步保存 trajectory
-4. **结果封装**：返回完整的 AgentRunResult
+</details>
 
 ### 5.3 关键调用链
 
@@ -670,6 +728,10 @@ gitGraph
     branch "Gemini CLI"
     checkout "Gemini CLI"
     commit id: "递归continuation"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "resetTimeoutOnProgress"
 ```
 
 | 项目 | 核心差异 | 适用场景 |
@@ -744,10 +806,10 @@ class ModelConfig:
 ## 9. 延伸阅读
 
 - 前置知识：`docs/swe-agent/01-swe-agent-overview.md`、`docs/swe-agent/02-swe-agent-cli-entry.md`
-- 相关机制：`docs/swe-agent/05-swe-agent-tools-system.md`、`docs/swe-agent/02-swe-agent-session-management.md`
+- 相关机制：`docs/swe-agent/05-swe-agent-tools-system.md`、`docs/swe-agent/03-swe-agent-session-runtime.md`
 - 深度分析：`docs/swe-agent/questions/swe-agent-error-handling.md`
 
 ---
 
 *✅ Verified: 基于 sweagent/agent/agents.py 源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-25*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

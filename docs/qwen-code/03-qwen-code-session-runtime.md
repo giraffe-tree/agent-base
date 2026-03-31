@@ -1,10 +1,32 @@
 # Session 运行时（Qwen Code）
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `01-qwen-code-overview.md`、`02-qwen-code-cli-entry.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Session 运行时是 Code Agent 的上下文持久化层，负责对话历史的存储、恢复和压缩管理。
 
 Qwen Code 的核心取舍：**JSONL 文件 + UUID 消息树 + 项目隔离**（对比 Gemini CLI 的分层记忆、Kimi CLI 的 Checkpoint 回滚、Codex 的惰性压缩）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 存储格式 | JSON Lines (JSONL) | `packages/core/src/services/sessionService.ts:128` |
+| 消息结构 | 树形 (uuid/parentUuid) | `packages/core/src/services/chatRecordingService.ts:40` |
+| 持久化策略 | 即时同步写入 | `packages/core/src/services/chatRecordingService.ts:265` |
+| 项目隔离 | projectHash 目录隔离 | `packages/core/src/services/sessionService.ts:128` |
+| 压缩策略 | 检查点快照 | `packages/core/src/services/chatCompressionService.ts:78` |
+| 分页机制 | 游标分页 (mtime) | `packages/core/src/services/sessionService.ts:216` |
 
 ---
 
@@ -428,7 +450,7 @@ sequenceDiagram
 
 ---
 
-### 3.4 关键数据路径
+### 3.5 关键数据路径
 
 #### 主路径（正常流程）
 
@@ -885,4 +907,4 @@ const SESSION_FILE_PATTERN = /^[0-9a-fA-F-]{32,36}\.jsonl$/;
 ---
 
 *✅ Verified: 基于 qwen-code/packages/core/src/services/sessionService.ts、chatRecordingService.ts、core/client.ts 源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

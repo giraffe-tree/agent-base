@@ -1,11 +1,32 @@
 # kimi-cli 概述
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `00-kimi-cli-onboarding.md`（推荐） |
+> | 文档结构 | 速览 → 架构 → 组件 → 数据流 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：kimi-cli 是 Moonshot AI 推出的 Python CLI Agent，采用分层架构设计，支持多模态交互、MCP 扩展和状态回滚。
 
 Kimi CLI 的核心取舍：**命令式 while 循环 + Checkpoint 文件回滚 + D-Mail 跨代理通信**
 （对比 Gemini CLI 的递归 continuation、Codex 的 Actor 消息驱动、OpenCode 的 Promise 链）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 架构分层 | CLI → Soul → Tools → Context 四层架构 | `kimi-cli/src/kimi_cli/cli/__init__.py:54` |
+| Agent Loop | while 迭代 + 异常驱动回滚 | `kimi-cli/src/kimi_cli/soul/kimisoul.py:302` |
+| 状态持久化 | JSONL 文件 + Checkpoint 机制 | `kimi-cli/src/kimi_cli/soul/context.py:16` |
+| 工具系统 | 内置工具 + fastmcp 客户端 | `kimi-cli/src/kimi_cli/soul/toolset.py:71` |
+| 多代理通信 | D-Mail 时间旅行消息系统 | `kimi-cli/src/kimi_cli/soul/denwarenji.py:16` |
 
 ---
 

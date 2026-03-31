@@ -1,10 +1,31 @@
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-30 分钟 |
+> | 前置文档 | `01-opencode-overview.md`、`03-opencode-session-runtime.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 # Session 管理（OpenCode）
 
 ## TL;DR（结论先行）
 
 一句话定义：OpenCode 的 Session 管理是**"基于 SQLite 的多层状态管理单元"**，使用消息-部件分离架构存储对话，支持 fork/revert 操作，内置 compaction 管理上下文窗口。
 
-OpenCode 的核心取舍：**SQLite 关系型存储 + 消息-部件分离架构**（对比 Kimi CLI 的 Checkpoint 文件回滚、Gemini CLI 的内存状态管理）
+OpenCode 的核心取舍：**SQLite 关系型存储 + 消息-部件分离架构**（对比 Kimi CLI 的 Checkpoint 文件回滚、Gemini CLI 的内存状态管理、Codex 的 Actor 状态管理）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 存储方案 | SQLite 关系型存储，Drizzle ORM 管理 | `packages/opencode/src/session/session.sql.ts:11-62` |
+| 消息架构 | Message + Part 分离，支持富媒体和细粒度更新 | `packages/opencode/src/session/message-v2.ts:19-180` |
+| ID 生成 | 降序时间戳，天然时间排序 | `packages/opencode/src/session/index.ts:287-326` |
+| 状态管理 | 显式状态机（idle/busy/retry）+ 事件驱动 | `packages/opencode/src/session/status.ts:6-76` |
+| 分支支持 | Fork 操作，级联复制消息和 Parts | `packages/opencode/src/session/index.ts:230-270` |
 
 ---
 
@@ -751,7 +772,7 @@ Session.loop()                  [prompt.ts:274]
 
 **OpenCode 的解决方案**：
 
-- **代码依据**：`packages/opencode/src/session/session.sql.ts:11-35`
+- **代码依据**：`packages/opencode/src/session/session.sql.ts:11-35` ✅ Verified
 - **设计意图**：使用关系型数据库的外键和事务保证 Session-Message-Part 三层数据的一致性
 - **带来的好处**：
   - 支持 Fork 时的级联复制
@@ -799,6 +820,8 @@ gitGraph
 | Compaction | 自动 + 手动 | 手动 | 自动 | 手动 |
 | 消息结构 | Message + Part | 单一消息 | 单一消息 | 单一消息 |
 | 状态恢复 | 从数据库加载 | Checkpoint 回滚 | 重新初始化 | 重新连接 |
+| Revert 支持 | 是 | 是（D-Mail） | 否 | 否 |
+| 分支粒度 | 消息级 | 对话级 | 不支持 | 不支持 |
 
 ---
 
@@ -877,4 +900,4 @@ export async function isOverflow(input: { tokens: MessageV2.Assistant["tokens"];
 ---
 
 *✅ Verified: 基于 opencode/packages/opencode/src/session/*.ts 源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

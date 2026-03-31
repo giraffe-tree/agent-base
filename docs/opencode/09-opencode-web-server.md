@@ -1,10 +1,31 @@
 # Web Server（opencode）
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-35 分钟 |
+> | 前置文档 | `01-opencode-overview.md`、`04-opencode-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：OpenCode Web Server 是一个**基于 Hono 框架和 Bun 运行时的全功能服务器**，支持**HTTP REST API**、**WebSocket PTY**、**SSE 事件流**和**MCP 协议**的多协议统一架构。
 
 OpenCode 的核心取舍：**Hono + Bun 原生运行时**（对比其他项目的 Node.js + Express/Fastify）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| Web 框架 | Hono 轻量级路由 | `src/server/server.ts:57` |
+| 运行时 | Bun 原生高性能 | `src/server/server.ts:576-622` |
+| 协议支持 | HTTP + WebSocket + SSE + MCP | `src/server/routes/*.ts` |
+| 事件系统 | 自定义 Bus + GlobalBus | `src/bus/index.ts:7-105` |
+| PTY 实现 | bun-pty 原生支持 | `src/pty/index.ts:12-390` |
 
 ---
 
@@ -843,6 +864,10 @@ gitGraph
     branch "Gemini CLI"
     checkout "Gemini CLI"
     commit id: "Node + Express"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "Python + FastAPI"
 ```
 
 | 项目 | 核心差异 | 适用场景 |
@@ -938,4 +963,4 @@ idleTimeout: 0  // 禁用连接超时
 ---
 
 *✅ Verified: 基于 opencode/packages/opencode/src/server/server.ts:57-622 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

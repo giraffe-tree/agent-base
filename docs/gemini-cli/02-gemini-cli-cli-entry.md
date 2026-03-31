@@ -1,13 +1,31 @@
 # CLI Entry（gemini-cli）
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | `01-gemini-cli-overview.md` |
+> | 文档结构 | TL;DR → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Gemini CLI Entry 是 `gemini` 命令的总入口与分发层，采用「**yargs Command Module + 双模式架构**」设计，支持交互式 TUI（React/Ink）和非交互式 CLI 两种运行模式。
 
-核心取舍：
-- **命令系统**：使用 yargs 的 Command Module 模式组织子命令（对比 Kimi CLI 的 Typer、Codex 的 clap）
-- **延迟执行**：通过 `defer()` 包装器统一前置检查（admin 设置验证）
-- **双模式分离**：显式区分交互模式（TUI）和非交互模式（直接执行）
+gemini-cli 的核心取舍：**延迟执行包装器 + 显式模式检测**（对比 Kimi CLI 的 Typer callback、Codex 的 clap 子命令枚举）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| CLI 框架 | yargs Command Module | `packages/cli/src/gemini.tsx:45` |
+| 模式检测 | `--prompt` / 管道输入检测 | `packages/cli/src/gemini.tsx:93` |
+| 前置检查 | `defer()` 高阶函数包装 | `packages/cli/src/deferred.ts:15` |
+| TUI 实现 | React/Ink 组件化渲染 | `packages/cli/src/gemini.tsx:156` |
+| 异常处理 | 全局 `uncaughtException` | `packages/cli/index.ts:12` |
 
 ---
 
@@ -147,6 +165,35 @@ sequenceDiagram
 #### 职责定位
 
 入口文件负责全局异常处理和进程生命周期管理，将具体业务逻辑委托给 `gemini.tsx` 的 `main()` 函数。
+
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Initializing: 进程启动
+    Initializing --> Running: 注册异常处理
+    Running --> Running: 调用 main()
+
+    Running --> ErrorHandling: 发生异常
+    ErrorHandling --> FatalExit: FatalError
+    ErrorHandling --> Continue: Windows node-pty 已知问题
+    ErrorHandling --> NormalExit: 其他错误
+
+    Running --> NormalExit: main() 正常返回
+    Continue --> Running: 继续执行
+    FatalExit --> [*]: process.exit(code)
+    NormalExit --> [*]: process.exit(0/1)
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Initializing | 初始化中 | 进程启动 | 异常处理注册完成 |
+| Running | 正常运行 | main() 被调用 | 正常返回或异常 |
+| ErrorHandling | 错误处理 | 发生未捕获异常 | 根据错误类型决定 |
+| FatalExit | 致命退出 | FatalError | 进程终止 |
+| NormalExit | 正常退出 | main() 完成 | 进程终止 |
 
 #### 全局异常处理流程
 
@@ -442,13 +489,29 @@ sequenceDiagram
     Entry-->>User: 输出结果
 ```
 
-### 4.4 异常分支
+### 4.4 异常/边界流程
 
-```text
-参数解析失败 (yargs) -> 显示帮助信息并退出
-配置加载失败 -> 输出配置错误并退出
-admin 检查失败 -> 显示权限错误并退出
-未捕获异常 -> 格式化错误输出并退出
+```mermaid
+flowchart TD
+    A[开始] --> B{参数解析}
+    B -->|失败| C[显示帮助并退出]
+    B -->|成功| D{配置加载}
+    D -->|失败| E[输出配置错误并退出]
+    D -->|成功| F{admin 检查}
+    F -->|失败| G[显示权限错误并退出]
+    F -->|通过| H[执行命令]
+    H --> I{是否异常}
+    I -->|是| J[异常处理]
+    I -->|否| K[正常退出]
+    J --> L{错误类型}
+    L -->|Fatal| M[特定 exitCode 退出]
+    L -->|其他| N[打印堆栈并退出]
+
+    style C fill:#FF6B6B
+    style E fill:#FF6B6B
+    style G fill:#FF6B6B
+    style M fill:#FF6B6B
+    style N fill:#FF6B6B
 ```
 
 ---
@@ -560,16 +623,36 @@ main()                          [packages/cli/index.ts:12]
 
 ### 6.3 与其他项目的对比
 
+```mermaid
+gitGraph
+    commit id: "传统方案"
+    branch "gemini-cli"
+    checkout "gemini-cli"
+    commit id: "yargs+defer"
+    checkout main
+    branch "kimi-cli"
+    checkout "kimi-cli"
+    commit id: "Typer+callback"
+    checkout main
+    branch "codex"
+    checkout "codex"
+    commit id: "clap+match"
+```
+
 | 项目 | CLI 框架 | 命令组织 | 前置检查 | 适用场景 |
 |-----|---------|---------|---------|---------|
 | **Gemini CLI** | yargs | Command Module + defer() | 高阶函数包装 | Node.js 生态，React TUI |
 | **Kimi CLI** | Typer | Typer 子命令组 | callback 参数验证 | Python 类型安全 |
 | **Codex** | clap | 子命令枚举显式分发 | 顶层 match 分发 | Rust 性能与安全 |
+| **OpenCode** | commander | 子命令注册 | 中间件 | TypeScript 生态 |
+| **SWE-agent** | argparse | 子命令解析器 | 直接验证 | Python 简单场景 |
 
 **关键差异**：
 - **Gemini CLI** 使用 yargs 的 Command Module 模式，通过 `defer()` 实现统一前置检查
 - **Kimi CLI** 使用 Typer 的类型安全参数解析，通过 `callback` 实现主命令逻辑
 - **Codex** 使用 Rust 的 clap，通过显式的 `match` 分发子命令，编译期检查更严格
+- **OpenCode** 使用 commander，通过中间件实现前置处理
+- **SWE-agent** 使用 argparse，简单直接但功能有限
 
 ---
 
@@ -628,6 +711,7 @@ process.on('uncaughtException', (error) => {
 ## 9. 延伸阅读
 
 - 概览：`01-gemini-cli-overview.md`
+- Session Runtime: `03-gemini-cli-session-runtime.md`
 - Agent Loop：`04-gemini-cli-agent-loop.md`
 - MCP Integration：`06-gemini-cli-mcp-integration.md`
 - 对比参考：
@@ -637,4 +721,4 @@ process.on('uncaughtException', (error) => {
 ---
 
 *✅ Verified: 基于 gemini-cli/packages/cli 源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

@@ -1,10 +1,31 @@
 # Kimi CLI Tool Call 并发机制
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `docs/kimi-cli/04-kimi-cli-agent-loop.md`、`docs/kimi-cli/06-kimi-cli-mcp-integration.md` |
+> | 文档结构 | 速览 → 架构 → 组件分析 → 数据流转 → 实现细节 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
-**Kimi CLI 采用"并发派发 + 顺序收集"的并发策略**，通过 `asyncio.create_task` 实现多工具并行执行，同时保证结果按请求顺序返回给 LLM。
+一句话定义：Kimi CLI 采用**"并发派发 + 顺序收集"**的并发策略，通过 `asyncio.create_task` 实现多工具并行执行，同时保证结果按请求顺序返回给 LLM。
 
 Kimi CLI 的核心取舍：**执行并发 + 结果顺序化回收**（对比 Gemini CLI 的串行执行、Codex 的读写锁控制并发、SWE-agent 的单调用限制）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 并发派发 | `asyncio.create_task` 创建并发任务 | `kimi-cli/packages/kosong/src/kosong/tooling/simple.py:133` |
+| 结果收集 | 按 `tool_calls` 顺序 `await` 收集 | `kimi-cli/packages/kosong/src/kosong/__init__.py:200-216` |
+| 错误隔离 | 单个工具失败不影响其他工具执行 | `kimi-cli/packages/kosong/src/kosong/tooling/simple.py:130-131` |
+| 取消清理 | `finally` 块取消所有 futures 防悬挂 | `kimi-cli/packages/kosong/src/kosong/__init__.py:212-216` |
+| 统一封装 | `ToolResult` 统一封装成功/失败结果 | `kimi-cli/packages/kosong/src/kosong/tooling/__init__.py:112` |
 
 ---
 
@@ -218,6 +239,32 @@ flowchart TD
 #### 职责定位
 
 kosong.step() 是 LLM 调用与工具执行的协调层，负责流式接收 LLM 响应、并发派发工具调用、并最终聚合结果。
+
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Initializing: 调用 step()
+    Initializing --> Streaming: 发起 generate()
+    Streaming --> Processing: 收到 tool_call
+    Processing --> Streaming: 创建 Task 后继续流式接收
+    Streaming --> Collecting: 流结束
+    Collecting --> Completed: 收集所有结果
+    Collecting --> Cancelled: 发生异常/取消
+    Completed --> [*]: 返回 StepResult
+    Cancelled --> [*]: 取消所有 futures
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Initializing | 初始化 | step() 被调用 | 发起 generate |
+| Streaming | 流式接收 | generate 开始 | 收到 tool_call 或流结束 |
+| Processing | 处理工具调用 | 收到 tool_call | Task 创建完成 |
+| Collecting | 收集结果 | 流结束 | 所有结果收集完成 |
+| Completed | 完成 | 结果收集完成 | 返回 StepResult |
+| Cancelled | 取消 | 发生异常 | 清理资源 |
 
 #### 内部数据流
 
@@ -542,6 +589,8 @@ class StepResult:
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```python
 # kimi-cli/packages/kosong/src/kosong/tooling/simple.py:112-133
 async def handle(self, tool_call: ToolCall) -> HandleResult:
@@ -568,6 +617,11 @@ async def handle(self, tool_call: ToolCall) -> HandleResult:
     return asyncio.create_task(_call())
 ```
 
+**设计意图**：
+1. **并发派发**：`asyncio.create_task(_call())` 立即返回不阻塞，实现并发执行
+2. **分层错误处理**：路由错误、解析错误、运行时错误分别处理
+3. **统一返回类型**：无论成功失败都返回 `ToolResult`
+
 ```python
 # kimi-cli/packages/kosong/src/kosong/__init__.py:144-155
 async def on_tool_call(tool_call: ToolCall):
@@ -584,6 +638,10 @@ async def on_tool_call(tool_call: ToolCall):
         tool_result_futures[tool_call.id] = result
 ```
 
+**设计意图**：
+1. **统一接口**：无论同步还是异步结果，都统一存储为 future
+2. **回调注册**：添加 done_callback 用于追踪任务完成状态
+
 ```python
 # kimi-cli/src/kimi_cli/soul/kimisoul.py:406-420
 result = await _kosong_step_with_retry()
@@ -597,12 +655,77 @@ logger.debug("Got tool results: {results}")
 await asyncio.shield(self._grow_context(result, results))
 ```
 
-**代码要点**：
+**设计意图**：
+1. **顺序收集**：`tool_results()` 按原始顺序 await 收集
+2. **异常保护**：`asyncio.shield` 保护上下文更新不被取消中断
 
-1. **并发派发**：`asyncio.create_task(_call())` 立即返回不阻塞，实现并发执行
-2. **统一接口**：无论同步还是异步工具，都返回统一的 `HandleResult` 类型（Task 或 ToolResult）
-3. **顺序收集**：`tool_results()` 按 `tool_calls` 顺序 await，保证结果顺序与请求顺序一致
-4. **异常清理**：`finally` 块中取消所有 futures，避免悬挂任务
+<details>
+<summary>查看完整实现</summary>
+
+```python
+# kimi-cli/packages/kosong/src/kosong/tooling/simple.py:112-145
+async def handle(self, tool_call: ToolCall) -> HandleResult:
+    """Handle a tool call by creating an async task for concurrent execution."""
+    if tool_call.function.name not in self._tool_dict:
+        return ToolResult(
+            tool_call_id=tool_call.id,
+            return_value=ToolNotFoundError(tool_call.function.name),
+        )
+
+    tool = self._tool_dict[tool_call.function.name]
+
+    try:
+        arguments: JsonType = json.loads(tool_call.function.arguments or "{}")
+    except json.JSONDecodeError as e:
+        return ToolResult(tool_call_id=tool_call.id, return_value=ToolParseError(str(e)))
+
+    async def _call():
+        try:
+            ret = await tool.call(arguments)
+            return ToolResult(tool_call_id=tool_call.id, return_value=ret)
+        except Exception as e:
+            return ToolResult(tool_call_id=tool_call.id, return_value=ToolRuntimeError(str(e)))
+
+    return asyncio.create_task(_call())
+```
+
+```python
+# kimi-cli/packages/kosong/src/kosong/__init__.py:104-216
+async def step(
+    chat_provider: ChatProvider,
+    system_prompt: str | None,
+    toolset: Toolset,
+    history: list[Message],
+) -> StepResult:
+    """Execute one step of the agent loop."""
+    tool_calls: list[ToolCall] = []
+    tool_result_futures: dict[str, ToolResultFuture] = {}
+
+    async def on_tool_call(tool_call: ToolCall):
+        tool_calls.append(tool_call)
+        result = toolset.handle(tool_call)
+
+        if isinstance(result, ToolResult):
+            future = ToolResultFuture()
+            future.add_done_callback(future_done_callback)
+            future.set_result(result)
+            tool_result_futures[tool_call.id] = future
+        else:
+            result.add_done_callback(future_done_callback)
+            tool_result_futures[tool_call.id] = result
+
+    # ... generate() 调用和流式处理 ...
+
+    return StepResult(
+        id=...,
+        message=...,
+        usage=...,
+        tool_calls=tool_calls,
+        _tool_result_futures=tool_result_futures,
+    )
+```
+
+</details>
 
 ### 5.3 关键调用链
 
@@ -653,53 +776,47 @@ KimiSoul._step()                    [kimisoul.py:382]
 ### 6.3 与其他项目的对比
 
 ```mermaid
-flowchart LR
-    subgraph Kimi["Kimi CLI"]
-        K1[并发派发] --> K2[顺序收集]
-        style K1 fill:#90EE90
-        style K2 fill:#90EE90
-    end
-
-    subgraph Gemini["Gemini CLI"]
-        G1[串行执行] --> G2[状态机管理]
-        style G1 fill:#FFB6C1
-        style G2 fill:#FFB6C1
-    end
-
-    subgraph Codex["Codex"]
-        C1[并发派发] --> C2[读写锁控制]
-        style C1 fill:#87CEEB
-        style C2 fill:#87CEEB
-    end
-
-    subgraph SWE["SWE-agent"]
-        S1[单调用限制] --> S2[强制串行]
-        style S1 fill:#FFD700
-        style S2 fill:#FFD700
-    end
-
-    subgraph OpenCode["OpenCode"]
-        O1[依赖 Provider] --> O2[batch 显式并发]
-        style O1 fill:#DDA0DD
-        style O2 fill:#DDA0DD
-    end
+gitGraph
+    commit id: "串行执行"
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "并发派发+顺序收集"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "串行+状态机"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "并发+读写锁"
+    checkout main
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "单调用限制"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "Provider依赖+batch"
 ```
 
-| 项目 | 并发策略 | 核心差异 | 适用场景 |
-|-----|---------|---------|---------|
-| **Kimi CLI** | 并发派发 + 顺序收集 | `asyncio.Task` 并发，按请求顺序收集结果 | Python 异步生态，I/O 密集型任务 |
-| **Gemini CLI** | 串行执行 + 状态机 | 单 active call，队列缓冲 | 需要严格顺序保证、资源安全 |
-| **Codex** | 并发 + 读写锁控制 | 根据工具是否支持并发决定读锁/写锁 | Rust 异步，需要细粒度并发控制 |
-| **SWE-agent** | 单调用限制 | 强制每次响应只能有一个 tool call | 简单可控，适合确定性调试 |
-| **OpenCode** | Provider 依赖 + batch 显式并发 | 常规调用依赖 AI SDK，batch 工具显式 Promise.all | TypeScript 生态，灵活可控 |
+| 项目 | 核心差异 | 适用场景 |
+|-----|---------|---------|
+| **Kimi CLI** | `asyncio.Task` 并发，按请求顺序收集结果 | Python 异步生态，I/O 密集型任务 |
+| **Gemini CLI** | 单 active call，队列缓冲 | 需要严格顺序保证、资源安全 |
+| **Codex** | 根据工具是否支持并发决定读锁/写锁 | Rust 异步，需要细粒度并发控制 |
+| **SWE-agent** | 强制每次响应只能有一个 tool call | 简单可控，适合确定性调试 |
+| **OpenCode** | 常规调用依赖 AI SDK，batch 工具显式 Promise.all | TypeScript 生态，灵活可控 |
 
-**对比分析**：
+**详细对比分析**：
 
-- **Kimi CLI 的并发策略**更适合 Python 异步生态，利用 `asyncio` 实现轻量级并发
-- **Gemini CLI 的串行策略**牺牲了性能换取确定性和简单性
-- **Codex 的读写锁策略**提供了更细粒度的并发控制，适合需要区分读写操作的场景
-- **SWE-agent 的单调用限制**最简单，适合需要严格顺序控制的调试场景
-- **OpenCode 的混合策略**依赖底层 SDK，同时提供显式并发工具
+| 对比维度 | Kimi CLI | Gemini CLI | Codex | SWE-agent | OpenCode |
+|---------|----------|------------|-------|-----------|----------|
+| **并发策略** | 并发派发 + 顺序收集 | 串行执行 | 并发 + 读写锁 | 单调用限制 | Provider 依赖 + batch |
+| **实现机制** | asyncio.Task | 状态机队列 | tokio::sync::RwLock | 强制限制 | AI SDK + Promise.all |
+| **结果顺序** | 按请求顺序 | 自然顺序 | 按请求顺序 | 单结果 | 按请求顺序 |
+| **错误隔离** | 单个失败不影响其他 | 串行失败中断 | 读写锁控制 | 单调用无并发 | 依赖 SDK |
+| **适用语言** | Python | TypeScript | Rust | Python | TypeScript |
+| **最佳场景** | I/O 密集型 | 资源安全优先 | 细粒度控制 | 简单调试 | 灵活可控 |
 
 ---
 
@@ -765,13 +882,11 @@ finally:
 
 - 前置知识：`docs/kimi-cli/04-kimi-cli-agent-loop.md` - Agent Loop 整体架构
 - 相关机制：`docs/kimi-cli/06-kimi-cli-mcp-integration.md` - MCP 工具集成
-- 对比分析：`docs/gemini-cli/questions/gemini-cli-tool-call-concurrency.md` - Gemini CLI 串行策略
-- 对比分析：`docs/codex/questions/codex-tool-call-concurrency.md` - Codex 读写锁策略
-- 对比分析：`docs/opencode/questions/opencode-tool-call-concurrency.md` - OpenCode 混合策略
-- 对比分析：`docs/swe-agent/questions/swe-agent-tool-call-concurrency.md` - SWE-agent 单调用限制
+- 深度分析：`docs/kimi-cli/questions/kimi-cli-tool-error-handling.md` - 工具错误处理机制
+- 跨项目对比：`docs/comm/comm-tool-call-concurrency.md` - 跨项目工具并发对比（如存在）
 
 ---
 
 *✅ Verified: 基于 kimi-cli/packages/kosong/src/kosong/__init__.py:104、kimi-cli/packages/kosong/src/kosong/tooling/simple.py:112、kimi-cli/src/kimi_cli/soul/kimisoul.py:382 等源码分析*
-*⚠️ Inferred: 部分设计意图基于代码结构推断*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+
+*基于版本：kimi-cli (baseline 2026-02-08) | 最后更新：2026-03-03*

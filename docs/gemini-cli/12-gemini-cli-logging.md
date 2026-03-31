@@ -1,10 +1,31 @@
-# Gemini CLI 日志记录机制
+# Logging（gemini-cli）
+
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置文档 | `01-gemini-cli-overview.md`、`02-gemini-cli-cli-entry.md`、`03-gemini-cli-session-runtime.md` |
+> | 文档结构 | TL;DR → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
 
 ## TL;DR（结论先行）
 
 一句话定义：Gemini CLI 采用**双模式日志设计**，A2A Server 使用 `winston` 生产级日志库，Core 包使用自定义 `DebugLogger`，配合 ESLint 强制规范和调试抽屉 UI，实现开发与生产环境的差异化日志策略。
 
 Gemini CLI 的核心取舍：**环境区分（服务端结构化 vs 客户端开发友好）**（对比 Codex 的企业级追踪、Kimi CLI 的库友好设计、OpenCode 的零依赖方案、SWE-agent 的标准库极简方案）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| A2A Server 日志 | winston 生产级结构化日志 | `packages/a2a-server/src/utils/logger.ts:1-28` |
+| Core 调试日志 | DebugLogger 自定义实现 | `packages/core/src/utils/debugLogger.ts:1-69` |
+| 开发规范 | ESLint no-console 强制 | `packages/core/.eslintrc.js` |
+| UI 集成 | ConsolePatcher 拦截到 Debug Drawer | UI 层实现 |
+| 文件输出 | GEMINI_DEBUG_LOG_FILE 环境变量控制 | `debugLogger.ts:202-206` |
 
 ---
 
@@ -84,7 +105,7 @@ Core 模式（开发调试）：
 |-----|------|---------|
 | `Winston Logger` | A2A Server 结构化日志 | `packages/a2a-server/src/utils/logger.ts:1-28` |
 | `DebugLogger` | Core 包调试日志 | `packages/core/src/utils/debugLogger.ts:1-69` |
-| `ConsolePatcher` | 拦截 console 输出到 UI | ⚠️ Inferred: UI 层实现 |
+| `ConsolePatcher` | 拦截 console 输出到 UI | UI 层实现 |
 | `ESLint no-console` | 强制规范，禁止直接使用 console | `packages/core/.eslintrc.js` |
 
 ### 2.3 核心组件交互关系
@@ -420,7 +441,7 @@ sequenceDiagram
 | 时间戳 | - | `toISOString()` | ISO 8601 时间 | `debugLogger.ts:217` |
 | 文件条目 | 时间戳 + 级别 + 消息 | 字符串拼接 | `[timestamp] [LEVEL] message\n` | `debugLogger.ts:218` |
 | 控制台 | 原始参数 | `console.log()` | 终端输出 | `debugLogger.ts:225` |
-| UI 展示 | 日志事件 | ConsolePatcher | Debug Drawer 渲染 | ⚠️ Inferred |
+| UI 展示 | 日志事件 | ConsolePatcher | Debug Drawer 渲染 | UI 层 |
 
 ### 4.2 数据流向图
 
@@ -570,7 +591,7 @@ class DebugLogger {
 }
 ```
 
-**代码要点**：
+**设计意图**：
 
 1. **双路输出设计**：文件写入 + 控制台输出，互不阻塞
 2. **环境驱动**：`GEMINI_DEBUG_LOG_FILE` 控制文件输出
@@ -614,8 +635,8 @@ debugLogger.log()          [packages/core/src/utils/debugLogger.ts:223]
     -> new Date().toISOString()
     -> logStream.write()   [fs.WriteStream]
   -> console.log()         [全局 console]
-    -> ConsolePatcher.emitToDrawer()  [⚠️ Inferred: UI 层]
-      -> DebugDrawer.render()         [⚠️ Inferred: UI 组件]
+    -> ConsolePatcher.emitToDrawer()  [UI 层]
+      -> DebugDrawer.render()         [UI 组件]
 ```
 
 ---
@@ -637,13 +658,13 @@ debugLogger.log()          [packages/core/src/utils/debugLogger.ts:223]
 **核心问题**：如何平衡服务端生产需求与客户端开发体验？
 
 **Gemini CLI 的解决方案**：
-- 代码依据：`packages/a2a-server/src/utils/logger.ts:138` 和 `packages/core/src/utils/debugLogger.ts:197`
-- 设计意图：环境区分，一套代码适配两种场景
-- 带来的好处：
+- **代码依据**：`packages/a2a-server/src/utils/logger.ts:138` 和 `packages/core/src/utils/debugLogger.ts:197`
+- **设计意图**：环境区分，一套代码适配两种场景
+- **带来的好处**：
   - 服务端：结构化、可分析
   - 客户端：实时、UI 集成
   - 强制规范：ESLint 确保一致性
-- 付出的代价：
+- **付出的代价**：
   - 两套日志代码需维护
   - 切换逻辑需正确配置
 
@@ -739,7 +760,7 @@ flowchart TD
 |---------|---------|---------|
 | 文件写入失败 | 捕获错误，继续控制台输出 | `debugLogger.ts:209-211` |
 | 文件流未初始化 | 跳过文件写入，仅控制台 | `debugLogger.ts:215` |
-| ConsolePatcher 失败 | 降级为仅终端输出 | ⚠️ Inferred |
+| ConsolePatcher 失败 | 降级为仅终端输出 | UI 层 |
 
 ---
 
@@ -764,6 +785,4 @@ flowchart TD
 
 ---
 
-*✅ Verified: 基于 gemini-cli/packages/{a2a-server,core}/src/utils/{logger,debugLogger}.ts 源码分析*
-*⚠️ Inferred: ConsolePatcher 和 Debug Drawer 的具体实现位于 UI 组件层，本分析未获取源码*
 *基于版本：2026-02-08 | 最后更新：2026-02-24*

@@ -1,10 +1,30 @@
 # Gemini CLI Plan and Execute 模式
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | `docs/gemini-cli/04-gemini-cli-agent-loop.md`、`docs/gemini-cli/10-gemini-cli-safety-control.md` |
+> | 文档结构 | TL;DR → 架构 → 核心组件 → 数据流转 → 代码实现 → 设计对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 **一句话定义**：Gemini CLI 实现了完整的 Plan and Execute 模式，通过 `ApprovalMode.PLAN` 实现安全的计划-执行分离，Plan 模式下只允许只读工具和在 `plans/` 目录下写入 `.md` 文件。
 
 **Gemini CLI 的核心取舍**：**策略驱动的显式模式切换**（对比其他项目的隐式或半自动计划模式），通过 TOML 配置文件定义权限规则，使用专用工具 `enter_plan_mode` 和 `exit_plan_mode` 进行显式状态转换。
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 模式定义 | 四种 ApprovalMode 枚举（DEFAULT/AUTO_EDIT/YOLO/PLAN） | `packages/core/src/policy/types.ts:1-10` |
+| 权限控制 | TOML 声明式策略配置 | `packages/core/src/policy/policies/plan.toml:1-20` |
+| 模式切换 | 显式工具调用（enter_plan_mode/exit_plan_mode） | `packages/core/src/tools/enter-plan-mode.ts:55` |
+| 计划验证 | 路径和内容双重验证 | `packages/core/src/utils/planUtils.ts:230-243` |
 
 ---
 
@@ -39,16 +59,16 @@
 ```text
 ┌─────────────────────────────────────────────────────────────┐
 │ CLI 入口 / Session Runtime                                   │
-│ gemini-cli/packages/cli/src/ui/commands/planCommand.ts      │
+│ packages/cli/src/ui/commands/planCommand.ts:253             │
 └───────────────────────┬─────────────────────────────────────┘
                         │ 调用
                         ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ ▓▓▓ Plan and Execute 模式 ▓▓▓                               │
-│ gemini-cli/packages/core/src/policy/policies/plan.toml      │
-│ - ApprovalMode.PLAN : 计划模式状态                           │
-│ - enter_plan_mode   : 进入计划模式工具                       │
-│ - exit_plan_mode    : 退出计划模式工具                       │
+│ packages/core/src/policy/policies/plan.toml                 │
+│ - ApprovalMode.PLAN : 计划模式状态                          │
+│ - enter_plan_mode   : 进入计划模式工具                      │
+│ - exit_plan_mode    : 退出计划模式工具                      │
 └───────────────────────┬─────────────────────────────────────┘
                         │ 依赖/调用
         ┌───────────────┼───────────────┐
@@ -56,6 +76,7 @@
 ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
 │ Config       │ │ Policy       │ │ UI Dialog    │
 │ 状态管理     │ │ Engine       │ │ 用户确认     │
+│ config.ts    │ │ engine.ts    │ │ ExitPlanModeDialog.tsx │
 └──────────────┘ └──────────────┘ └──────────────┘
 ```
 
@@ -63,11 +84,11 @@
 
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
-| `ApprovalMode` | 定义四种审批模式枚举 | `gemini-cli/packages/core/src/policy/types.ts` |
-| `EnterPlanModeTool` | 切换到 Plan Mode 的工具实现 | `gemini-cli/packages/core/src/tools/enter-plan-mode.ts:37` |
-| `ExitPlanModeInvocation` | 退出 Plan Mode 并选择执行模式 | `gemini-cli/packages/core/src/tools/exit-plan-mode.ts:110` |
-| `plan.toml` | Plan Mode 的安全策略配置 | `gemini-cli/packages/core/src/policy/policies/plan.toml` |
-| `planUtils` | 计划文件路径和内容验证 | `gemini-cli/packages/core/src/utils/planUtils.ts` |
+| `ApprovalMode` | 定义四种审批模式枚举 | `packages/core/src/policy/types.ts:1-10` |
+| `EnterPlanModeTool` | 切换到 Plan Mode 的工具实现 | `packages/core/src/tools/enter-plan-mode.ts:37` |
+| `ExitPlanModeInvocation` | 退出 Plan Mode 并选择执行模式 | `packages/core/src/tools/exit-plan-mode.ts:110` |
+| `plan.toml` | Plan Mode 的安全策略配置 | `packages/core/src/policy/policies/plan.toml` |
+| `planUtils` | 计划文件路径和内容验证 | `packages/core/src/utils/planUtils.ts:230-243` |
 
 ### 2.3 核心组件交互关系
 
@@ -114,16 +135,42 @@ sequenceDiagram
 
 ## 3. 核心组件详细分析
 
-### 3.1 ApprovalMode 枚举定义
+### 3.1 ApprovalMode 状态机
 
 #### 职责定位
 
 定义四种审批模式，作为整个安全策略系统的基础类型。
 
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> DEFAULT: 初始化
+    DEFAULT --> PLAN: enter_plan_mode
+    AUTO_EDIT --> PLAN: enter_plan_mode
+    YOLO --> PLAN: enter_plan_mode
+    PLAN --> DEFAULT: exit_plan_mode(选择 DEFAULT)
+    PLAN --> AUTO_EDIT: exit_plan_mode(选择 AUTO_EDIT)
+    PLAN --> YOLO: exit_plan_mode(选择 YOLO)
+    DEFAULT --> AUTO_EDIT: 用户切换
+    DEFAULT --> YOLO: 用户切换
+    AUTO_EDIT --> DEFAULT: 用户切换
+    YOLO --> DEFAULT: 用户切换
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| DEFAULT | 标准安全模式，需手动审批 | 初始化或从其他模式切换 | 调用 enter_plan_mode 或用户切换 |
+| AUTO_EDIT | 自动接受编辑操作 | 用户切换或 exit_plan_mode | 用户切换或调用 enter_plan_mode |
+| YOLO | 完全自动模式（高风险） | 用户切换 | 用户切换 |
+| PLAN | 计划模式，只读操作 | enter_plan_mode 调用 | exit_plan_mode 调用 |
+
 #### 关键接口
 
 ```typescript
-// gemini-cli/packages/core/src/policy/types.ts
+// packages/core/src/policy/types.ts:1-10
 export enum ApprovalMode {
   DEFAULT = 'default',    // 默认模式，需要手动审批编辑操作
   AUTO_EDIT = 'autoEdit', // 自动接受编辑操作
@@ -149,10 +196,34 @@ export enum ApprovalMode {
 
 通过声明式配置定义 Plan Mode 下的工具权限规则。
 
+#### 内部数据流
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  策略输入层                                                  │
+│  ├── TOML 配置文件 ──► 策略解析器 ──► 规则对象列表            │
+│  └── 模式标识 ──► ApprovalMode.PLAN ──► 策略筛选器           │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  策略匹配层                                                  │
+│  ├── 工具名称匹配 ──► 通配符/精确匹配                         │
+│  ├── 参数模式匹配 ──► 正则表达式验证                          │
+│  └── 优先级排序 ──► 高优先级规则覆盖低优先级                  │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  决策输出层                                                  │
+│  ├── allow ──► 允许执行                                      │
+│  ├── deny ──► 拒绝执行并返回错误信息                          │
+│  └── ask_user ──► 显示确认对话框                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
 #### 策略规则详解
 
 ```toml
-# gemini-cli/packages/core/src/policy/policies/plan.toml
+# packages/core/src/policy/policies/plan.toml
 
 # Catch-All: Deny everything by default in Plan mode.
 [[rule]]
@@ -202,8 +273,27 @@ argsPattern = """"file_path":"[^"]+/\.gemini/tmp/[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+/p
 
 #### 关键算法逻辑
 
+```mermaid
+flowchart TD
+    A[execute 调用] --> B{用户确认?}
+    B -->|取消| C[返回取消结果]
+    B -->|确认| D[调用 config.setApprovalMode]
+    D --> E[设置 ApprovalMode.PLAN]
+    E --> F[返回切换成功]
+    C --> G[结束]
+    F --> G
+```
+
+**算法要点**：
+
+1. **取消处理**：用户可以在确认对话框中取消切换
+2. **状态变更**：通过 `config.setApprovalMode()` 原子性切换模式
+3. **反馈信息**：返回切换原因（如果提供）
+
+#### 关键代码
+
 ```typescript
-// gemini-cli/packages/core/src/tools/enter-plan-mode.ts:55-71
+// packages/core/src/tools/enter-plan-mode.ts:55-71
 async execute(_signal: AbortSignal): Promise<ToolResult> {
   if (this.confirmationOutcome === ToolConfirmationOutcome.Cancel) {
     return {
@@ -223,12 +313,6 @@ async execute(_signal: AbortSignal): Promise<ToolResult> {
 }
 ```
 
-**算法要点**：
-
-1. **取消处理**：用户可以在确认对话框中取消切换
-2. **状态变更**：通过 `config.setApprovalMode()` 原子性切换模式
-3. **反馈信息**：返回切换原因（如果提供）
-
 ---
 
 ### 3.4 ExitPlanModeInvocation 实现
@@ -239,8 +323,36 @@ async execute(_signal: AbortSignal): Promise<ToolResult> {
 
 #### 关键算法逻辑
 
+```mermaid
+flowchart TD
+    A[execute 调用] --> B[validatePlanPath]
+    B --> C{路径有效?}
+    C -->|否| D[返回路径错误]
+    C -->|是| E[validatePlanContent]
+    E --> F{内容有效?}
+    F -->|否| G[返回内容错误]
+    F -->|是| H{用户已批准?}
+    H -->|否| I[返回等待批准]
+    H -->|是| J[获取用户选择的模式]
+    J --> K[设置新 ApprovalMode]
+    K --> L[保存计划路径]
+    L --> M[返回成功]
+    D --> N[结束]
+    G --> N
+    I --> N
+    M --> N
+```
+
+**算法要点**：
+
+1. **双层验证**：先验证路径安全，再验证内容非空
+2. **用户决策**：通过 `approvalPayload` 获取用户选择的执行模式
+3. **状态持久化**：保存批准的计划路径供后续执行参考
+
+#### 关键代码
+
 ```typescript
-// gemini-cli/packages/core/src/tools/exit-plan-mode.ts:114-141
+// packages/core/src/tools/exit-plan-mode.ts:114-141
 async execute(_signal: AbortSignal): Promise<ToolResult> {
   // 1. 验证计划文件路径
   const pathError = await validatePlanPath(planPath, plansDir, targetDir);
@@ -269,12 +381,6 @@ async execute(_signal: AbortSignal): Promise<ToolResult> {
   // ...
 }
 ```
-
-**算法要点**：
-
-1. **双层验证**：先验证路径安全，再验证内容非空
-2. **用户决策**：通过 `approvalPayload` 获取用户选择的执行模式
-3. **状态持久化**：保存批准的计划路径供后续执行参考
 
 ---
 
@@ -411,14 +517,14 @@ flowchart TD
 ### 5.1 核心数据结构
 
 ```typescript
-// gemini-cli/packages/core/src/tools/exit-plan-mode.ts:106-109
+// packages/core/src/tools/exit-plan-mode.ts:106-109
 export interface ExitPlanModeParams {
   plan_path: string;  // 计划文件路径
 }
 ```
 
 ```typescript
-// gemini-cli/packages/core/src/utils/planUtils.ts:220-228
+// packages/core/src/utils/planUtils.ts:220-228
 export const PlanErrorMessages = {
   PATH_ACCESS_DENIED:
     'Access denied: plan path must be within the designated plans directory.',
@@ -441,8 +547,10 @@ export const PlanErrorMessages = {
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```typescript
-// gemini-cli/packages/cli/src/ui/commands/planCommand.ts:253-270
+// packages/cli/src/ui/commands/planCommand.ts:253-270
 export const planCommand: SlashCommand = {
   name: 'plan',
   description: 'Switch to Plan Mode and view current plan',
@@ -463,31 +571,72 @@ export const planCommand: SlashCommand = {
 };
 ```
 
-**代码要点**：
+**设计意图**：
 
 1. **命令行入口**：用户可通过 `/plan` 命令手动切换
 2. **状态检查**：避免重复切换时的冗余提示
 3. **计划查看**：切换后显示已批准的计划（如果有）
 
+<details>
+<summary>查看完整实现（含验证逻辑）</summary>
+
+```typescript
+// packages/core/src/tools/exit-plan-mode.ts:114-170
+async execute(_signal: AbortSignal): Promise<ToolResult> {
+  // 1. 验证计划文件路径安全性
+  const pathError = await validatePlanPath(planPath, plansDir, targetDir);
+  if (pathError) {
+    return { llmContent: pathError, returnDisplay: pathError };
+  }
+
+  // 2. 验证计划文件内容非空
+  const contentError = await validatePlanContent(planPath);
+  if (contentError) {
+    return { llmContent: contentError, returnDisplay: contentError };
+  }
+
+  // 3. 处理用户批准和模式切换
+  const payload = this.approvalPayload;
+  if (payload?.approved) {
+    const newMode = payload.approvalMode ?? ApprovalMode.DEFAULT;
+    this.config.setApprovalMode(newMode);
+    this.config.setApprovedPlanPath(resolvedPlanPath);
+
+    return {
+      llmContent: `Plan approved. Switching to ${description}.\n\nThe approved implementation plan is stored at: ${resolvedPlanPath}`,
+      returnDisplay: `Plan approved: ${resolvedPlanPath}`,
+    };
+  }
+
+  // 用户未批准或需要反馈
+  return {
+    llmContent: 'Plan approval was cancelled or requires feedback.',
+    returnDisplay: 'Plan approval cancelled',
+  };
+}
+```
+
+</details>
+
 ### 5.3 关键调用链
 
 ```text
-planCommand.action()          [gemini-cli/packages/cli/src/ui/commands/planCommand.ts:258]
-  -> config.setApprovalMode(PLAN)   [gemini-cli/packages/core/src/config.ts]
+planCommand.action()          [packages/cli/src/ui/commands/planCommand.ts:258]
+  -> config.setApprovalMode(PLAN)   [packages/core/src/config.ts]
 
-EnterPlanModeTool.execute()   [gemini-cli/packages/core/src/tools/enter-plan-mode.ts:55]
-  -> config.setApprovalMode(PLAN)   [gemini-cli/packages/core/src/config.ts]
+EnterPlanModeTool.execute()   [packages/core/src/tools/enter-plan-mode.ts:55]
+  -> config.setApprovalMode(PLAN)   [packages/core/src/config.ts]
     - 切换到 Plan Mode
     - 后续工具调用受 plan.toml 规则约束
 
-ExitPlanModeInvocation.execute()  [gemini-cli/packages/core/src/tools/exit-plan-mode.ts:114]
-  -> validatePlanPath()         [gemini-cli/packages/core/src/utils/planUtils.ts:230]
+ExitPlanModeInvocation.execute()  [packages/core/src/tools/exit-plan-mode.ts:114]
+  -> validatePlanPath()         [packages/core/src/utils/planUtils.ts:230]
     - 验证路径在 plans/ 目录内
-  -> validatePlanContent()      [gemini-cli/packages/core/src/utils/planUtils.ts:239]
+  -> validatePlanContent()      [packages/core/src/utils/planUtils.ts:239]
     - 验证文件内容非空
-  -> config.setApprovalMode(newMode)  [gemini-cli/packages/core/src/config.ts]
+  -> config.setApprovalMode(newMode)  [packages/core/src/config.ts]
     - 切换到用户选择的执行模式
-  -> config.setApprovedPlanPath(path) [gemini-cli/packages/core/src/config.ts]
+  -> config.setApprovedPlanPath(path) [packages/core/src/config.ts]
     - 保存批准的计划路径
 ```
 
@@ -510,7 +659,7 @@ ExitPlanModeInvocation.execute()  [gemini-cli/packages/core/src/tools/exit-plan-
 
 **Gemini CLI 的解决方案**：
 
-- **代码依据**：`gemini-cli/packages/core/src/policy/policies/plan.toml:1-20`
+- **代码依据**：`packages/core/src/policy/policies/plan.toml:1-20`
 - **设计意图**：通过策略配置文件实现声明式权限管理，将安全规则与业务逻辑分离
 - **带来的好处**：
   - 安全策略可独立维护和更新
@@ -522,11 +671,32 @@ ExitPlanModeInvocation.execute()  [gemini-cli/packages/core/src/tools/exit-plan-
 
 ### 6.3 与其他项目的对比
 
-| 项目 | Plan and Execute 实现 | 核心差异 |
-|-----|---------------------|---------|
-| **Gemini CLI** | ApprovalMode.PLAN + TOML 策略 + 显式工具 | 策略驱动，声明式权限配置 |
-| **Codex** | ⚠️ Inferred: 基于沙箱的安全控制 | 侧重进程隔离而非模式切换 |
-| **Kimi CLI** | ❓ Pending: Checkpoint 回滚机制 | 侧重状态保存而非计划分离 |
+```mermaid
+gitGraph
+    commit id: "基础架构"
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "TOML策略+显式切换"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "沙箱安全控制"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "Checkpoint回滚"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "简单审批模式"
+```
+
+| 项目 | Plan and Execute 实现 | 核心差异 | 适用场景 |
+|-----|---------------------|---------|---------|
+| **Gemini CLI** | ApprovalMode.PLAN + TOML 策略 + 显式工具 | 策略驱动，声明式权限配置 | 需要精细权限控制的复杂任务 |
+| **Codex** | ⚠️ Inferred: 基于沙箱的安全控制 | 侧重进程隔离而非模式切换 | 安全优先，代码执行隔离 |
+| **Kimi CLI** | ❓ Pending: Checkpoint 回滚机制 | 侧重状态保存而非计划分离 | 需要状态回滚的场景 |
+| **OpenCode** | ⚠️ Inferred: 简单的确认对话框 | 轻量级实现，功能较简单 | 简单任务，快速迭代 |
 
 ---
 
@@ -544,8 +714,10 @@ ExitPlanModeInvocation.execute()  [gemini-cli/packages/core/src/tools/exit-plan-
 
 ### 7.2 验证逻辑
 
+**关键代码**：
+
 ```typescript
-// gemini-cli/packages/core/src/utils/planUtils.ts:230-243
+// packages/core/src/utils/planUtils.ts:230-243
 export async function validatePlanPath(
   planPath: string,
   plansDir: string,
@@ -576,80 +748,18 @@ export async function validatePlanContent(
 
 | 功能 | 文件 | 行号 | 说明 |
 |-----|------|------|------|
-| 模式枚举 | `gemini-cli/packages/core/src/policy/types.ts` | - | ApprovalMode 定义 |
-| 进入工具 | `gemini-cli/packages/core/src/tools/enter-plan-mode.ts` | 37-72 | EnterPlanModeTool 实现 |
-| 退出工具 | `gemini-cli/packages/core/src/tools/exit-plan-mode.ts` | 110-142 | ExitPlanModeInvocation 实现 |
-| 策略配置 | `gemini-cli/packages/core/src/policy/policies/plan.toml` | 1-20 | Plan Mode 安全策略 |
-| 验证工具 | `gemini-cli/packages/core/src/utils/planUtils.ts` | 220-243 | 计划文件验证 |
-| 命令实现 | `gemini-cli/packages/cli/src/ui/commands/planCommand.ts` | 253-270 | /plan 命令 |
-| 确认对话框 | `gemini-cli/packages/cli/src/ui/components/ExitPlanModeDialog.tsx` | 282-294 | 退出确认 UI |
-| 评估测试 | `gemini-cli/evals/plan_mode.eval.ts` | 308-341 | Plan Mode 测试用例 |
+| 模式枚举 | `packages/core/src/policy/types.ts` | 1-10 | ApprovalMode 定义 |
+| 进入工具 | `packages/core/src/tools/enter-plan-mode.ts` | 37-72 | EnterPlanModeTool 实现 |
+| 退出工具 | `packages/core/src/tools/exit-plan-mode.ts` | 110-142 | ExitPlanModeInvocation 实现 |
+| 策略配置 | `packages/core/src/policy/policies/plan.toml` | 1-20 | Plan Mode 安全策略 |
+| 验证工具 | `packages/core/src/utils/planUtils.ts` | 220-243 | 计划文件验证 |
+| 命令实现 | `packages/cli/src/ui/commands/planCommand.ts` | 253-270 | /plan 命令 |
+| 确认对话框 | `packages/cli/src/ui/components/ExitPlanModeDialog.tsx` | 282-294 | 退出确认 UI |
+| 评估测试 | `packages/core/evals/plan_mode.eval.ts` | 308-341 | Plan Mode 测试用例 |
 
 ---
 
-## 9. 工作流程图
-
-```text
-┌─────────────────────────────────────────────────────────────────┐
-│               Gemini CLI Plan and Execute 工作流程               │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│   用户输入                                                      │
-│      │                                                          │
-│      ▼                                                          │
-│   ┌─────────────────┐                                          │
-│   │  /plan 命令     │ 或 enter_plan_mode 工具                  │
-│   └────────┬────────┘                                          │
-│            ▼                                                    │
-│   ┌─────────────────────────┐                                  │
-│   │   ApprovalMode.PLAN     │                                  │
-│   ├─────────────────────────┤                                  │
-│   │ 允许的工具：             │                                  │
-│   │ • glob, grep_search     │ 只读操作                          │
-│   │ • list_directory        │                                  │
-│   │ • read_file             │                                  │
-│   │ • google_web_search     │                                  │
-│   │ • activate_skill        │                                  │
-│   │ • ask_user              │ 需要确认                          │
-│   │ • write/replace .md     │ plans/ 目录                       │
-│   └──────┬──────────────────┘                                  │
-│          │ 创建计划文件                                         │
-│          ▼                                                      │
-│   ┌─────────────────┐                                          │
-│   │ exit_plan_mode  │                                          │
-│   └────────┬────────┘                                          │
-│            ▼                                                    │
-│   ┌─────────────────┐                                          │
-│   │   用户确认      │ 选择执行模式                              │
-│   │                 │ • DEFAULT (手动审批)                      │
-│   │                 │ • AUTO_EDIT (自动接受)                    │
-│   └────────┬────────┘                                          │
-│            ▼                                                    │
-│   ┌─────────────────────────┐                                  │
-│   │   执行模式              │                                  │
-│   │   (DEFAULT/AUTO_EDIT)   │                                  │
-│   ├─────────────────────────┤                                  │
-│   │ 按照批准的计划执行       │                                  │
-│   └─────────────────────────┘                                  │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 10. 设计亮点
-
-| 特性 | 实现细节 |
-|------|----------|
-| **策略驱动** | 使用 TOML 配置文件定义 Plan Mode 的权限规则 |
-| **文件隔离** | 计划文件必须存储在 `.gemini/tmp/{id}/plans/` 目录下 |
-| **显式切换** | 通过 `enter_plan_mode` 和 `exit_plan_mode` 工具显式切换 |
-| **用户确认** | 退出 Plan Mode 时需要用户明确批准执行模式 |
-| **验证机制** | 计划文件路径和内容都需要验证 |
-
----
-
-## 11. 延伸阅读
+## 9. 延伸阅读
 
 - 前置知识：`docs/gemini-cli/04-gemini-cli-agent-loop.md`
 - 相关机制：`docs/gemini-cli/10-gemini-cli-safety-control.md`
@@ -657,6 +767,6 @@ export async function validatePlanContent(
 
 ---
 
-*✅ Verified: 基于 gemini-cli/packages/core/src/policy/policies/plan.toml、gemini-cli/packages/core/src/tools/enter-plan-mode.ts、gemini-cli/packages/core/src/tools/exit-plan-mode.ts 等源码分析*
+*✅ Verified: 基于 gemini-cli/packages/core/src/policy/policies/plan.toml、packages/core/src/tools/enter-plan-mode.ts、packages/core/src/tools/exit-plan-mode.ts 等源码分析*
 *⚠️ Inferred: 与其他项目的对比基于架构分析*
-*基于版本：gemini-cli (baseline 2026-02-08) | 最后更新：2026-02-24*
+*基于版本：gemini-cli (baseline 2026-02-08) | 最后更新：2026-03-03*

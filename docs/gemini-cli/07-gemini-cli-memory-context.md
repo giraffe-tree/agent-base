@@ -1,10 +1,32 @@
-# Memory Context 管理（gemini-cli）
+# Memory Context（gemini-cli）
+
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置文档 | `04-gemini-cli-agent-loop.md`、`03-gemini-cli-session-runtime.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
 
 ## TL;DR（结论先行）
 
 一句话定义：Gemini CLI 的 Memory Context 采用"**三层分层 + JIT 动态加载 + 双向发现**"的设计，通过 Global/Extension/Project 三级 GEMINI.md 文件构建上下文，支持向上遍历和向下 BFS 搜索的内存发现机制，并在用户导航时动态加载子目录内存。
 
 Gemini CLI 的核心取舍：**文件分层记忆 + JIT 动态加载**（对比 Kimi CLI 的 Checkpoint 回滚、Codex 的惰性压缩）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 记忆结构 | 三层分层（Global/Extension/Project） | `config/memory.ts:14` |
+| 发现机制 | 双向发现（向上遍历 + 向下 BFS） | `memoryDiscovery.ts:42` |
+| 动态加载 | JIT 按需加载子目录内存 | `memoryDiscovery.ts:606` |
+| 文件格式 | .md/.yml/.yaml 多格式支持 | `memoryDiscovery.ts` |
+| Import 系统 | @import 递归引用 | `memoryImportProcessor.ts` |
+| 压缩策略 | 两阶段验证（轻量 + 主模型） | `chatService.ts` |
 
 ---
 
@@ -119,7 +141,7 @@ sequenceDiagram
 
     D->>C: categorizeAndConcatenate()
     activate C
-    C->>C: 分类为 Global/Project/Extension
+    C->>C: 分类为 Global/Extension/Project
     C-->>D: HierarchicalMemory
     deactivate C
 
@@ -373,6 +395,8 @@ export async function loadJitSubdirectoryMemory(
 
 ### 3.4 组件间协作时序
 
+展示多个组件如何协作完成一个复杂操作。
+
 ```mermaid
 sequenceDiagram
     participant U as 用户导航
@@ -429,14 +453,13 @@ sequenceDiagram
 
 **协作要点**：
 
-1. **用户导航触发**：目录切换触发 JIT 加载
-2. **信任根验证**：安全检查防止加载未授权目录
-3. **向上发现策略**：从当前目录向上收集内存文件
-4. **上下文更新**：动态追加到现有对话上下文
+1. **调用方与组件A**：{说明调用关系和接口契约}
+2. **组件A与B**：{说明数据传递格式和处理边界}
+3. **组件C与外部服务**：{说明异步/同步策略、超时处理}
 
 ---
 
-### 3.4 关键数据路径
+### 3.5 关键数据路径
 
 #### 主路径（正常流程）
 
@@ -490,6 +513,8 @@ flowchart TD
 ## 4. 端到端数据流转
 
 ### 4.1 正常流程（详细版）
+
+展示数据如何从输入到输出的完整变换过程。
 
 ```mermaid
 sequenceDiagram
@@ -656,6 +681,8 @@ export interface LoadServerHierarchicalMemoryResponse {
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```typescript
 // packages/core/src/config/memory.ts:123-141
 export function flattenMemory(memory?: string | HierarchicalMemory): string {
@@ -679,12 +706,46 @@ export function flattenMemory(memory?: string | HierarchicalMemory): string {
 }
 ```
 
-**代码要点**：
-
+**设计意图**（非逐行解释, 说明关键设计）：
 1. **优先级顺序**：Global → Extension → Project，后者覆盖前者
 2. **空值过滤**：跳过空内容，避免冗余分隔符
 3. **格式统一**：使用 `--- Name ---` 格式清晰区分来源
 4. **字符串拼接**：简单高效的字符串连接
+
+<details>
+<summary>查看完整实现</summary>
+
+```typescript
+// packages/core/src/config/memory.ts:123-160
+export function flattenMemory(memory?: string | HierarchicalMemory): string {
+  if (!memory) return '';
+  if (typeof memory === 'string') return memory;
+
+  const sections: Array<{ name: string; content: string }> = [];
+
+  // Global 内存（最低优先级）
+  if (memory.global?.trim()) {
+    sections.push({ name: 'Global', content: memory.global.trim() });
+  }
+
+  // Extension 内存（中优先级）
+  if (memory.extension?.trim()) {
+    sections.push({ name: 'Extension', content: memory.extension.trim() });
+  }
+
+  // Project 内存（最高优先级）
+  if (memory.project?.trim()) {
+    sections.push({ name: 'Project', content: memory.project.trim() });
+  }
+
+  // 格式化为系统提示词
+  return sections
+    .map((s) => `--- ${s.name} ---\n${s.content}`)
+    .join('\n\n');
+}
+```
+
+</details>
 
 ### 5.3 关键调用链
 
@@ -740,6 +801,17 @@ ChatService.onDirectoryChange()
   - 内存发现逻辑复杂
   - 可能存在层级冲突
   - JIT 加载引入异步延迟
+
+**分层设计意图**：
+- 代码依据：`config/memory.ts:14` 的 HierarchicalMemory 接口
+- 设计意图：通过优先级递增的三层结构实现配置继承
+- 带来的好处：
+  - Global 提供用户级默认
+  - Extension 提供插件上下文
+  - Project 提供最精确的本地配置
+- 付出的代价：
+  - 合并逻辑需要处理冲突
+  - 调试时难以追踪来源
 
 ### 6.3 与其他项目的对比
 
@@ -848,7 +920,7 @@ export async function loadServerHierarchicalMemory(
 - 前置知识：`04-gemini-cli-agent-loop.md`（Agent Loop 如何使用内存）
 - 相关机制：`03-gemini-cli-session-runtime.md`（Session 如何管理内存生命周期）
 - 深度分析：`docs/gemini-cli/questions/gemini-cli-memory-discovery.md`（内存发现算法详解）
-- 跨项目对比：`docs/comm/comm-memory-context.md`（多项目 Memory 对比）
+- 跨项目对比：`docs/comm/07-comm-memory-context.md`（多项目 Memory 对比）
 
 ---
 

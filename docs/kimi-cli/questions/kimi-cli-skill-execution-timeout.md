@@ -1,10 +1,31 @@
 # Kimi CLI 工具执行超时机制
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | `docs/kimi-cli/04-kimi-cli-agent-loop.md` |
+> | 文档结构 | 结论 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 Kimi CLI 采用**分层超时控制策略**：Shell 工具默认 60s（上限 300s），MCP 工具默认 60s（可配置），超时后强制终止子进程并返回结构化错误，由 LLM 决定后续处理而非自动回滚。
 
 Kimi CLI 的核心取舍：**工具层独立超时 + 错误上报**（对比 Codex 的全局超时控制、OpenCode 的进程树级超时清理）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| Shell 超时 | 默认 60s，硬上限 300s | `src/kimi_cli/tools/shell/__init__.py:17,447` |
+| MCP 超时 | 默认 60s，可配置 | `src/kimi_cli/config.py:129` |
+| 超时实现 | `asyncio.wait_for` + `process.kill()` | `src/kimi_cli/tools/shell/__init__.py:113` |
+| 错误处理 | 返回 ToolError，由 LLM 决策 | `src/kimi_cli/tools/shell/__init__.py:89-93` |
+| 用户审批 | 所有危险操作前置确认 | `src/kimi_cli/tools/shell/__init__.py:67` |
 
 ---
 
@@ -211,8 +232,6 @@ flowchart TD
 | `_run_shell_command()` | command, callbacks, timeout | exitcode | 核心执行方法 | `shell/__init__.py:95` |
 | `Params.timeout` | - | int (1-300) | 超时参数定义 | `shell/__init__.py:22` |
 
----
-
 ### 3.2 MCP 工具超时机制
 
 #### 职责定位
@@ -273,8 +292,6 @@ flowchart TD
 1. **配置驱动**：超时从配置文件读取，非硬编码
 2. **消息匹配**：fastmcp 超时抛出 `RuntimeError`，需通过消息内容识别
 3. **用户提示**：超时错误包含配置调整建议，引导用户自助解决
-
----
 
 ### 3.3 组件间协作时序
 
@@ -701,13 +718,13 @@ class MCPClientConfig(BaseModel):
 
 ## 9. 延伸阅读
 
-- 前置知识：[Kimi CLI Agent Loop 分析](../04-kimi-cli-agent-loop.md)
-- 相关机制：[Kimi CLI Checkpoint 机制](./kimi-cli-checkpoint-implementation.md)
-- 对比分析：[Codex Agent Loop 分析](../../codex/04-codex-agent-loop.md)
-- MCP 协议：[MCP Integration 对比](../../comm/comm-mcp-integration.md)
+- 前置知识：`docs/kimi-cli/04-kimi-cli-agent-loop.md`
+- 相关机制：`docs/kimi-cli/questions/kimi-cli-checkpoint-implementation.md`
+- 对比分析：`docs/codex/04-codex-agent-loop.md`
+- MCP 协议：`docs/comm/comm-mcp-integration.md`
 
 ---
 
 *✅ Verified: 基于 kimi-cli/src/kimi_cli/tools/shell/__init__.py:17-129、kimi-cli/src/kimi_cli/soul/toolset.py:355-405、kimi-cli/src/kimi_cli/config.py:129-133 等源码分析*
 
-*基于版本：kimi-cli (2026-02-08) | 最后更新：2026-02-24*
+*基于版本：kimi-cli (baseline 2026-02-08) | 最后更新：2026-02-24*

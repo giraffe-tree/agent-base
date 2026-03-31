@@ -1,3 +1,14 @@
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-35 分钟 |
+> | 前置文档 | `01-qwen-code-overview.md`、`05-qwen-code-tools-system.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 # MCP 集成（Qwen Code）
 
 ## TL;DR（结论先行）
@@ -5,6 +16,18 @@
 一句话定义：Qwen Code 的 MCP 集成是**基于官方 MCP SDK 的多传输层 + 自动 OAuth 发现 + 服务器级信任模型 + 工具注解支持**的外部工具接入框架，通过 `McpClientManager` 统一管理多个 MCP 服务器的连接、发现和生命周期，支持实时进度通知和现代 JSON Schema 标准。
 
 Qwen Code 的核心取舍：**官方 MCP SDK 原生集成 + 自动 OAuth 发现 + 完全限定名命名空间 + Tool Annotations 智能审批**（对比 Gemini CLI 的多传输自动回退、Codex 的 Rust 原生实现、Kimi CLI 的 ACP 桥接）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 核心机制 | 官方 MCP SDK 原生集成，支持多传输协议 | `packages/core/src/tools/mcp-client.ts:798` |
+| 连接管理 | McpClientManager 统一管理多服务器生命周期 | `packages/core/src/tools/mcp-client-manager.ts:29` |
+| 认证机制 | 自动 OAuth 发现 + 401 重试机制 | `packages/core/src/tools/mcp-client.ts:364` |
+| 工具命名 | `mcp__{server}__{tool}` 完全限定名避免冲突 | `packages/core/src/tools/mcp-tool.ts:569` |
+| 智能审批 | Tool Annotations (readOnlyHint) 支持 Plan 模式 | `packages/core/src/tools/mcp-tool.ts:97` |
+| 进度通知 | onprogress 回调支持长时间任务实时反馈 | `packages/core/src/tools/mcp-tool.ts:213` |
+| Schema 兼容 | Draft-07 + Draft-2020-12 双验证器 | `packages/core/src/utils/schemaValidator.ts:66` |
 
 ---
 
@@ -105,15 +128,15 @@ sequenceDiagram
     participant S as MCP Server
     participant R as ToolRegistry
 
-    A->>M: discoverAllMcpTools()
+    A->>M: 1. discoverAllMcpTools()
     Note over M: 检查 isTrustedFolder()
 
     loop 每个服务器
-        M->>C: connectAndDiscover(serverName, config)
+        M->>C: 2. connectAndDiscover(serverName, config)
         activate C
 
-        C->>C: updateMCPServerStatus(CONNECTING)
-        C->>T: createTransport(config)
+        C->>C: 3. updateMCPServerStatus(CONNECTING)
+        C->>T: 4. createTransport(config)
         activate T
 
         alt 有 OAuth 配置
@@ -129,27 +152,27 @@ sequenceDiagram
             T->>T: 创建 StdioClientTransport
         end
 
-        T-->>C: Transport 实例
+        T-->>C: 5. Transport 实例
         deactivate T
 
-        C->>S: client.connect(transport)
-        S-->>C: 连接成功
-        C->>C: updateMCPServerStatus(CONNECTED)
+        C->>S: 6. client.connect(transport)
+        S-->>C: 7. 连接成功
+        C->>C: 8. updateMCPServerStatus(CONNECTED)
 
-        C->>S: listTools()
-        S-->>C: Tool[]
+        C->>S: 9. listTools()
+        S-->>C: 10. Tool[]
 
-        C->>C: discoverTools()
+        C->>C: 11. discoverTools()
         Note right of C: 包装为 DiscoveredMCPTool
 
         loop 每个工具
-            C->>R: registerTool(tool)
+            C->>R: 12. registerTool(tool)
         end
 
         deactivate C
     end
 
-    M-->>A: 所有服务器发现完成
+    M-->>A: 13. 所有服务器发现完成
 ```
 
 **关键交互说明**：
@@ -158,10 +181,11 @@ sequenceDiagram
 |-----|---------|---------|
 | 1 | Agent Loop 触发发现 | 解耦触发与执行，支持延迟加载 |
 | 2 | 信任文件夹检查 | 不受信任文件夹不启用 MCP，安全默认 |
-| 3-4 | 创建传输层 | 根据配置自动选择传输协议 |
+| 4 | 创建传输层 | 根据配置自动选择传输协议 |
 | 5 | OAuth 注入 | 自动处理认证，支持 401 自动重试 |
 | 6-7 | 建立连接 | 支持多种传输协议，自动回退 |
-| 8-9 | 发现工具 | 使用 mcpToTool 从 SDK 获取工具定义 |
+| 9-10 | 发现工具 | 使用 mcpToTool 从 SDK 获取工具定义 |
+| 12 | 注册到 Registry | 工具名格式为 `mcp__{server}__{tool}` |
 | 10 | 注册到 Registry | 工具名格式为 `mcp__{server}__{tool}` |
 
 ---

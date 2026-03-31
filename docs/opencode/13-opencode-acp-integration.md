@@ -1,10 +1,32 @@
 # OpenCode 多 Agent 架构与 ACP 实现
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-35 分钟 |
+> | 前置文档 | `01-opencode-overview.md`、`04-opencode-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
-**OpenCode 实现了两套独立的 Agent 协作机制：内置多 Agent 系统（通过 `task` 工具以函数调用方式协作）和 ACP (Agent Client Protocol) 服务端模式（标准化协议暴露 Agent 能力），前者是内部架构设计，后者是对外服务协议。**
+一句话定义：**OpenCode 实现了两套独立的 Agent 协作机制：内置多 Agent 系统（通过 `task` 工具以函数调用方式协作）和 ACP (Agent Client Protocol) 服务端模式（标准化协议暴露 Agent 能力），前者是内部架构设计，后者是对外服务协议。**
 
 OpenCode 的核心取舍：**函数调用式子 Agent 协作 + ACP 服务端并存**（对比 Kimi/Qwen/Gemini 的 ACP 模式与 Codex/SWE-agent 的非 ACP 架构）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 子 Agent 通信 | 函数调用（同进程） | `opencode/packages/opencode/src/tool/task.ts:45` |
+| Agent 类型定义 | mode 字段区分 primary/subagent/all | `opencode/packages/opencode/src/agent/agent.ts:24` |
+| 权限隔离 | PermissionNext.Ruleset 规则集 | `opencode/packages/opencode/src/agent/agent.ts:44` |
+| ACP 协议 | JSON-RPC over stdio | `opencode/packages/opencode/src/acp/agent.ts:52` |
+| 会话管理 | 父子 Session 关联 | `opencode/packages/opencode/src/tool/task.ts:72` |
+| ACP 启动入口 | `opencode acp` CLI 命令 | `opencode/packages/opencode/src/cli/cmd/acp.ts:12` |
 
 ---
 
@@ -136,6 +158,67 @@ sequenceDiagram
 
 内置多 Agent 系统通过 `task` 工具实现主 Agent 与子 Agent 的协作，采用函数调用方式在同一进程内完成。
 
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle: 系统启动
+    Idle --> TaskRequested: 主 Agent 调用 task 工具
+    TaskRequested --> PermissionChecking: 权限检查
+    PermissionChecking --> SessionCreating: 权限通过
+    PermissionChecking --> Rejected: 权限拒绝
+    SessionCreating --> Executing: 子 Session 创建成功
+    Executing --> Completed: 子 Agent 执行完成
+    Executing --> Failed: 执行异常
+    Completed --> Idle: 返回结果
+    Rejected --> Idle: 返回错误
+    Failed --> Idle: 返回错误信息
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Idle | 空闲等待 | 系统启动/任务完成 | 收到 task 调用 |
+| TaskRequested | 收到任务请求 | 主 Agent 调用 task | 开始权限检查 |
+| PermissionChecking | 权限检查中 | task 参数验证通过 | 权限检查完成 |
+| SessionCreating | 创建子 Session | 权限检查通过 | Session 创建完成 |
+| Executing | 子 Agent 执行中 | 子 Session 就绪 | 执行完成/失败 |
+| Completed | 执行成功 | 子 Agent 正常结束 | 返回结果 |
+| Rejected | 权限被拒绝 | 用户拒绝/规则拒绝 | 返回错误 |
+| Failed | 执行失败 | 子 Agent 异常 | 返回错误信息 |
+
+#### 内部数据流
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  输入层                                                      │
+│  主 Agent ──► task 工具调用 ──► 参数解析                      │
+│    ├── description: 任务描述                                 │
+│    ├── prompt: 具体任务内容                                  │
+│    └── subagent_type: Agent 类型                             │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  权限层                                                      │
+│  ├── bypassAgentCheck 检查（@ 显式调用）                     │
+│  ├── PermissionNext.ask() 用户确认                           │
+│  └── 规则集匹配（agent.permission）                          │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  执行层                                                      │
+│  ├── Session.create({parentID}) 创建子 Session               │
+│  ├── SessionPrompt.prompt() 执行 Agent Loop                  │
+│  └── 结果收集 ──► <task_result> 包装                         │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  输出层                                                      │
+│  返回父 Agent ──► 继续主 Loop ──► 最终响应                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
 #### Agent 类型定义
 
 ✅ **Verified**: 代码依据 `opencode/packages/opencode/src/agent/agent.ts:24-49`
@@ -220,6 +303,71 @@ export const TaskTool = Tool.define("task", async (ctx) => {
 #### 职责定位
 
 ACP (Agent Client Protocol) 是标准化协议，允许外部客户端（如 IDE）通过 JSON-RPC over stdio 调用 OpenCode 的 Agent 能力。
+
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Uninitialized: 启动 ACP Server
+    Uninitialized --> Initializing: 初始化 SDK
+    Initializing --> Ready: 等待客户端连接
+    Ready --> SessionCreating: 收到 initialize 请求
+    SessionCreating --> SessionActive: Session 创建成功
+    SessionActive --> Processing: 收到 session/prompt
+    Processing --> SessionActive: 处理完成
+    SessionActive --> SessionClosing: 收到关闭请求
+    SessionClosing --> Ready: Session 清理完成
+    Processing --> Error: 处理异常
+    Error --> SessionActive: 错误恢复
+    SessionActive --> [*]: Server 关闭
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Uninitialized | 未初始化 | ACP Server 启动 | 开始初始化 |
+| Initializing | 初始化中 | 创建 SDK 客户端 | 初始化完成 |
+| Ready | 就绪等待 | 等待客户端连接 | 收到 initialize |
+| SessionCreating | 创建 Session | 收到 initialize 请求 | Session 就绪 |
+| SessionActive | Session 活跃 | Session 创建成功 | 收到 prompt/关闭 |
+| Processing | 处理请求中 | 收到 session/prompt | 处理完成 |
+| SessionClosing | 关闭 Session | 收到关闭请求 | 清理完成 |
+| Error | 错误状态 | 处理异常 | 恢复/关闭 |
+
+#### 内部数据流
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  输入层（JSON-RPC）                                          │
+│  ├── initialize: 协议版本协商 + 能力广告                      │
+│  ├── session/new: 创建新会话                                 │
+│  ├── session/load: 恢复已有会话                              │
+│  └── session/prompt: 处理用户消息                            │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  协议解析层                                                  │
+│  ├── AgentSideConnection 连接管理                            │
+│  ├── JSON-RPC 消息解析                                       │
+│  └── 请求路由分发                                            │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  内部转发层                                                  │
+│  ├── ACPSessionManager 会话映射                              │
+│  ├── 内部 Session 创建/加载                                  │
+│  └── SessionPrompt.prompt() 转发                             │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  输出层（流式响应）                                          │
+│  ├── agent_message_chunk: LLM 输出片段                       │
+│  ├── agent_thought_chunk: 思考过程                           │
+│  ├── tool_call/tool_call_update: 工具调用                    │
+│  └── session/update: 状态更新                                │
+└─────────────────────────────────────────────────────────────┘
+```
 
 #### ACP Server 启动流程
 
@@ -554,23 +702,31 @@ AcpCommand.handler()       [opencode/packages/opencode/src/cli/cmd/acp.ts:22]
 ### 6.3 与其他项目的对比
 
 ```mermaid
-flowchart LR
-    subgraph OpenCode["OpenCode"]
-        OC1[内置多 Agent] --> OC2[函数调用]
-        OC3[ACP Server] --> OC4[JSON-RPC]
-    end
-
-    subgraph ACPAgents["Kimi/Qwen/Gemini"]
-        K1[ACP 模式] --> K2[JSON-RPC]
-    end
-
-    subgraph Others["Codex/SWE-agent"]
-        O1[非 ACP] --> O2[本地协作或单 Agent]
-    end
-
-    style OpenCode fill:#e1f5e1
-    style ACPAgents fill:#fff3cd
-    style Others fill:#f8d7da
+gitGraph
+    commit id: "单 Agent 架构"
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "内置多 Agent + ACP Server"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "ACP Server 模式"
+    checkout main
+    branch "Qwen Code"
+    checkout "Qwen Code"
+    commit id: "TaskTool + ACP"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "SubAgent + A2A"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "实验性多 Agent"
+    checkout main
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "单 Agent 重试"
 ```
 
 | 项目 | 多 Agent 支持 | 实现方式 | ACP 支持 |
@@ -581,6 +737,18 @@ flowchart LR
 | **Gemini CLI** | ✅（SubAgent + A2A） | `--experimental-acp` + zed integration | ✅（实验性 ACP） |
 | **Codex** | ⚠️（实验性进程内协作） | `multi_agent`/collab tools | ❌ |
 | **SWE-agent** | ❌ | 单 Agent 重试循环 | ❌ |
+
+**详细对比分析**：
+
+| 特性 | OpenCode | Kimi CLI | Qwen Code | Gemini CLI | Codex | SWE-agent |
+|-----|----------|----------|-----------|------------|-------|-----------|
+| 子 Agent 通信 | 函数调用（同进程） | ACP JSON-RPC | ACP JSON-RPC | A2A 协议 | 进程内协作 | 不支持 |
+| 延迟 | 极低（无序列化） | 中（进程间通信） | 中（进程间通信） | 中（网络通信） | 低 | - |
+| Session 隔离 | 父子 Session 关联 | ACP Session | SubAgentTracker | SubAgent 实例 | 共享 Session | - |
+| 外部集成 | ACP Server 模式 | ACP Server | ACP Server | A2A + MCP | Sandbox API | 无 |
+| 权限控制 | PermissionNext 规则 | Checkpoint 权限 | 策略配置 | 策略驱动 | 沙箱隔离 | 简单配置 |
+| 协议标准 | ACP (Agent Client Protocol) | ACP | ACP | A2A (Agent-to-Agent) | 无 | 无 |
+| 适用场景 | 内部协作 + 外部集成 | 外部工具集成 | IDE 集成 | 多 Agent 生态 | 安全隔离 | 简单任务 |
 
 ---
 

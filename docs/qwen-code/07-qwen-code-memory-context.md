@@ -1,3 +1,14 @@
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置文档 | `01-qwen-code-overview.md`、`04-qwen-code-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 # Memory Context（Qwen Code）
 
 ## TL;DR（结论先行）
@@ -5,6 +16,17 @@
 一句话定义：Qwen Code 的 Memory Context 采用「**四层分层架构 + 智能自动压缩 + IDE 上下文增量同步**」策略，通过 GeminiChat 管理 API 格式历史，ChatCompressionService 在 token 超过 70% 阈值时自动总结压缩，同时支持 IDE 编辑器状态的实时增量注入。
 
 Qwen Code 的核心取舍：**自动压缩 + IDE 增量同步**（对比 Gemini CLI 的文件分层记忆、Kimi CLI 的 Checkpoint 回滚、Codex 的惰性压缩）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 核心机制 | API Content 数组管理对话历史 | `packages/core/src/core/geminiChat.ts:214` |
+| 自动压缩 | 70% 阈值触发，保留 30% 完整历史 | `packages/core/src/services/chatCompressionService.ts:78` |
+| 分割策略 | 在 user message 边界分割，保护 functionCall/functionResponse 配对 | `packages/core/src/services/chatCompressionService.ts:36` |
+| IDE 同步 | 增量更新 + API 约束感知（跳过 pending tool call） | `packages/core/src/core/client.ts:211` |
+| 思考清理 | 完全移除 thought parts 减少 token 消耗 | `packages/core/src/core/geminiChat.ts:480` |
+| 失败处理 | 标记 hasFailedCompressionAttempt 避免重复失败 | `packages/core/src/core/client.ts:695` |
 
 ---
 
@@ -96,36 +118,36 @@ sequenceDiagram
     participant IDE as IdeContextStore
     participant LLM as LLM API
 
-    A->>C: sendMessageStream()
+    A->>C: 1. sendMessageStream()
     Note over C: 开始消息处理流程
 
-    C->>CMP: tryCompressChat()
+    C->>CMP: 2. tryCompressChat()
     activate CMP
-    CMP->>CH: getHistory(true)
-    CH-->>CMP: curatedHistory
-    CMP->>CMP: 检查 token 阈值
+    CMP->>CH: 3. getHistory(true)
+    CH-->>CMP: 4. curatedHistory
+    CMP->>CMP: 5. 检查 token 阈值
     alt 需要压缩
-        CMP->>LLM: 生成摘要
-        LLM-->>CMP: summary
-        CMP->>CH: setHistory(newHistory)
+        CMP->>LLM: 6. 生成摘要
+        LLM-->>CMP: 7. summary
+        CMP->>CH: 8. setHistory(newHistory)
     end
-    CMP-->>C: compressionInfo
+    CMP-->>C: 9. compressionInfo
     deactivate CMP
 
-    C->>C: getIdeContextParts()
+    C->>C: 10. getIdeContextParts()
     Note over C: 检查 hasPendingToolCall
-    C->>IDE: get()
-    IDE-->>C: currentIdeContext
-    C->>CH: addHistory(ideContextMsg)
+    C->>IDE: 11. get()
+    IDE-->>C: 12. currentIdeContext
+    C->>CH: 13. addHistory(ideContextMsg)
 
-    C->>CH: sendMessageStream()
+    C->>CH: 14. sendMessageStream()
     activate CH
-    CH->>LLM: 发送 Prompt
-    LLM-->>CH: 流式响应
-    CH-->>C: StreamEvent
+    CH->>LLM: 15. 发送 Prompt
+    LLM-->>CH: 16. 流式响应
+    CH-->>C: 17. StreamEvent
     deactivate CH
 
-    C-->>A: 响应结果
+    C-->>A: 18. 响应结果
 ```
 
 **关键交互说明**：
@@ -133,9 +155,9 @@ sequenceDiagram
 | 步骤 | 交互内容 | 设计意图 |
 |-----|---------|---------|
 | 1 | Agent Loop 发起请求 | 统一入口，解耦业务与核心 |
-| 2-7 | 压缩检查与执行 | 在发送前自动压缩，避免超限 |
-| 8-11 | IDE 上下文注入 | 增量同步编辑器状态 |
-| 12-15 | LLM 调用与响应 | 标准对话流程 |
+| 2-9 | 压缩检查与执行 | 在发送前自动压缩，避免超限 |
+| 10-13 | IDE 上下文注入 | 增量同步编辑器状态 |
+| 14-18 | LLM 调用与响应 | 标准对话流程 |
 
 ---
 

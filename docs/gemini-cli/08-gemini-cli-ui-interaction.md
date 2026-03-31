@@ -1,10 +1,32 @@
-# UI Interaction（Gemini CLI）
+# UI Interaction（gemini-cli）
+
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置文档 | `02-gemini-cli-cli-entry.md`、`03-gemini-cli-session-runtime.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
 
 ## TL;DR（结论先行）
 
 一句话定义：Gemini CLI 的 UI Interaction 是**基于 Ink.js（React for CLI）构建的终端用户界面系统**，提供组件化渲染、流式响应、键盘事件处理和调试抽屉等高级 TUI 能力。
 
 Gemini CLI 的核心取舍：**Ink.js + React 组件化架构**（对比 Codex 的 Ratatui、Kimi CLI 的 Wire 协议解耦）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| UI 框架 | Ink.js (React for CLI) | `App.tsx:16` |
+| 状态管理 | React Context + useState | `AppContainer.tsx` |
+| 键盘处理 | 自定义 ANSI 解析器 | `KeypressContext.tsx:706` |
+| 消息渲染 | VirtualizedList 虚拟列表 | `VirtualizedList.tsx` |
+| 调试工具 | 内置调试抽屉 (F12) | `DetailedMessagesDisplay.tsx:26` |
+| 主题系统 | 运行时主题切换 | `UIStateContext.tsx` |
 
 ---
 
@@ -148,6 +170,15 @@ stateDiagram-v2
     PasteMode --> Processing: 收到 paste-end
     PasteMode --> Idle: 超时
 ```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Idle | 空闲等待 | 初始化完成或处理结束 | 收到 ESC 或 paste-start |
+| Buffering | 缓冲转义序列 | 收到 ESC 字符 | 序列完整或超时 |
+| Processing | 处理按键 | 序列解析完成 | 事件分发完成 |
+| PasteMode | 粘贴模式 | 收到 paste-start | 收到 paste-end 或超时 |
 
 #### 内部数据流
 
@@ -322,6 +353,8 @@ if (isFolderTrustDialogOpen) return <FolderTrustDialog />
 
 ### 3.4 组件间协作时序
 
+展示多个组件如何协作完成一个复杂操作。
+
 ```mermaid
 sequenceDiagram
     participant U as 用户
@@ -342,6 +375,12 @@ sequenceDiagram
     A->>C: 恢复正常 Composer 渲染
     C->>C: 显示工具执行结果
 ```
+
+**协作要点**：
+
+1. **调用方与组件A**：{说明调用关系和接口契约}
+2. **组件A与B**：{说明数据传递格式和处理边界}
+3. **组件C与外部服务**：{说明异步/同步策略、超时处理}
 
 ---
 
@@ -388,6 +427,8 @@ flowchart TD
 ## 4. 端到端数据流转
 
 ### 4.1 正常流程（详细版）
+
+展示数据如何从输入到输出的完整变换过程。
 
 ```mermaid
 sequenceDiagram
@@ -539,6 +580,8 @@ export interface UIState {
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```typescript
 // gemini-cli/packages/cli/src/ui/contexts/KeypressContext.tsx:769-786
 const broadcast = useCallback(
@@ -561,11 +604,49 @@ const broadcast = useCallback(
 );
 ```
 
-**代码要点**：
-
+**设计意图**（非逐行解释, 说明关键设计）：
 1. **优先级缓存**：`sortedPriorities` 避免每次按键都重新排序
 2. **栈行为处理**：同一优先级内，后订阅的处理器先执行
 3. **事件消费**：返回 `true` 表示事件被处理，停止后续传播
+
+<details>
+<summary>查看完整实现</summary>
+
+```typescript
+// gemini-cli/packages/cli/src/ui/contexts/KeypressContext.tsx:769-810
+const broadcast = useCallback(
+  (key: Key) => {
+    // 使用缓存的排序优先级
+    for (const p of sortedPriorities.current) {
+      const set = subscribers.get(p);
+      if (!set) continue;
+
+      // 同一优先级内，后订阅的先处理（栈行为）
+      const handlers = Array.from(set).reverse();
+      for (const handler of handlers) {
+        try {
+          if (handler(key) === true) {
+            return; // 事件被消费
+          }
+        } catch (error) {
+          console.error('Key handler error:', error);
+        }
+      }
+    }
+  },
+  [subscribers],
+);
+
+// 优先级常量
+export enum KeypressPriority {
+  Critical = 0,  // 系统级快捷键
+  High = 1,      // 对话框、确认
+  Normal = 2,    // 普通组件
+  Low = 3,       // 背景监听
+}
+```
+
+</details>
 
 ### 5.3 关键调用链
 
@@ -627,16 +708,18 @@ Gemini API SSE
   - 首次渲染有启动时间
   - 需要处理 React 的异步特性
 
+**键盘处理设计**：
+- 代码依据：`KeypressContext.tsx:336` 的 emitKeys 生成器
+- 设计意图：统一处理各种终端的 ANSI 转义序列
+- 带来的好处：
+  - 支持复杂组合键
+  - 支持粘贴事件
+  - 优先级分发机制
+- 付出的代价：
+  - 维护成本高
+  - 需要处理各种终端差异
+
 ### 6.3 与其他项目的对比
-
-| 项目 | UI 框架 | 流式渲染 | 交互模式 | 适用场景 |
-|-----|---------|---------|---------|---------|
-| **Gemini CLI** | Ink.js (React) | VirtualizedList + Markdown 高亮 | 组件化 TUI | 复杂交互、多对话框 |
-| **Codex** | Ratatui (Rust) | 增量渲染 + syntect 高亮 | 命令式 TUI | 高性能、代码阅读 |
-| **Kimi CLI** | 自定义 Wire 协议 | 双通道 (raw/merged) | 协议解耦 | 可替换 UI、远程控制 |
-| **OpenCode** | Ink.js (React) | 流式 Markdown | 类 Gemini 设计 | 类似场景 |
-
-**核心差异分析**：
 
 ```mermaid
 flowchart LR
@@ -662,6 +745,25 @@ flowchart LR
     C1 --> C2 --> C3
     K3 --> K1 --> K2
 ```
+
+| 项目 | UI 框架 | 流式渲染 | 交互模式 | 适用场景 |
+|-----|---------|---------|---------|---------|
+| **Gemini CLI** | Ink.js (React) | VirtualizedList + Markdown 高亮 | 组件化 TUI | 复杂交互、多对话框 |
+| **Codex** | Ratatui (Rust) | 增量渲染 + syntect 高亮 | 命令式 TUI | 高性能、代码阅读 |
+| **Kimi CLI** | 自定义 Wire 协议 | 双通道 (raw/merged) | 协议解耦 | 可替换 UI、远程控制 |
+| **OpenCode** | Ink.js (React) | 流式 Markdown | 类 Gemini 设计 | 类似场景 |
+
+**核心差异分析**：
+
+| 对比维度 | Gemini CLI | Codex | Kimi CLI |
+|---------|------------|-------|----------|
+| **UI 框架** | Ink.js + React | Ratatui (Rust) | Wire 协议 |
+| **渲染模式** | 虚拟列表 | 增量渲染 | 双通道 |
+| **状态管理** | React Context | 命令式 | 协议状态 |
+| **键盘处理** | 自定义 ANSI | 标准输入 | 协议封装 |
+| **调试能力** | F12 调试抽屉 | 日志文件 | 协议日志 |
+| **扩展性** | React 组件 | Rust 模块 | 协议适配 |
+| **性能** | 中等 | 高 | 取决于 UI 实现 |
 
 ---
 

@@ -1,10 +1,32 @@
-# Session Runtime（kimi-cli）
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `01-kimi-cli-overview.md`、`02-kimi-cli-cli-entry.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
+# Session Runtime（Kimi CLI）
 
 ## TL;DR（结论先行）
 
 一句话定义：Kimi CLI 的 Session Runtime 采用**"目录隔离 + 双文件日志 + 轻量 Metadata 索引"**模型，以 append-only JSONL 形式持久化对话历史，支持 Checkpoint 回滚和会话恢复。
 
 Kimi CLI 的核心取舍：**文件系统持久化 + Checkpoint 回滚能力**（对比 Codex 的 SQLite + Actor 模型、Gemini CLI 的 JSON 整文件重写、SWE-agent 的纯内存存储）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 存储格式 | append-only JSONL，支持崩溃恢复 | `kimi-cli/src/kimi_cli/soul/context.py:167` |
+| 隔离策略 | work_dir md5 哈希目录隔离 | `kimi-cli/src/kimi_cli/metadata.py:33` |
+| 索引方式 | 轻量 Metadata（last_session_id） | `kimi-cli/src/kimi_cli/metadata.py:42` |
+| 回滚机制 | Checkpoint 文件轮转 + 全量重建 | `kimi-cli/src/kimi_cli/soul/context.py:80` |
+| 空会话处理 | 自动删除，保持列表干净 | `kimi-cli/src/kimi_cli/session.py:49` |
+| 协议兼容 | WireFile 版本号管理 | `kimi-cli/src/kimi_cli/wire/file.py:59` |
 
 ---
 
@@ -174,6 +196,11 @@ stateDiagram-v2
 
     Empty --> [*]: _post_run() 删除
     Active --> [*]: _post_run() 保留
+
+    Active --> Restoring: Context.restore()
+    Restoring --> Active: 恢复成功
+    Restoring --> Failed: 恢复失败
+    Failed --> [*]: 清理资源
 ```
 
 **状态说明**：
@@ -745,27 +772,27 @@ _post_run()                         [kimi_cli/cli/__init__.py:528]
 ### 6.3 与其他项目的对比
 
 ```mermaid
-graph LR
-    subgraph volatile["进程内存（易失）"]
-        V1["SWE-agent<br/>Python list"]
-    end
-    subgraph file["文件系统（轻量持久）"]
-        F1["Kimi CLI<br/>append-only JSONL<br/>+ Checkpoint"]
-        F2["gemini-cli<br/>JSON 整文件重写"]
-    end
-    subgraph db["SQLite（完整持久）"]
-        D1["Codex<br/>conversation + items<br/>+ Actor 模型"]
-        D2["OpenCode<br/>session + message + part"]
-    end
-
-    V1 -->|优点: 零依赖、最简单| A1["✅ 简单"]
-    V1 -->|缺点: 退出丢失、无恢复| B1["❌ 不可恢复"]
-    F1 -->|优点: 轻量、可恢复、可回滚| A2["✅ 可靠+灵活"]
-    F1 -->|缺点: 查询慢、回滚开销| B2["⚠️ 性能"]
-    F2 -->|优点: 可读、整文件原子写| A3["✅ 简单"]
-    F2 -->|缺点: 大文件性能差、无回滚| B3["⚠️ 功能受限"]
-    D1 -->|优点: 可查询、fork、并发安全| A4["✅ 功能丰富"]
-    D1 -->|缺点: 依赖 SQLite、复杂| B4["⚠️ 复杂度高"]
+gitGraph
+    commit id: "传统方案"
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "内存存储"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "JSON 整文件"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "append-only JSONL"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "SQLite + Actor"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "SQLite 三层结构"
 ```
 
 | 项目 | Session 存储方式 | 恢复机制 | 回滚能力 | 核心差异 |
@@ -775,6 +802,19 @@ graph LR
 | **Codex** | SQLite + Rollout JSONL | `resume`/`fork` | 基于事件回放 | Actor 模型、事件溯源 |
 | **OpenCode** | SQLite 三层结构 | `Session.create({fork})` | fork 分支 | Part 级细粒度 |
 | **SWE-agent** | Python list（内存） | 不支持 | 不支持 | 学术场景、简单透明 |
+
+**详细对比分析**：
+
+| 对比维度 | Kimi CLI | Gemini CLI | Codex | OpenCode | SWE-agent |
+|---------|----------|------------|-------|----------|-----------|
+| **存储格式** | append-only JSONL | JSON 整文件重写 | SQLite + JSONL 事件流 | SQLite 三层结构 | Python list |
+| **隔离策略** | work_dir md5 哈希目录 | 项目目录隔离 | 工作区隔离 | 会话级隔离 | 无隔离 |
+| **索引方式** | 轻量 Metadata（last_session_id） | 时间戳命名 | 完整数据库索引 | Part 级细粒度 | 无索引 |
+| **回滚机制** | Checkpoint 文件轮转 | 不支持 | 基于事件回放 | fork 分支 | 不支持 |
+| **空会话处理** | 自动删除 | 保留 | 保留 | 保留 | 不适用 |
+| **协议兼容** | WireFile 版本号 | 无版本控制 | 多版本兼容 | 无版本控制 | 无 |
+| **并发安全** | 文件锁 | 无 | Actor 模型 | 事务隔离 | 无 |
+| **适用场景** | 需要回滚的复杂对话 | 简单持久化需求 | 企业级高可靠 | 分支会话管理 | 学术研究 |
 
 **对比维度详解**：
 
@@ -887,5 +927,15 @@ def _migrate_session_context_file(work_dir_meta: WorkDirMeta, session_id: str) -
 
 ---
 
+## 9. 延伸阅读
+
+- 前置知识：`01-kimi-cli-overview.md`
+- CLI Entry：`02-kimi-cli-cli-entry.md`
+- Agent Loop：`04-kimi-cli-agent-loop.md`
+- Checkpoint 深度分析：`docs/kimi-cli/questions/kimi-cli-checkpoint-implementation.md`
+- 跨项目对比：`docs/comm/03-comm-session-runtime.md`
+
+---
+
 *✅ Verified: 基于 kimi-cli/src/kimi_cli/session.py、kimi-cli/src/kimi_cli/soul/context.py 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

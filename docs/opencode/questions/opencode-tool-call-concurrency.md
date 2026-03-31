@@ -1,10 +1,31 @@
 # OpenCode Tool Call 并发机制
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | `docs/opencode/04-opencode-agent-loop.md`、`docs/opencode/06-opencode-mcp-integration.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Tool Call 并发机制是指 AI Agent 在单次 LLM 调用中同时触发多个工具执行的能力。
 
 OpenCode 的核心取舍：**依赖底层 AI SDK/Provider 的隐式并发 + batch 工具的显式并发**（对比 Codex 的 Runtime 锁调度或 Gemini CLI 的 Scheduler Queue 显式管理）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 并发控制 | SDK 隐式 + batch 显式 | `packages/opencode/src/session/processor.ts:100` |
+| 状态管理 | Map 索引 + 事件驱动 | `packages/opencode/src/session/processor.ts:55-60` |
+| 工具执行 | 异步 Promise | `packages/opencode/src/session/processor.ts:150-250` |
+| 结果收集 | 流式实时更新 | `packages/opencode/src/session/processor.ts:250-350` |
+| 批量限制 | 最多 25 个并发调用 | `packages/opencode/src/tool/batch.ts:45` |
 
 ---
 
@@ -661,13 +682,13 @@ SessionPrompt.loop()          [opencode/packages/opencode/src/session/prompt.ts:
 
 **OpenCode 的解决方案**：
 
-- 代码依据：`opencode/packages/opencode/src/session/processor.ts:100-200`
-- 设计意图：将并发控制委托给底层 AI SDK，框架只负责状态跟踪和结果收集
-- 带来的好处：
+- **代码依据**：`opencode/packages/opencode/src/session/processor.ts:100-200`
+- **设计意图**：将并发控制委托给底层 AI SDK，框架只负责状态跟踪和结果收集
+- **带来的好处**：
   - 框架代码简洁，易于维护
   - 自动受益于 AI SDK 的优化
   - 支持多种 Provider 的并发策略
-- 付出的代价：
+- **付出的代价**：
   - 无法精细控制并发度
   - Provider 行为差异可能导致不一致体验
   - 调试并发问题更困难
@@ -700,6 +721,7 @@ gitGraph
 | Codex | Runtime 锁 + 显式调度器 | 企业级安全，需要精细控制 |
 | Gemini CLI | Scheduler Queue 状态机管理 | 复杂状态管理，UX 要求高 |
 | Kimi CLI | 并发派发、顺序收集 | 需要确定性结果顺序 |
+| SWE-agent | 无显式并发控制 | 简单场景，顺序执行 |
 
 **详细对比**：
 
@@ -710,6 +732,12 @@ gitGraph
 | 结果顺序 | 流式无序 | 按需排序 | 状态机保证 | 顺序收集 |
 | 错误隔离 | 工具级别 | 调用级别 | 任务级别 | 步骤级别 |
 | 实现复杂度 | 低 | 高 | 中 | 中 |
+
+**对比分析**：
+
+- **vs Codex**：Codex 使用 Runtime 锁实现显式调度，OpenCode 依赖 SDK 隐式并发，前者控制更精细但代码更复杂
+- **vs Gemini CLI**：Gemini 的 Scheduler Queue 是核心架构组件，OpenCode 的并发是 SDK 层能力，前者更适合复杂状态管理
+- **vs Kimi CLI**：Kimi 的并发派发 + 顺序收集确保结果确定性，OpenCode 的流式处理更实时但顺序依赖 SDK 实现
 
 ---
 
@@ -773,4 +801,4 @@ toolPromise.finally(() => clearTimeout(toolTimeout));
 ---
 
 *✅ Verified: 基于 opencode/packages/opencode/src/session/processor.ts 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

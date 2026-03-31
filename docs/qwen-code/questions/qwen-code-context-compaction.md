@@ -1,10 +1,31 @@
 # 上下文压缩机制（Qwen Code）
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置文档 | `../07-qwen-code-memory-context.md`、`../04-qwen-code-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：上下文压缩是 Qwen Code 在对话历史超过模型上下文窗口阈值时，自动将早期对话历史总结为结构化 XML 快照并替换原始消息的机制。
 
 Qwen Code 的核心取舍：**阈值触发 + 模型总结 + 智能分割**（对比 Gemini CLI 的双阶段压缩 + 验证、Kimi CLI 的消息数保留策略、Codex 的远程压缩任务）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 触发方式 | 阈值触发（默认 70% 上下文窗口） | `packages/core/src/services/chatCompressionService.ts:111` |
+| 分割策略 | 字符数估算 + user message 边界 | `packages/core/src/services/chatCompressionService.ts:36` |
+| 总结方式 | 单阶段 LLM 总结 | `packages/core/src/services/chatCompressionService.ts:146` |
+| 保留策略 | 保留最近 30% 完整对话 | `packages/core/src/services/chatCompressionService.ts:127` |
+| 失败处理 | 标记失败避免重试 | `packages/core/src/services/chatCompressionService.ts:233` |
 
 ---
 
@@ -272,7 +293,7 @@ export function findCompressSplitPoint(
 }
 ```
 
-**关键设计**：
+**设计意图**：
 - 使用字符数而非 token 数估算（避免本地 token 计算开销）
 - 只在 `user` role 且非 `functionResponse` 处分割，确保对话结构完整
 - 如果最后一条是 model 消息且无 function call，可以压缩全部历史
@@ -339,62 +360,6 @@ sequenceDiagram
 1. **UI 与 Client**：UI 层通过 `useGeminiStream` Hook 监听压缩事件，更新界面提示
 2. **Client 与 Service**：`tryCompressChat` 封装压缩调用，处理成功/失败逻辑
 3. **Service 与 LLM**：使用专用 Prompt 生成结构化总结，确保输出质量
-
----
-
-### 3.4 关键数据路径
-
-#### 主路径（正常流程）
-
-```mermaid
-flowchart LR
-    subgraph Input["输入阶段"]
-        I1[原始历史] --> I2[过滤无效记录]
-        I2 --> I3[curatedHistory]
-    end
-
-    subgraph Process["处理阶段"]
-        P1[阈值检查] --> P2[分割计算]
-        P2 --> P3[LLM 总结]
-        P3 --> P4[Token 计算]
-    end
-
-    subgraph Output["输出阶段"]
-        O1[重建历史] --> O2[状态报告]
-        O2 --> O3[事件通知]
-    end
-
-    I3 --> P1
-    P4 --> O1
-
-    style Process fill:#e1f5e1,stroke:#333
-```
-
-#### 异常路径（错误恢复）
-
-```mermaid
-flowchart TD
-    E[发生错误] --> E1{错误类型}
-    E1 -->|历史为空| R1[返回 NOOP]
-    E1 -->|已失败过| R2[跳过压缩]
-    E1 -->|总结为空| R3[FAILED_EMPTY]
-    E1 -->|Token 增加| R4[FAILED_INFLATED]
-    E1 -->|计数错误| R5[FAILED_TOKEN_ERROR]
-
-    R3 --> R6[标记 hasFailedCompressionAttempt]
-    R4 --> R6
-    R5 --> R6
-
-    R1 --> End[结束]
-    R2 --> End
-    R6 --> End
-
-    style R1 fill:#FFD700
-    style R2 fill:#FFD700
-    style R3 fill:#FF6B6B
-    style R4 fill:#FF6B6B
-    style R5 fill:#FF6B6B
-```
 
 ---
 
@@ -621,7 +586,7 @@ async compress(
 }
 ```
 
-**代码要点**：
+**设计意图**：
 
 1. **分层条件检查**：先检查空历史、失败标记，再检查阈值，避免无效计算
 2. **字符数估算分割**：使用 `JSON.stringify(content).length` 估算，避免本地 token 计算
@@ -845,4 +810,4 @@ if (isSummaryEmpty) {
 ---
 
 *✅ Verified: 基于 qwen-code/packages/core/src/services/chatCompressionService.ts 等源码分析*
-*基于版本：2025-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

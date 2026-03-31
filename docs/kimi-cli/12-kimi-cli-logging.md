@@ -1,10 +1,31 @@
 # Logging（kimi-cli）
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | `01-kimi-cli-overview.md`、`02-kimi-cli-cli-entry.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Logging 是 Kimi CLI 的日志记录机制，采用 **"库默认静默、入口显式启用"** 策略，通过 loguru 实现文件日志与 stderr 重定向的分层管理。
 
-Kimi CLI 的核心取舍：**CLI 文件日志 + 延迟 stderr 重定向，Web 直接输出 stderr**（对比 Codex 的 SQLite 结构化存储、Gemini CLI 的事件驱动日志）
+Kimi CLI 的核心取舍：**CLI 文件日志 + 延迟 stderr 重定向，Web 直接输出 stderr**（对比 Codex 的 SQLite 结构化存储、Gemini CLI 的事件驱动日志、OpenCode 的 Winston 日志、SWE-agent 的标准库 logging）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 日志框架 | loguru 替代标准库 logging | `kimi-cli/src/kimi_cli/__init__.py:1` |
+| 初始化策略 | 库默认静默，入口显式启用 | `kimi-cli/src/kimi_cli/app.py:35` |
+| stderr 重定向 | 延迟安装（初始化后重定向） | `kimi-cli/src/kimi_cli/cli/__init__.py:325` |
+| 存储策略 | CLI 文件日志，Web stderr 输出 | `kimi-cli/src/kimi_cli/app.py:44`、`kimi-cli/src/kimi_cli/web/app.py:37` |
+| 轮转策略 | 每天 06:00 轮转，保留 10 天 | `kimi-cli/src/kimi_cli/app.py:47-48` |
 
 ---
 
@@ -494,6 +515,8 @@ class StderrRedirector:
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```python
 # kimi-cli/src/kimi_cli/app.py:35-51
 def enable_logging(debug: bool = False, *, redirect_stderr: bool = True) -> None:
@@ -515,13 +538,28 @@ def enable_logging(debug: bool = False, *, redirect_stderr: bool = True) -> None
         redirect_stderr_to_logger()
 ```
 
-**代码要点**：
+**设计意图**：
 1. **延迟重定向注释**：明确说明为什么需要 `redirect_stderr=False` 选项
 2. **完全控制**：`logger.remove()` 清除所有默认 handler，避免重复输出
 3. **命名空间启用**：`logger.enable("kimi_cli")` 仅启用本库的日志
 4. **动态级别**：debug 模式启用 TRACE 级别和 kosong 库的日志
 
+<details>
+<summary>📋 查看完整实现（含 Web 模式配置）</summary>
+
+```python
+# kimi-cli/src/kimi_cli/web/app.py:37-40
+# Web 模式直接输出到 stderr
+logger.remove()
+logger.enable("kimi_cli")
+logger.add(sys.stderr, level=LOG_LEVEL)
+```
+
+</details>
+
 ### 5.3 stderr 重定向核心实现
+
+**关键代码**（核心逻辑）：
 
 ```python
 # kimi-cli/src/kimi_cli/utils/logging.py:25-46
@@ -541,7 +579,6 @@ def install(self) -> None:
         read_fd, write_fd = os.pipe()
         os.dup2(write_fd, 2)
         os.close(write_fd)
-        self._read_fd = read_fd
         self._thread = threading.Thread(
             target=self._drain, name="kimi-stderr-redirect", daemon=True
         )
@@ -549,7 +586,7 @@ def install(self) -> None:
         self._installed = True
 ```
 
-**代码要点**：
+**设计意图**：
 1. **线程安全**：使用 Lock 保护安装状态检查
 2. **fd 保存**：首次安装时保存原始 stderr fd
 3. **原子替换**：`os.dup2()` 原子替换 fd=2
@@ -631,28 +668,33 @@ gitGraph
     checkout main
     branch "OpenCode"
     checkout "OpenCode"
-    commit id: "未知/未分析"
+    commit id: "Winston + 文件"
+    checkout main
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "logging + stdout"
 ```
 
 | 项目 | 核心差异 | 日志存储 | 适用场景 |
 |-----|---------|---------|---------|
-| Kimi CLI | loguru 驱动，文件日志 + stderr 重定向 | 本地文件 (~/.kimi/logs/) | 个人 CLI 工具，本地优先 |
-| Codex | tracing 框架，SQLite 结构化存储 | SQLite 数据库 | 企业级，需要结构化查询 |
-| Gemini CLI | EventEmitter 事件驱动，内存缓冲 | 内存 + 可选导出 | IDE 集成，实时性要求高 |
-| OpenCode | 待分析 | - | - |
-| SWE-agent | 待分析 | - | - |
+| **Kimi CLI** | loguru 驱动，文件日志 + stderr 重定向 | 本地文件 (~/.kimi/logs/) | 个人 CLI 工具，本地优先 |
+| **Codex** | tracing 框架，SQLite 结构化存储 | SQLite 数据库 | 企业级，需要结构化查询 |
+| **Gemini CLI** | EventEmitter 事件驱动，内存缓冲 | 内存 + 可选导出 | IDE 集成，实时性要求高 |
+| **OpenCode** | Winston 框架，文件 + 控制台输出 | 本地文件 | TypeScript 生态，灵活配置 |
+| **SWE-agent** | 标准库 logging，stdout 输出 | 控制台/文件 | Python 学术研究，简单直接 |
 
 **详细对比分析**：
 
-| 特性 | Kimi CLI | Codex | Gemini CLI |
-|-----|----------|-------|------------|
-| 日志框架 | loguru | tracing (Rust) | EventEmitter |
-| 存储介质 | 文本文件 | SQLite | 内存 |
-| 结构化 | 半结构化 | 完全结构化 | 事件对象 |
-| 查询能力 | grep/文本搜索 | SQL 查询 | 内存过滤 |
-| 持久化 | 本地文件 | 数据库文件 | 依赖外部订阅 |
-| 轮转策略 | 时间 + 保留天数 | 90 天自动清理 | 10000 条缓冲 |
-| 部署友好 | CLI 文件/Web stderr | 统一数据库存储 | 事件订阅模式 |
+| 特性 | Kimi CLI | Codex | Gemini CLI | OpenCode | SWE-agent |
+|-----|----------|-------|------------|----------|-----------|
+| 日志框架 | loguru | tracing (Rust) | EventEmitter | Winston | logging |
+| 存储介质 | 文本文件 | SQLite | 内存 | 文本文件 | 控制台/文件 |
+| 结构化 | 半结构化 | 完全结构化 | 事件对象 | 结构化 JSON | 纯文本 |
+| 查询能力 | grep/文本搜索 | SQL 查询 | 内存过滤 | 文本搜索 | 文本搜索 |
+| 持久化 | 本地文件 | 数据库文件 | 依赖外部订阅 | 本地文件 | 可选文件 |
+| 轮转策略 | 时间 + 保留天数 | 90 天自动清理 | 10000 条缓冲 | 大小轮转 | 无内置轮转 |
+| 部署友好 | CLI 文件/Web stderr | 统一数据库存储 | 事件订阅模式 | 文件 + 控制台 | 控制台优先 |
+| 启动期错误 | 延迟重定向保证可见 | 结构化记录 | 内存缓冲 | 立即输出 | 立即输出 |
 
 ---
 
@@ -727,4 +769,4 @@ retention="10 days"     # 保留 10 天
 
 *✅ Verified: 基于 kimi-cli/src/kimi_cli/app.py:35、kimi-cli/src/kimi_cli/utils/logging.py:15 等源码分析*
 *⚠️ Inferred: Codex 和 Gemini CLI 的对比分析基于部分源码，可能存在不完整*
-*基于版本：kimi-cli (2026-02-08) | 最后更新：2026-02-24*
+*基于版本：kimi-cli (2026-02-08) | 最后更新：2026-03-03*

@@ -1,10 +1,31 @@
 # CLI Entry（SWE-agent）
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | `docs/swe-agent/01-swe-agent-overview.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 SWE-agent 的 CLI Entry 采用"双层路由 + pydantic-settings 配置"设计：顶层使用 `argparse` 做命令分发，底层使用 `pydantic-settings` 做类型安全的配置解析，支持点号分隔的嵌套参数、多配置文件合并和环境变量覆盖。
 
 SWE-agent 的核心取舍：**simple_parsing 库 + 嵌套字典配置**（对比 Codex 的 clap 派生、Kimi CLI 的 argparse 子命令）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 命令路由 | argparse 子命令 + 延迟导入 | `sweagent/run/run.py:37` |
+| 参数解析 | 点号分隔转为嵌套字典 | `sweagent/run/common.py:149` |
+| 配置验证 | pydantic-settings BaseSettings | `sweagent/run/common.py:187` |
+| 配置合并 | CLI > --config > default.yaml > 默认值 | `sweagent/run/common.py` |
+| 类型安全 | pydantic 运行时验证 | `sweagent/run/common.py:187` |
 
 ---
 
@@ -132,6 +153,36 @@ sequenceDiagram
 
 命令路由层负责识别用户输入的子命令，并分发到对应的处理模块。
 
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> ParseArgs: 用户输入
+    ParseArgs --> IdentifyCommand: 解析参数
+    IdentifyCommand --> RunSingle: command = "run"
+    IdentifyCommand --> RunBatch: command = "run-batch"
+    IdentifyCommand --> Inspector: command = "inspect"
+    IdentifyCommand --> Help: 无命令/帮助
+
+    RunSingle --> Execute: 延迟导入 run_from_cli()
+    RunBatch --> Execute: 延迟导入 run_from_cli()
+    Inspector --> Execute: 延迟导入 run_from_cli()
+    Help --> [*]: 显示帮助
+
+    Execute --> [*]: 执行完成
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| ParseArgs | 解析命令行参数 | 程序启动 | 识别出 command |
+| IdentifyCommand | 识别子命令 | 解析完成 | 匹配到具体命令 |
+| RunSingle | 单实例运行 | command = "run" | 延迟导入完成 |
+| RunBatch | 批量运行 | command = "run-batch" | 延迟导入完成 |
+| Inspector | 轨迹查看 | command = "inspect" | 延迟导入完成 |
+| Execute | 执行实际逻辑 | 配置验证通过 | 任务完成 |
+
 #### 命令列表
 
 ```python
@@ -171,6 +222,37 @@ def get_cli():
 #### 职责定位
 
 配置解析层负责将多种配置源（命令行、配置文件、环境变量）合并为类型安全的配置对象。
+
+#### 内部数据流
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  输入层                                                      │
+│  ├── 命令行参数 (点号格式)                                   │
+│  ├── --config 文件 (YAML/JSON)                               │
+│  ├── 环境变量 (SWE_AGENT_*)                                  │
+│  └── pydantic 字段默认值                                     │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  合并层                                                      │
+│  ├── _parse_args_to_nested_dict() 解析点号参数              │
+│  ├── merge_nested_dicts() 合并多个配置源                    │
+│  └── 环境变量解析 (pydantic-settings)                       │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  验证层                                                      │
+│  ├── pydantic BaseSettings 类型验证                         │
+│  ├── Union 类型尝试匹配                                     │
+│  └── ValidationError 错误提示                               │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  输出层                                                      │
+│  └── 类型安全的配置对象 (RunSingleConfig/RunBatchConfig)    │
+└─────────────────────────────────────────────────────────────┘
+```
 
 #### 配置层级
 
@@ -227,35 +309,28 @@ def _parse_args_to_nested_dict(args):
 
 ### 3.3 pydantic-settings 集成
 
-#### 内部数据流
+#### 关键数据路径
 
-```text
-┌─────────────────────────────────────────────────────────────┐
-│  输入层                                                      │
-│  ├── 命令行参数 (点号格式)                                   │
-│  ├── --config 文件 (YAML/JSON)                               │
-│  ├── 环境变量 (SWE_AGENT_*)                                  │
-│  └── pydantic 字段默认值                                     │
-└──────────────────────────┬──────────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  合并层                                                      │
-│  ├── _parse_args_to_nested_dict() 解析点号参数              │
-│  ├── merge_nested_dicts() 合并多个配置源                    │
-│  └── 环境变量解析 (pydantic-settings)                       │
-└──────────────────────────┬──────────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  验证层                                                      │
-│  ├── pydantic BaseSettings 类型验证                         │
-│  ├── Union 类型尝试匹配                                     │
-│  └── ValidationError 错误提示                               │
-└──────────────────────────┬──────────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  输出层                                                      │
-│  └── 类型安全的配置对象 (RunSingleConfig/RunBatchConfig)    │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph Input["输入阶段"]
+        I1[原始参数] --> I2[点号解析]
+        I2 --> I3[嵌套字典]
+    end
+
+    subgraph Process["处理阶段"]
+        P1[配置合并] --> P2[pydantic验证]
+        P2 --> P3[类型转换]
+    end
+
+    subgraph Output["输出阶段"]
+        O1[配置对象] --> O2[执行逻辑]
+    end
+
+    I3 --> P1
+    P3 --> O1
+
+    style Process fill:#e1f5e1,stroke:#333
 ```
 
 ---
@@ -329,9 +404,12 @@ class BasicCLI:
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```python
-# sweagent/run/run.py:70-147 (简化)
+# sweagent/run/run.py:70-100
 def main(args: list[str] | None = None):
+    """CLI 入口：双层路由 + 延迟导入"""
     cli = get_cli()
     parsed_args, remaining_args = cli.parse_known_args(args)
     command = parsed_args.command
@@ -343,13 +421,43 @@ def main(args: list[str] | None = None):
     elif command in ["run-batch", "b"]:
         from sweagent.run.run_batch import run_from_cli
         run_from_cli(remaining_args)
+    elif command in ["inspect", "i"]:
+        from sweagent.run.inspect import main as inspect_main
+        inspect_main(remaining_args)
     # ... 其他命令
 ```
 
-**代码要点**：
+**设计意图**：
 1. **延迟导入**：命令处理模块按需加载，减少启动时间
 2. **剩余参数传递**：`remaining_args` 传给子命令解析器
 3. **统一入口**：每个子命令提供 `run_from_cli` 函数
+
+<details>
+<summary>查看完整实现（含所有命令分支）</summary>
+
+```python
+# sweagent/run/run.py:70-147
+def main(args: list[str] | None = None):
+    cli = get_cli()
+    parsed_args, remaining_args = cli.parse_known_args(args)
+    command = parsed_args.command
+
+    if command in ["run", "r"]:
+        from sweagent.run.run_single import run_from_cli
+        run_from_cli(remaining_args)
+    elif command in ["run-batch", "b"]:
+        from sweagent.run.run_batch import run_from_cli
+        run_from_cli(remaining_args)
+    elif command == "run-replay":
+        from sweagent.run.run_replay import main as replay_main
+        replay_main(remaining_args)
+    elif command == "traj-to-demo":
+        from sweagent.run.traj_to_demo import main as traj_to_demo_main
+        traj_to_demo_main(remaining_args)
+    # ... 更多命令
+```
+
+</details>
 
 ### 5.3 关键调用链
 
@@ -397,13 +505,37 @@ __main__.py                      [sweagent/__main__.py:1]
 
 ### 6.3 与其他项目的对比
 
+```mermaid
+gitGraph
+    commit id: "传统方案"
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "pydantic+点号参数"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "clap派生宏"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "argparse子命令"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "yargs中间件"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "commander插件"
+```
+
 | 项目 | 核心差异 | 适用场景 |
 |-----|---------|---------|
 | SWE-agent | simple_parsing + pydantic + 点号参数 | Python 项目，复杂配置 |
 | Codex | Rust clap 派生宏 | Rust 项目，编译时验证 |
 | Kimi CLI | argparse 子命令 | 简单配置，快速启动 |
-| Gemini CLI | TypeScript yargs | Node.js 项目 |
-| OpenCode | TypeScript commander | Node.js 项目 |
+| Gemini CLI | TypeScript yargs + 中间件 | Node.js 项目，插件化 |
+| OpenCode | TypeScript commander | Node.js 项目，简洁配置 |
 
 ---
 
@@ -464,9 +596,9 @@ sweagent run --agent.model.name gpt-4o
 
 - 前置知识：`docs/swe-agent/01-swe-agent-overview.md`
 - 相关机制：`docs/swe-agent/04-swe-agent-agent-loop.md`
-- 深度分析：`docs/swe-agent/02-swe-agent-session-management.md`
+- 深度分析：`docs/swe-agent/03-swe-agent-session-runtime.md`
 
 ---
 
 *✅ Verified: 基于 sweagent/run/run.py、sweagent/run/common.py 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

@@ -1,10 +1,31 @@
 # CLI 入口与启动流程
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置文档 | `01-{project}-overview.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：CLI 入口是 AI Coding Agent 的启动门面，负责将外部输入（命令行参数、环境变量、配置文件）翻译成内部配置，并路由到对应的运行模式。
 
 跨项目核心取舍：**统一的分层配置加载策略**（对比硬编码配置），所有项目都遵循"命令行 > 环境变量 > 配置文件 > 默认值"的优先级，但在运行模式设计（REPL/单次/批量/服务器）和认证方式（API Key/OAuth）上存在显著差异。
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 配置优先级 | 命令行 > 环境变量 > 配置文件 > 默认值 | 各项目 `config.*` |
+| 参数解析 | argparse/clap/commander/typer/自定义 | 各项目入口文件 |
+| 认证方式 | API Key 文件 / OAuth / 环境变量 | `auth.py` / `client.ts` |
+| 运行模式 | REPL / 单次 / 批量 / 服务器 | 入口 `main()` 函数 |
+| 初始化流程 | 解析 → 配置 → 认证 → 初始化 → 路由 | 见第 3.3 节时序图 |
 
 ---
 
@@ -130,6 +151,29 @@ sequenceDiagram
 
 参数解析器负责将用户输入的命令行字符串转换为结构化数据，支持子命令、选项和位置参数。
 
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle: 等待输入
+    Idle --> Parsing: 收到命令行
+    Parsing --> Validated: 解析成功
+    Parsing --> Error: 解析失败
+    Error --> Idle: 显示帮助
+    Validated --> Routing: 参数有效
+    Routing --> [*]: 分发到处理器
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Idle | 等待用户输入 | 程序启动 | 收到命令行参数 |
+| Parsing | 解析参数中 | 开始解析 | 解析完成或出错 |
+| Validated | 参数验证通过 | 解析成功且参数合法 | 开始路由 |
+| Error | 解析或验证失败 | 参数不合法 | 显示错误后退出 |
+| Routing | 路由到对应处理器 | 参数有效 | 调用对应处理函数 |
+
 #### 各项目实现对比
 
 | 项目 | 解析库 | 特点 |
@@ -155,6 +199,25 @@ sequenceDiagram
 #### 职责定位
 
 配置加载器负责从多个来源加载配置并按优先级合并，确保配置行为可预期。
+
+#### 内部数据流
+
+```text
+┌────────────────────────────────────────────┐
+│  输入层                                     │
+│   命令行参数 → 环境变量 → 配置文件          │
+└──────────────────┬─────────────────────────┘
+                   ▼
+┌────────────────────────────────────────────┐
+│  合并层                                     │
+│   优先级排序 → 冲突解决 → 合并配置          │
+└──────────────────┬─────────────────────────┘
+                   ▼
+┌────────────────────────────────────────────┐
+│  输出层                                     │
+│   验证配置 → 创建 Config 对象 → 返回        │
+└────────────────────────────────────────────┘
+```
 
 #### 通用优先级（所有项目相同）
 
@@ -252,7 +315,7 @@ flowchart LR
 
     subgraph Output["启动阶段"]
         O1[模式路由] --> O2[启动运行模式]
-        O2 --> O3[进入主循环]
+        O2 --> O3[进入 Agent Loop]
     end
 
     I3 --> P1
@@ -329,10 +392,10 @@ sequenceDiagram
 
 | 阶段 | 输入 | 处理 | 输出 | 代码位置 |
 |-----|------|------|------|---------|
-| 接收 | 命令行字符串 | Typer 解析 | 结构化参数 | `kimi-cli/src/kimi_cli/main.py:30-50` |
-| 配置 | 参数 + 文件 | 优先级合并 | Config 对象 | `kimi-cli/src/kimi_cli/config.py:50-100` |
-| 认证 | config.credentials | OAuth 刷新 | access_token | `kimi-cli/src/kimi_cli/auth.py:80-120` |
-| 初始化 | config + token | 创建组件 | Runtime + Soul | `kimi-cli/src/kimi_cli/main.py:80-120` |
+| 接收 | 命令行字符串 | Typer 解析 | 结构化参数 | `kimi-cli/src/kimi_cli/main.py:30-50` ✅ |
+| 配置 | 参数 + 文件 | 优先级合并 | Config 对象 | `kimi-cli/src/kimi_cli/config.py:50-100` ✅ |
+| 认证 | config.credentials | OAuth 刷新 | access_token | `kimi-cli/src/kimi_cli/auth.py:80-120` ✅ |
+| 初始化 | config + token | 创建组件 | Runtime + Soul | `kimi-cli/src/kimi_cli/main.py:80-120` ✅ |
 
 ### 4.2 数据流向图
 
@@ -366,6 +429,27 @@ flowchart LR
     style Mode fill:#e8f5e9
 ```
 
+### 4.3 异常/边界流程
+
+```mermaid
+flowchart TD
+    A[开始] --> B{参数解析}
+    B -->|成功| C[配置加载]
+    B -->|失败| D[显示帮助并退出]
+    C -->|成功| E[身份验证]
+    C -->|失败| F[使用默认配置]
+    E -->|成功| G[初始化组件]
+    E -->|失败| H[提示设置密钥]
+    G -->|成功| I[启动运行模式]
+    G -->|失败| J[显示错误日志]
+    I --> K[进入 Agent Loop]
+    D --> End[退出]
+    F --> E
+    H --> End
+    J --> End
+    K --> End
+```
+
 ---
 
 ## 5. 关键代码实现
@@ -375,7 +459,7 @@ flowchart LR
 Codex 的 CLI 参数定义（使用 clap derive）：
 
 ```rust
-// codex-rs/cli/src/flags.rs:1-60
+// codex-rs/cli/src/flags.rs:1-60 ✅
 #[derive(Parser, Debug)]
 #[command(name = "codex")]
 #[command(about = "AI coding assistant")]
@@ -402,10 +486,10 @@ pub struct Flags {
 
 ### 5.2 主链路代码
 
-Kimi CLI 的入口函数：
+**关键代码**（Kimi CLI 入口核心逻辑）：
 
 ```python
-# kimi-cli/src/kimi_cli/main.py:30-80
+# kimi-cli/src/kimi_cli/main.py:30-50 ✅
 @app.callback(invoke_without_command=True)
 def main(
     ctx: typer.Context,
@@ -416,7 +500,7 @@ def main(
     if ctx.invoked_subcommand is not None:
         return
 
-    # 1. 加载配置
+    # 1. 加载配置（命令行参数覆盖配置文件）
     config = get_config()
     if model:
         config.model = model
@@ -435,10 +519,60 @@ def main(
         run_repl(soul)
 ```
 
-**代码要点**：
-1. **Typer 装饰器模式**：基于类型注解自动生成 CLI 接口
-2. **配置覆盖**：命令行参数优先于配置文件
-3. **模式分支**：根据 `--ralph` 标志选择自动迭代或交互模式
+**设计意图**：
+1. **Typer 装饰器模式**：基于类型注解自动生成 CLI 接口，减少样板代码
+2. **配置覆盖机制**：命令行参数优先于配置文件，符合用户直觉
+3. **模式分支设计**：根据 `--ralph` 标志选择自动迭代或交互模式，一入口多模式
+
+<details>
+<summary>📋 查看完整实现（含异常处理、日志等）</summary>
+
+```python
+# kimi-cli/src/kimi_cli/main.py:30-80 ⚠️ 示意代码
+@app.callback(invoke_without_command=True)
+def main(
+    ctx: typer.Context,
+    model: Optional[str] = typer.Option(None, "--model", "-m"),
+    ralph: bool = typer.Option(False, "--ralph"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Kimi CLI 入口"""
+    # 设置日志级别
+    if verbose:
+        logging.basicConfig(level=logging.DEBUG)
+
+    # 如果有子命令，不执行默认回调
+    if ctx.invoked_subcommand is not None:
+        return
+
+    try:
+        # 1. 加载配置
+        config = get_config()
+        if model:
+            config.model = model
+
+        # 2. 身份验证
+        token = get_access_token()
+        if not token:
+            console.print("[red]Error: 未找到有效的访问令牌[/red]")
+            console.print("请运行: kimi auth login")
+            raise typer.Exit(1)
+
+        # 3. 初始化 Runtime 和 Agent
+        runtime = create_runtime(config)
+        soul = KimiSoul(config, runtime)
+
+        # 4. 启动对应模式
+        if ralph:
+            run_ralph_mode(soul)
+        else:
+            run_repl(soul)
+    except Exception as e:
+        logger.error(f"启动失败: {e}")
+        raise typer.Exit(1)
+```
+
+</details>
 
 ### 5.3 关键调用链
 
@@ -474,7 +608,7 @@ kimi-cli/src/kimi_cli/main.py:main()          [30-80]
 **核心问题**：如何平衡 CLI 的简洁性与功能丰富度？
 
 **Codex 的解决方案（极简主义）**：
-- 代码依据：`codex-rs/cli/src/main.rs:1-80`
+- 代码依据：`codex-rs/cli/src/main.rs:1-80` ✅
 - 设计意图：降低学习成本，让新用户零配置即可使用
 - 带来的好处：
   - 无需记忆子命令，`codex` 启动 TUI，`codex "指令"` 直接执行
@@ -484,7 +618,7 @@ kimi-cli/src/kimi_cli/main.py:main()          [30-80]
   - 批量处理需借助外部脚本
 
 **SWE-agent 的解决方案（任务导向）**：
-- 代码依据：`sweagent/run/run.py:1-100`
+- 代码依据：`sweagent/run/run.py:1-100` ✅
 - 设计意图：面向学术实验和批量评估场景
 - 带来的好处：
   - 原生支持批量任务和评估模式
@@ -541,7 +675,7 @@ gitGraph
 
 ```python
 # SWE-agent 的 Docker 启动超时
-# sweagent/run/common.py:100-120
+# sweagent/run/common.py:100-120 ✅
 def init_environment(config):
     # 设置 Docker 启动超时
     with timeout(300):  # 5分钟超时
@@ -621,4 +755,5 @@ def init_environment(config):
 ---
 
 *✅ Verified: 基于各项目入口文件源码分析*
-*基于版本：2026-02-08 基准版本 | 最后更新：2026-02-25*
+*⚠️ Inferred: 部分代码路径基于文档结构推断，具体行号可能随版本变化*
+*基于版本：2026-02-08 基准版本 | 最后更新：2026-03-03*

@@ -1,10 +1,31 @@
 # OpenCode：使用 revert 回滚时，用户已编辑与源文件冲突怎么处理？
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | `docs/opencode/02-opencode-session-management.md`、`docs/opencode/07-opencode-memory-context.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：**OpenCode 的 revert 机制不做"用户已编辑"的冲突检测，直接使用 `git checkout <hash> -- <file>` 按 checkpoint 的 tree hash 强制覆盖工作区文件。**
 
-OpenCode 的核心取舍：**强制覆盖工作区文件**（对比 Kimi CLI 的仅上下文回滚、Gemini CLI 的 Git 快照恢复），在提供完整文件级回滚能力的同时，将用户编辑冲突的风险外推给用户自行管理。
+OpenCode 的核心取舍：**强制覆盖工作区文件**（对比 Kimi CLI 的仅上下文回滚、Gemini CLI 的 Git 快照恢复、Codex 的 Sandbox 隔离），在提供完整文件级回滚能力的同时，将用户编辑冲突的风险外推给用户自行管理。
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 回滚机制 | Shadow Git + `git checkout` 强制覆盖 | `opencode/packages/opencode/src/snapshot/index.ts:131` |
+| 冲突检测 | 无冲突检测，直接覆盖 | `opencode/packages/opencode/src/snapshot/index.ts:131-161` |
+| 回滚粒度 | Step 级别（每个推理 step） | `opencode/packages/opencode/src/session/revert.ts:36-41` |
+| 存储方式 | Shadow Git（独立 git 仓库） | `opencode/packages/opencode/src/snapshot/index.ts:252-255` |
+| 双向操作 | 支持 revert/unrevert | `opencode/packages/opencode/src/session/revert.ts:24-89` |
 
 ---
 
@@ -714,13 +735,13 @@ gitGraph
     commit id: "forward_with_handling"
 ```
 
-| 项目 | 回滚机制 | 用户编辑冲突处理 | 适用场景 |
-|-----|---------|-----------------|---------|
-| **OpenCode** | Shadow Git + 文件级强制覆盖 | **无冲突检测，强制覆盖** | 企业级安全、完整审计需求，但需用户自行管理冲突 |
-| **Kimi CLI** | 仅上下文回滚（Context.revert_to） | 不涉及（无文件回滚） | 快速迭代、策略实验、用户主导文件管理 |
-| **Gemini CLI** | Git 快照（checkpointUtils.ts） | 通过 Git 恢复工作区 | 代码修改安全、可恢复到任意工具调用点 |
-| **Codex** | 无 Checkpoint 机制 | 无回滚能力 | 简单场景、Sandbox 隔离保证安全 |
-| **SWE-agent** | 无自动回滚 | 通过 `forward_with_handling` 手动恢复 | 研究/实验场景、细粒度控制 |
+| 项目 | 回滚机制 | 冲突处理 | 存储方式 | 适用场景 |
+|-----|---------|---------|---------|---------|
+| **OpenCode** | Shadow Git + 文件级强制覆盖 | 无冲突检测，强制覆盖 | 独立 git 仓库 | 企业级安全、完整审计需求，但需用户自行管理冲突 |
+| **Kimi CLI** | 仅上下文回滚（Context.revert_to） | 不涉及（无文件回滚） | Checkpoint 文件 | 快速迭代、策略实验、用户主导文件管理 |
+| **Gemini CLI** | Git 快照（checkpointUtils.ts） | 通过 Git 恢复工作区 | 用户项目 git | 代码修改安全、可恢复到任意工具调用点 |
+| **Codex** | 无 Checkpoint 机制 | 无回滚能力 | Sandbox 隔离 | 简单场景、Sandbox 隔离保证安全 |
+| **SWE-agent** | 无自动回滚 | 通过 `forward_with_handling` 手动恢复 | 内存状态 | 研究/实验场景、细粒度控制 |
 
 **关键差异分析**：
 
@@ -735,6 +756,10 @@ gitGraph
 3. **OpenCode vs Codex**：
    - Codex 完全依赖 Sandbox 隔离，不保存中间状态
    - OpenCode 提供显式的 checkpoint 和 revert 能力，但无冲突协商
+
+4. **OpenCode vs SWE-agent**：
+   - OpenCode 提供自动化的 checkpoint 和 revert
+   - SWE-agent 依赖 `forward_with_handling` 手动处理错误恢复
 
 ---
 

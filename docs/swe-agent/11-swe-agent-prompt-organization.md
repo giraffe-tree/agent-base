@@ -1,8 +1,29 @@
-# SWE-agent Prompt Organization
+# Prompt Organization（SWE-agent）
+
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `docs/swe-agent/01-swe-agent-overview.md`、`docs/swe-agent/04-swe-agent-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
 
 ## TL;DR（结论先行）
 
 SWE-agent 采用**配置驱动 + Jinja2 模板引擎**的 prompt 组织方式，通过 YAML 配置文件定义多类模板（system/instance/next_step/strategy），支持运行时动态渲染和多级继承。核心取舍是**模板化配置优先**（对比 Kimi CLI 的程序化 prompt 构建）。
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 配置格式 | YAML + Jinja2 模板 | `sweagent/agent/agents.py:60` |
+| 模板类型 | system/instance/next_step/strategy | `sweagent/agent/agents.py:65-87` |
+| 渲染引擎 | Jinja2 Template | `sweagent/agent/agents.py:312` |
+| 继承机制 | extends 单继承 | YAML 配置 |
+| 变量注入 | `_get_format_dict()` 动态组装 | `sweagent/agent/agents.py:680` |
 
 ---
 
@@ -31,7 +52,7 @@ SWE-agent 采用**配置驱动 + Jinja2 模板引擎**的 prompt 组织方式，
 
 ---
 
-## 2. 整体架构
+## 2. 整体架构（ASCII 图）
 
 ### 2.1 在系统中的位置
 
@@ -62,11 +83,11 @@ SWE-agent 采用**配置驱动 + Jinja2 模板引擎**的 prompt 组织方式，
 
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
-| `TemplateConfig` | 模板配置模型 | `SWE-agent/sweagent/agent/agents.py:60` |
-| `system_template` | 系统身份定义 | `SWE-agent/sweagent/agent/agents.py:65` |
-| `instance_template` | 问题实例描述 | `SWE-agent/sweagent/agent/agents.py:66` |
-| `next_step_template` | 下一步指导 | `SWE-agent/sweagent/agent/agents.py:67` |
-| `add_instance_template_to_history()` | 添加实例模板到历史 | `SWE-agent/sweagent/agent/agents.py:748` |
+| `TemplateConfig` | 模板配置模型 | `sweagent/agent/agents.py:60` |
+| `system_template` | 系统身份定义 | `sweagent/agent/agents.py:65` |
+| `instance_template` | 问题实例描述 | `sweagent/agent/agents.py:66` |
+| `next_step_template` | 下一步指导 | `sweagent/agent/agents.py:67` |
+| `add_instance_template_to_history()` | 添加实例模板到历史 | `sweagent/agent/agents.py:748` |
 
 ### 2.3 核心组件交互关系
 
@@ -102,11 +123,60 @@ sequenceDiagram
 
 ## 3. 核心组件详细分析
 
-### 3.1 模板类型分层
+### 3.1 TemplateConfig 内部结构
 
 #### 职责定位
 
-SWE-agent 将 prompt 分为四层，从抽象到具体：
+定义所有 message 模板的配置模型，支持四层模板类型从抽象到具体。
+
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unloaded: 初始化
+    Unloaded --> Loading: 加载配置
+    Loading --> Loaded: 解析完成
+    Loaded --> Rendering: 收到渲染请求
+    Rendering --> Rendered: 渲染完成
+    Rendered --> Applied: 添加到历史
+    Applied --> [*]
+    Loading --> Failed: 解析错误
+    Failed --> Unloaded: 重试
+    Failed --> [*]: 放弃
+    Rendering --> Failed: 变量缺失
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Unloaded | 未加载 | 初始化 | 开始加载配置 |
+| Loading | 加载中 | 开始加载 | 解析完成/失败 |
+| Loaded | 已加载 | 解析完成 | 收到渲染请求 |
+| Rendering | 渲染中 | 收到请求 | 渲染完成/失败 |
+| Rendered | 已渲染 | 渲染完成 | 应用到历史 |
+| Failed | 失败 | 解析/渲染错误 | 重试或终止 |
+
+#### 内部数据流
+
+```text
+┌────────────────────────────────────────────┐
+│  输入层                                     │
+│   YAML 配置 → Pydantic 解析 → TemplateConfig│
+└──────────────────┬─────────────────────────┘
+                   ▼
+┌────────────────────────────────────────────┐
+│  处理层                                     │
+│   继承合并 → 变量组装 → Jinja2 渲染        │
+└──────────────────┬─────────────────────────┘
+                   ▼
+┌────────────────────────────────────────────┐
+│  输出层                                     │
+│   渲染后字符串 → Message → History          │
+└────────────────────────────────────────────┘
+```
+
+#### 模板类型分层
 
 ```text
 ┌─────────────────────────────────────────────────────┐
@@ -196,7 +266,7 @@ prompt_context = {
 
 ## 4. 端到端数据流转
 
-### 4.1 正常流程
+### 4.1 正常流程（详细版）
 
 ```mermaid
 sequenceDiagram
@@ -222,12 +292,12 @@ sequenceDiagram
 
 **数据变换详情**：
 
-| 阶段 | 输入 | 处理 | 输出 |
-|-----|------|------|------|
-| 配置加载 | YAML 文件 | Pydantic 解析 | TemplateConfig 对象 |
-| 变量组装 | 运行时数据 | 字典构建 | prompt_context |
-| 模板渲染 | 模板 + 变量 | Jinja2 渲染 | 字符串 |
-| 组合 | 多个 prompt 段 | 字符串拼接 | 完整 prompt |
+| 阶段 | 输入 | 处理 | 输出 | 代码位置 |
+|-----|------|------|------|---------|
+| 配置加载 | YAML 文件 | Pydantic 解析 | TemplateConfig 对象 | `sweagent/agent/agents.py:60` |
+| 变量组装 | 运行时数据 | 字典构建 | prompt_context | `sweagent/agent/agents.py:680` |
+| 模板渲染 | 模板 + 变量 | Jinja2 渲染 | 字符串 | `sweagent/agent/agents.py:312` |
+| 组合 | 多个 prompt 段 | 字符串拼接 | 完整 prompt | `sweagent/agent/agents.py:310` |
 
 ### 4.2 配置继承流程
 
@@ -247,6 +317,27 @@ flowchart LR
     L4 --> R1
 ```
 
+### 4.3 异常/边界流程
+
+```mermaid
+flowchart TD
+    Start[开始] --> Load{配置加载}
+    Load -->|成功| Render{模板渲染}
+    Load -->|失败| LoadError[配置错误]
+    Render -->|成功| Combine[组合输出]
+    Render -->|变量缺失| VarError[变量错误]
+    Render -->|语法错误| SyntaxError[模板语法错误]
+    Combine --> End[结束]
+    LoadError --> End
+    VarError --> End
+    SyntaxError --> End
+
+    style LoadError fill:#FF6B6B
+    style VarError fill:#FFD700
+    style SyntaxError fill:#FF6B6B
+    style Combine fill:#90EE90
+```
+
 ---
 
 ## 5. 关键代码实现
@@ -254,7 +345,7 @@ flowchart LR
 ### 5.1 核心数据结构
 
 ```python
-# SWE-agent/sweagent/agent/agents.py:60-126
+# sweagent/agent/agents.py:60-126
 class TemplateConfig(BaseModel):
     """This configuration is used to define almost all message templates that are
     formatted by the agent and sent to the LM.
@@ -296,8 +387,10 @@ class TemplateConfig(BaseModel):
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```python
-# SWE-agent/sweagent/agent/agents.py:748-770
+# sweagent/agent/agents.py:748-770
 def add_instance_template_to_history(self, state: dict[str, str]) -> None:
     """Add the instance template to the history.
 
@@ -315,21 +408,58 @@ def add_instance_template_to_history(self, state: dict[str, str]) -> None:
         )
 ```
 
-**代码要点**：
-
+**设计意图**：
 1. **模板渲染**：使用 Jinja2 Template 渲染模板
 2. **状态注入**：通过 `_get_format_dict` 注入环境状态
 3. **标签标记**：添加 "template" 标签便于追踪
 
+<details>
+<summary>查看完整实现（含错误处理、日志等）</summary>
+
+```python
+# sweagent/agent/agents.py:748-790
+def add_instance_template_to_history(self, state: dict[str, str]) -> None:
+    """Add the instance template to the history.
+
+    This is called at the beginning of the agent run.
+    """
+    templates = [self.templates.instance_template]
+    if self.templates.strategy_template:
+        templates.append(self.templates.strategy_template)
+    for template in templates:
+        self._add_message_to_history(
+            "user",
+            Template(template).render(**self._get_format_dict(state=state)),
+            agent=self.name,
+            tags=["template"],
+        )
+
+def _get_format_dict(self, state: dict[str, str]) -> dict[str, str]:
+    """Get the format dictionary for template rendering.
+
+    This dictionary contains all variables available in templates.
+    """
+    return {
+        "problem_statement": state.get("problem_statement", ""),
+        "repo_name": state.get("repo_name", ""),
+        "workspace_path": state.get("workspace_path", ""),
+        "available_tools": state.get("available_tools", ""),
+        "history": state.get("history", ""),
+        "state_summary": state.get("state_summary", ""),
+    }
+```
+
+</details>
+
 ### 5.3 关键调用链
 
 ```text
-Agent.run()                    [SWE-agent/sweagent/agent/agents.py:390]
-  -> setup()                   [SWE-agent/sweagent/agent/agents.py:561]
-    -> add_instance_template_to_history() [SWE-agent/sweagent/agent/agents.py:748]
+Agent.run()                    [sweagent/agent/agents.py:390]
+  -> setup()                   [sweagent/agent/agents.py:561]
+    -> add_instance_template_to_history() [sweagent/agent/agents.py:748]
       - Template.render()      [Jinja2]
-  -> step()                    [SWE-agent/sweagent/agent/agents.py:790]
-    -> _add_step_to_history()  [SWE-agent/sweagent/agent/agents.py:714]
+  -> step()                    [sweagent/agent/agents.py:790]
+    -> _add_step_to_history()  [sweagent/agent/agents.py:714]
       - Template(next_step_template).render()
 ```
 
@@ -351,7 +481,7 @@ Agent.run()                    [SWE-agent/sweagent/agent/agents.py:390]
 **核心问题**：如何在保持灵活性的同时降低 prompt 管理复杂度？
 
 **SWE-agent 的解决方案**：
-- 代码依据：`SWE-agent/sweagent/agent/agents.py:60`
+- 代码依据：`sweagent/agent/agents.py:60`
 - 设计意图：将 prompt 从代码中抽离，实现配置化管理
 - 带来的好处：
   - 非技术人员可调整 prompt
@@ -363,18 +493,52 @@ Agent.run()                    [SWE-agent/sweagent/agent/agents.py:390]
 
 ### 6.3 与其他项目的对比
 
+```mermaid
+gitGraph
+    commit id: "硬编码 prompt"
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "YAML + Jinja2"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "程序化构建"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "内置模板"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "混合模式"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "配置中心"
+```
+
 | 项目 | 核心差异 | 适用场景 |
 |-----|---------|---------|
 | SWE-agent | YAML + Jinja2 配置驱动 | 研究场景，需要频繁调整 prompt |
 | Kimi CLI | 程序化构建 prompt | 生产环境，prompt 相对稳定 |
 | Codex | 内置模板，用户不可配置 | 标准化场景，简化用户体验 |
 | Gemini CLI | 混合模式 | 平衡灵活性和易用性 |
+| OpenCode | 配置中心 | 企业级统一管理 |
 
 ---
 
 ## 7. 边界情况与错误处理
 
-### 7.1 模板渲染错误
+### 7.1 终止条件
+
+| 终止原因 | 触发条件 | 处理方式 |
+|---------|---------|---------|
+| 配置解析失败 | YAML 语法错误 | 抛出异常，终止启动 |
+| 模板未找到 | 配置引用不存在 | 使用默认空字符串 |
+| 变量缺失 | 模板使用了未提供的变量 | Jinja2 默认忽略，可配置严格模式 |
+| 渲染超时 | 复杂模板渲染耗时过长 | 无超时控制，依赖系统资源 |
+
+### 7.2 模板渲染错误
 
 | 错误类型 | 触发条件 | 处理策略 |
 |---------|---------|---------|
@@ -382,7 +546,7 @@ Agent.run()                    [SWE-agent/sweagent/agent/agents.py:390]
 | 变量缺失 | 模板使用了未提供的变量 | Jinja2 默认忽略，可配置严格模式 |
 | 语法错误 | Jinja2 语法错误 | 抛出 TemplateSyntaxError |
 
-### 7.2 配置继承冲突
+### 7.3 配置继承冲突
 
 ```yaml
 # base.yaml
@@ -401,15 +565,16 @@ templates:
 
 ## 8. 关键代码索引
 
-| 功能 | 文件 | 说明 |
-|-----|------|------|
-| 模板配置 | `SWE-agent/sweagent/agent/agents.py` | 60 | TemplateConfig 类 |
-| 系统模板 | `SWE-agent/sweagent/agent/agents.py` | 65 | system_template |
-| 实例模板 | `SWE-agent/sweagent/agent/agents.py` | 66 | instance_template |
-| 下一步模板 | `SWE-agent/sweagent/agent/agents.py` | 67 | next_step_template |
-| 策略模板 | `SWE-agent/sweagent/agent/agents.py` | 87 | strategy_template |
-| 演示模板 | `SWE-agent/sweagent/agent/agents.py` | 88 | demonstration_template |
-| 添加实例模板 | `SWE-agent/sweagent/agent/agents.py` | 748 | add_instance_template_to_history() |
+| 功能 | 文件 | 行号 | 说明 |
+|-----|------|------|------|
+| 模板配置 | `sweagent/agent/agents.py` | 60 | TemplateConfig 类 |
+| 系统模板 | `sweagent/agent/agents.py` | 65 | system_template |
+| 实例模板 | `sweagent/agent/agents.py` | 66 | instance_template |
+| 下一步模板 | `sweagent/agent/agents.py` | 67 | next_step_template |
+| 策略模板 | `sweagent/agent/agents.py` | 87 | strategy_template |
+| 演示模板 | `sweagent/agent/agents.py` | 88 | demonstration_template |
+| 添加实例模板 | `sweagent/agent/agents.py` | 748 | add_instance_template_to_history() |
+| 变量组装 | `sweagent/agent/agents.py` | 680 | _get_format_dict() |
 
 ---
 
@@ -418,8 +583,13 @@ templates:
 - 前置知识：`docs/swe-agent/04-swe-agent-agent-loop.md`（Agent 循环中的 prompt 注入点）
 - 相关机制：`docs/swe-agent/05-swe-agent-tools-system.md`（工具描述动态渲染）
 - 深度分析：`docs/swe-agent/questions/swe-agent-context-compaction.md`（上下文压缩与 prompt 长度管理）
+- 跨项目对比：
+  - `docs/kimi-cli/11-kimi-cli-prompt-organization.md`
+  - `docs/codex/11-codex-prompt-organization.md`
+  - `docs/gemini-cli/11-gemini-cli-prompt-organization.md`
+  - `docs/opencode/11-opencode-prompt-organization.md`
 
 ---
 
-*✅ Verified: 基于 SWE-agent/sweagent/agent/agents.py 源码分析*
-*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-02-25*
+*✅ Verified: 基于 sweagent/agent/agents.py 源码分析*
+*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-03-03*

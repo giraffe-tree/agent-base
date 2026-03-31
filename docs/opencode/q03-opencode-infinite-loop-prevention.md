@@ -1,10 +1,32 @@
 # OpenCode 无限循环预防机制
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | `04-opencode-agent-loop.md`、`10-opencode-safety-control.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：无限循环预防是 Code Agent 的安全机制，防止 LLM 在工具调用中陷入重复调用相同工具的无效循环。
 
 OpenCode 的核心取舍：**行为模式检测 + PermissionNext 权限介入**（对比 Kimi CLI 的 Checkpoint 回滚、Codex 的沙箱隔离）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 检测方式 | 最近 3 次工具调用精确匹配 | `opencode/packages/opencode/src/session/processor.ts:151` |
+| 检测阈值 | `DOOM_LOOP_THRESHOLD = 3` | `opencode/packages/opencode/src/session/processor.ts:20` |
+| 匹配逻辑 | 工具名 + 输入参数 JSON 序列化比较 | `opencode/packages/opencode/src/session/processor.ts:154-166` |
+| 权限系统 | PermissionNext.ask() 用户确认 | `opencode/packages/opencode/src/session/processor.ts:169` |
+| 用户选项 | once / always / reject | `opencode/packages/opencode/src/permission/next.ts:163` |
+| 默认规则 | `doom_loop: "ask"` | `opencode/packages/opencode/src/agent/agent.ts:58` |
 
 ---
 
@@ -132,6 +154,41 @@ sequenceDiagram
 #### 职责定位
 
 在 SessionProcessor 中实时检测最近 3 次工具调用是否形成重复模式。
+
+#### 内部数据流
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  输入层                                                      │
+│  ├── tool-call 事件触发                                      │
+│  ├── 提取 value.toolName（工具名）                           │
+│  └── 提取 value.input（输入参数）                            │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  历史查询层                                                  │
+│  ├── MessageV2.parts(messageID)                              │
+│  ├── 获取所有工具调用 parts                                  │
+│  └── slice(-DOOM_LOOP_THRESHOLD) 取最近3次                   │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  检测层                                                      │
+│  ├── 检查数量 >= 3                                           │
+│  ├── 比较工具名：p.tool === value.toolName                   │
+│  ├── 比较参数：JSON.stringify(p.state.input) === JSON.stringify(value.input) │
+│  └── 检查状态：p.state.status !== "pending"                  │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  处理层                                                      │
+│  ├── 未检测到循环 → 正常继续                                 │
+│  └── 检测到循环 → PermissionNext.ask()                       │
+│       ├── 用户选择 once → 继续本次                           │
+│       ├── 用户选择 always → 持久化并继续                     │
+│       └── 用户选择 reject → 终止会话                         │
+└─────────────────────────────────────────────────────────────┘
+```
 
 #### 检测逻辑流程
 
@@ -509,26 +566,27 @@ SessionProcessor.process()    [processor.ts:45]
 ### 6.3 与其他项目的对比
 
 ```mermaid
-flowchart LR
-    subgraph OpenCode["OpenCode"]
-        OC1[模式检测] --> OC2[权限介入]
-    end
-
-    subgraph Kimi["Kimi CLI"]
-        K1[Checkpoint] --> K2[状态回滚]
-    end
-
-    subgraph Codex["Codex"]
-        C1[沙箱隔离] --> C2[资源限制]
-    end
-
-    subgraph Gemini["Gemini CLI"]
-        G1[策略驱动] --> G2[自动确认]
-    end
-
-    subgraph SWE["SWE-agent"]
-        S1[forward_with_handling]
-    end
+gitGraph
+    commit id: "无循环预防"
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "模式检测 + 权限介入"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "Checkpoint 回滚"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "沙箱 + 审批"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "策略驱动自动确认"
+    checkout main
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "forward_with_handling"
 ```
 
 | 项目 | 核心差异 | 适用场景 |
@@ -538,6 +596,18 @@ flowchart LR
 | Codex | 沙箱 + 审批流程 | 高安全要求的企业环境 |
 | Gemini CLI | 策略驱动的自动确认 | 追求流畅体验的场景 |
 | SWE-agent | 错误处理包装器 | 研究/实验环境 |
+
+**详细对比分析**：
+
+| 特性 | OpenCode | Kimi CLI | Codex | Gemini CLI | SWE-agent |
+|-----|----------|----------|-------|------------|-----------|
+| 检测机制 | 最近3次调用精确匹配 | Checkpoint 状态对比 | 沙箱资源监控 | 策略规则匹配 | 异常捕获 |
+| 介入时机 | 检测到循环时 | 任意时刻可回滚 | 实时审批 | 自动/策略驱动 | 异常发生时 |
+| 用户交互 | 确认对话框 (once/always/reject) | D-Mail 时间旅行 | 审批流程 | 自动确认/策略 | 重试/终止 |
+| 回滚能力 | 无（仅阻止继续） | ✅ 完整状态回滚 | ❌ | ✅ Git 快照 | ❌ |
+| 配置方式 | PermissionNext 规则 | 配置文件 | 环境变量 | 策略文件 | 代码配置 |
+| 持久化 | 内存 approved 列表 | Checkpoint 文件 | 无 | 策略存储 | 无 |
+| 粒度 | 工具调用级别 | Turn 级别 | 操作级别 | 工具级别 | 任务级别 |
 
 ---
 

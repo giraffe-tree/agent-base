@@ -1,10 +1,31 @@
 # 循环检测机制（Qwen Code）
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-35 分钟 |
+> | 前置文档 | `../04-qwen-code-agent-loop.md`、`../06-qwen-code-mcp-integration.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
-Qwen Code 通过**三层渐进式循环检测**（工具调用哈希重复、内容流滑动窗口、LLM 语义分析）+ **动态检测间隔调整** + **会话级禁用控制**防止 Agent 陷入无限循环。
+一句话定义：Qwen Code 通过**三层渐进式循环检测**（工具调用哈希重复、内容流滑动窗口、LLM 语义分析）+ **动态检测间隔调整** + **会话级禁用控制**防止 Agent 陷入无限循环。
 
 Qwen Code 的核心取舍：**渐进式智能检测 + 代码块感知过滤**（对比 Gemini CLI 的双模型验证、Kimi CLI 的简单计数限制、Codex 的审批介入策略）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 工具检测 | SHA256 哈希 + 连续计数（阈值 5） | `packages/core/src/services/loopDetectionService.ts:175` |
+| 内容检测 | 滑动窗口 + Markdown 过滤 | `packages/core/src/services/loopDetectionService.ts:207` |
+| LLM 检测 | 置信度驱动 + 动态间隔（5-15 轮） | `packages/core/src/services/loopDetectionService.ts:395` |
+| 防误报 | 代码块/表格/列表感知重置 | `packages/core/src/services/loopDetectionService.ts:219` |
+| 会话控制 | disableForSession 手动禁用 | `packages/core/src/services/loopDetectionService.ts:108` |
 
 ---
 
@@ -306,7 +327,7 @@ private checkToolCallLoop(toolCall: { name: string; args: object }): boolean {
 }
 ```
 
-**设计要点**：
+**设计意图**：
 1. **SHA256 哈希**：确保参数变化也能被精确检测
 2. **连续计数**：只检测连续重复，避免误伤正常间隔重复
 3. **工具调用会重置内容跟踪**：`resetContentTracking()` 避免跨工具调用的内容误检测
@@ -382,7 +403,7 @@ private checkContentLoop(content: string): boolean {
 }
 ```
 
-**设计要点**：
+**设计意图**：
 1. **Markdown 元素感知**：检测到代码围栏、表格、列表、标题、引用、分隔线时重置跟踪
 2. **代码块状态跟踪**：`inCodeBlock` 布尔值跟踪是否在代码块内
 3. **滑动窗口**：50 字符块（`CONTENT_CHUNK_SIZE`）逐字符滑动
@@ -471,7 +492,7 @@ private async checkForLoopWithLLM(signal: AbortSignal) {
 }
 ```
 
-**设计要点**：
+**设计意图**：
 1. **延迟启用**：30 轮后才启用，避免短对话的额外开销
 2. **动态间隔**：根据置信度调整（5-15轮），高置信度循环可能时检测更频繁
 3. **结构化输出**：使用 JSON schema 获取 reasoning 和 confidence
@@ -726,7 +747,7 @@ addAndCheck(event: ServerGeminiStreamEvent): boolean {
 }
 ```
 
-**代码要点**：
+**设计意图**：
 1. **短路返回**：已检测到循环或会话禁用时直接返回
 2. **工具调用重置内容跟踪**：工具调用会中断内容流，重置内容跟踪状态
 3. **同步检测**：流式事件同步处理，确保即时发现循环
@@ -791,7 +812,7 @@ private isLoopDetectedForChunk(chunk: string, hash: string): boolean {
 }
 ```
 
-**代码要点**：
+**设计意图**：
 1. **逐字符滑动**：`lastContentIndex++` 实现逐字符滑动窗口
 2. **哈希聚类**：`contentStats` Map 存储每个哈希值的所有出现位置
 3. **距离阈值**：平均距离 <= 1.5 * 块大小（75字符）认为是短距离重复
@@ -854,32 +875,38 @@ sendMessageStream()                    [packages/core/src/core/client.ts:403]
 ### 6.3 与其他项目的对比
 
 ```mermaid
-flowchart TD
-    subgraph "防循环策略对比"
-        A[Qwen Code] --> A1[三层渐进检测]
-        A --> A2[Markdown 感知过滤]
-        A --> A3[动态检测间隔]
-
-        B[Gemini CLI] --> B1[三层检测]
-        B --> B2[双模型验证]
-        B --> B3[Final Warning]
-
-        C[Kimi CLI] --> C1[简单 step 计数]
-        C --> C2[D-Mail 回退]
-
-        D[Codex] --> D1[重试上限]
-        D --> D2[审批介入]
-
-        E[OpenCode] --> E1[Doom loop 检测]
-        E --> E2[权限系统]
-    end
-
-    style A fill:#90EE90
-    style B fill:#87CEEB
-    style C fill:#FFB6C1
-    style D fill:#FFD700
-    style E fill:#DDA0DD
+gitGraph
+    commit id: "基础防护"
+    branch "Qwen Code"
+    checkout "Qwen Code"
+    commit id: "三层渐进+Markdown感知"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "双模型验证+FinalWarning"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "简单计数+D-Mail"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "审批介入+策略"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "DoomLoop+权限"
 ```
+
+| 项目 | 核心差异 | 适用场景 |
+|-----|---------|---------|
+| Qwen Code | 三层渐进检测，Markdown 感知过滤，动态检测间隔 | 需要平衡检测准确性和成本的生产环境 |
+| Gemini CLI | 双模型验证降低误报，Final Warning 优雅恢复 | 追求极致用户体验的场景 |
+| Kimi CLI | 简单计数器 + 显式回退，不依赖智能检测 | 需要状态回滚能力的复杂任务 |
+| Codex | 策略驱动 + 审批介入 | 企业级安全场景 |
+| OpenCode | Doom loop 检测 + 权限系统 | 需要灵活权限控制的场景 |
+
+**详细对比分析**：
 
 | 防护机制 | Qwen Code | Gemini CLI | Kimi CLI | Codex | OpenCode |
 |---------|-----------|------------|----------|-------|----------|
@@ -991,4 +1018,4 @@ const isDivider = /^[+-_=*\u2500-\u257F]+$/.test(content);   // 分隔线
 ---
 
 *✅ Verified: 基于 qwen-code/packages/core/src/services/loopDetectionService.ts、qwen-code/packages/core/src/core/client.ts、qwen-code/packages/core/src/telemetry/types.ts 源码分析*
-*基于版本：qwen-code (baseline 2026-02-08) | 最后更新：2026-02-24*
+*基于版本：qwen-code (baseline 2026-02-08) | 最后更新：2026-03-03*

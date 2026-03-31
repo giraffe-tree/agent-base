@@ -1,10 +1,31 @@
 # MCP 集成（opencode）
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置文档 | `01-opencode-overview.md`、`05-opencode-tools-system.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：MCP (Model Context Protocol) 集成是 OpenCode 连接外部工具生态的桥梁，通过将 MCP 服务器暴露的工具动态转换为 Vercel AI SDK 的 `Tool` 类型，使 LLM 能够调用本地命令行工具或远程 HTTP 服务。
 
 OpenCode 的核心取舍：**AI SDK 原生集成 + 状态驱动的生命周期管理 + 孤儿进程自动清理**（对比 Kimi CLI 的独立工具层、Gemini CLI 的函数声明映射）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 工具转换 | dynamicTool 包装 MCP 工具 | `packages/opencode/src/mcp/index.ts:120` |
+| 生命周期 | Instance.state() 惰性初始化 | `packages/opencode/src/mcp/index.ts:185` |
+| 传输协议 | StreamableHTTP → SSE 自动回退 | `packages/opencode/src/mcp/index.ts:337` |
+| 进程清理 | descendants() 递归清理孤儿进程 | `packages/opencode/src/mcp/index.ts:163` |
+| 超时控制 | resetTimeoutOnProgress 进度重置 | `packages/opencode/src/mcp/index.ts:381` |
 
 ---
 
@@ -206,6 +227,35 @@ flowchart TD
 1. **传输层自动回退**：远程连接先尝试 StreamableHTTP，失败后自动回退到 SSE
 2. **并发初始化**：使用 `Promise.all` 并行初始化所有 MCP 客户端
 3. **错误隔离**：单个客户端失败不影响其他客户端
+
+#### 内部数据流
+
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│  输入层                                                          │
+│  ├── Config.get() ──► 多层级配置合并                              │
+│  │   └── remote → global → project → inline                      │
+│  └── mcp: { server1: {...}, server2: {...} }                     │
+└──────────────────────────┬──────────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  处理层                                                          │
+│  ├── 遍历配置项                                                  │
+│  │   └── [key, mcp] → create(key, mcp)                          │
+│  ├── 类型判断                                                    │
+│  │   ├── local → StdioClientTransport                           │
+│  │   └── remote → StreamableHTTP → SSE (fallback)               │
+│  └── 状态记录                                                    │
+│      └── status[key] = { status: "connected" | "failed" | ... } │
+└──────────────────────────┬──────────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  输出层                                                          │
+│  ├── clients: Record<string, MCPClient>                         │
+│  ├── status: Record<string, Status>                             │
+│  └── tools: 通过 convertMcpTool 转换后的 AI SDK 工具             │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 #### 孤儿进程清理机制
 
@@ -791,6 +841,10 @@ gitGraph
     branch "Codex"
     checkout "Codex"
     commit id: "沙箱内工具"
+    checkout main
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "独立工具层"
 ```
 
 | 项目 | 核心差异 | 适用场景 |
@@ -799,16 +853,19 @@ gitGraph
 | Kimi CLI | 独立工具层，支持 Checkpoint 回滚 | Python 生态，需要状态持久化 |
 | Gemini CLI | 函数声明映射到 Gemini API | Google Gemini 专用，函数调用原生支持 |
 | Codex | 沙箱内工具执行，安全隔离优先 | 企业环境，安全要求严格 |
+| SWE-agent | 独立工具层 + 代码生成 | 自动化代码修复场景 |
 
 **详细对比**：
 
-| 特性 | OpenCode | Kimi CLI | Gemini CLI | Codex |
-|-----|----------|----------|------------|-------|
-| 工具集成方式 | AI SDK dynamicTool | 独立 Tool 类 | 函数声明映射 | 沙箱内执行 |
-| 传输协议 | HTTP/SSE/Stdio | Stdio | HTTP | 内部 IPC |
-| OAuth 支持 | 内置 Provider | 外部配置 | 内置 | 无 |
-| 配置验证 | Zod Schema | Pydantic | TypeScript | Rust 类型 |
-| 状态管理 | Instance.state() | Checkpoint 文件 | 内存状态 | Actor 消息 |
+| 特性 | OpenCode | Kimi CLI | Gemini CLI | Codex | SWE-agent |
+|-----|----------|----------|------------|-------|-----------|
+| 工具集成方式 | AI SDK dynamicTool | 独立 Tool 类 | 函数声明映射 | 沙箱内执行 | 独立工具层 |
+| 传输协议 | HTTP/SSE/Stdio | Stdio | HTTP | 内部 IPC | Stdio |
+| OAuth 支持 | 内置 Provider | 外部配置 | 内置 | 无 | 无 |
+| 配置验证 | Zod Schema | Pydantic | TypeScript | Rust 类型 | YAML |
+| 状态管理 | Instance.state() | Checkpoint 文件 | 内存状态 | Actor 消息 | 内存 |
+| 进程管理 | descendants() 递归清理 | 无 | 无 | 沙箱隔离 | 无 |
+| 超时控制 | resetTimeoutOnProgress | 固定超时 | 固定超时 | 可配置 | 固定超时 |
 
 ---
 

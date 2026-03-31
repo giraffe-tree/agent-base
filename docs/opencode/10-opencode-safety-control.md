@@ -1,10 +1,31 @@
 # Safety Control（opencode）
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-35 分钟 |
+> | 前置文档 | `01-opencode-overview.md`、`04-opencode-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Safety Control 是 Code Agent 的安全闸门，防止危险操作在未经审批的情况下执行。
 
 OpenCode 的核心取舍：**规则评估 + 执行前拦截 + 事件审批 + 路径边界** 四段式控制（对比 Kimi CLI 的 Checkpoint 回滚、Codex 的沙箱隔离、Gemini CLI 的静态分析）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 规则评估 | Pattern 匹配 + 后匹配优先 | `packages/opencode/src/permission/next.ts` |
+| 执行拦截 | 工具执行前 ctx.ask() 统一入口 | `packages/opencode/src/session/prompt.ts` |
+| 事件审批 | permission.asked/reply 事件驱动 | `packages/opencode/src/server/routes/permission.ts` |
+| 路径边界 | Instance.containsPath() 运行时检查 | `packages/opencode/src/project/instance.ts` |
+| 记忆机制 | 会话级 approvedPatterns 集合 | `packages/opencode/src/permission/next.ts` |
 
 ---
 
@@ -766,4 +787,4 @@ async askUser(context: PermissionContext): Promise<Decision> {
 ---
 
 *✅ Verified: 基于 opencode/packages/opencode/src/permission/next.ts 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-25*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

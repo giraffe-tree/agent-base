@@ -1,14 +1,35 @@
 # Kimi CLI ACP 集成实现
 
-## TL;DR（结论先行）
-
-Kimi CLI 实现了 ACP（Agent Client Protocol）协议，通过 ACP Server 模式将 Agent 能力服务化，支持外部系统调用、多会话管理、MCP 配置桥接和流式状态传输。
-
-Kimi CLI 的核心取舍：**协议分层架构 + 能力协商机制**（对比 Codex/SWE-agent 等非 ACP 架构）
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-35 分钟 |
+> | 前置文档 | `01-kimi-cli-overview.md`、`06-kimi-cli-mcp-integration.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
 
 ---
 
-## 1. 为什么需要这个机制
+## TL;DR（结论先行）
+
+一句话定义：Kimi CLI 实现了 ACP（Agent Client Protocol）协议，通过 ACP Server 模式将 Agent 能力服务化，支持外部系统调用、多会话管理、MCP 配置桥接和流式状态传输。
+
+Kimi CLI 的核心取舍：**协议分层架构 + 能力协商机制**（对比 Codex/SWE-agent 等非 ACP 架构，OpenCode 的 task 工具 + ACP 并存，Gemini CLI 的实验性 ACP 支持）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 协议实现 | 原生 ACP Server 实现 | `kimi-cli/src/kimi_cli/acp/server.py:27` |
+| 会话管理 | 多会话 dict 管理 | `kimi-cli/src/kimi_cli/acp/server.py:31` |
+| 能力协商 | 运行时协商 + fallback 机制 | `kimi-cli/src/kimi_cli/acp/kaos.py:149` |
+| MCP 桥接 | acp_mcp_servers_to_mcp_config | `kimi-cli/src/kimi_cli/acp/mcp.py:13` |
+| 流式传输 | 实时 session_update 推送 | `kimi-cli/src/kimi_cli/acp/session.py:139` |
+
+---
+
+## 1. 为什么需要这个机制？（解决什么问题）
 
 ### 1.1 问题场景
 
@@ -31,7 +52,7 @@ Kimi CLI 的核心取舍：**协议分层架构 + 能力协商机制**（对比 
 
 ---
 
-## 2. 整体架构
+## 2. 整体架构（ASCII 图）
 
 ### 2.1 在系统中的位置
 
@@ -312,6 +333,66 @@ sequenceDiagram
     deactivate S
 ```
 
+**协作要点**：
+
+1. **ACPServer 与会话管理**：通过 sessions dict 管理多会话，支持并发
+2. **ACPSession 与 KimiSoul**：调用 KimiSoul.run() 执行 Agent Loop
+3. **ACPKaos 能力协商**：运行时检测客户端能力，动态选择本地或远程执行
+4. **流式状态推送**：通过 session_update 实时推送执行状态到客户端
+
+---
+
+### 3.5 关键数据路径
+
+#### 主路径（正常流程）
+
+```mermaid
+flowchart LR
+    subgraph Input["输入阶段"]
+        I1[ACP ContentBlock] --> I2[acp_blocks_to_content_parts]
+        I2 --> I3[ContentPart 列表]
+    end
+
+    subgraph Process["处理阶段"]
+        P1[KimiSoul.run] --> P2[Agent Loop]
+        P2 --> P3[工具执行]
+    end
+
+    subgraph Output["输出阶段"]
+        O1[Wire 消息] --> O2[convert.py 转换]
+        O2 --> O3[ACP session_update]
+    end
+
+    I3 --> P1
+    P3 --> O1
+
+    style Process fill:#e1f5e1,stroke:#333
+```
+
+#### 异常路径（错误恢复）
+
+```mermaid
+flowchart TD
+    E[发生错误] --> E1{错误类型}
+    E1 -->|会话不存在| R1[返回 invalid_params]
+    E1 -->|执行异常| R2[返回 internal_error]
+    E1 -->|LLM 未设置| R3[返回 auth_required]
+    E1 -->|达到最大步数| R4[返回 max_turn_requests]
+    E1 -->|用户取消| R5[返回 cancelled]
+
+    R1 --> End[结束]
+    R2 --> End
+    R3 --> End
+    R4 --> End
+    R5 --> End
+
+    style R1 fill:#FFB6C1
+    style R2 fill:#FFB6C1
+    style R3 fill:#FFD700
+    style R4 fill:#FFD700
+    style R5 fill:#87CEEB
+```
+
 ---
 
 ## 4. 端到端数据流转
@@ -359,6 +440,16 @@ sequenceDiagram
     S-->>C: response
 ```
 
+**数据变换详情**：
+
+| 阶段 | 输入 | 处理 | 输出 | 代码位置 |
+|-----|------|------|------|---------|
+| 协议握手 | protocol_version | 版本协商 | InitializeResponse | `server.py:37` |
+| 会话创建 | cwd, mcp_servers | 配置转换 | NewSessionResponse | `server.py:108` |
+| 内容转换 | ACPContentBlock | acp_blocks_to_content_parts | ContentPart | `convert.py:17` |
+| 流式推送 | Agent Loop 消息 | 类型映射 | session_update | `session.py:216-301` |
+| 权限审批 | ApprovalRequest | 用户交互 | PermissionResponse | `session.py:337` |
+
 ### 4.2 数据流向图
 
 ```mermaid
@@ -381,7 +472,7 @@ flowchart LR
     I3 --> P1
     P3 --> O1
 
-    style Process fill:#e1f5e1,stroke:#333
+    style Process fill:#f9f,stroke:#333
 ```
 
 ### 4.3 异常/边界流程
@@ -521,6 +612,8 @@ class ACPKaos:
 
 #### 5.2.1 桥接函数实现
 
+**关键代码**（核心逻辑）：
+
 ```python
 # kimi-cli/src/kimi_cli/acp/mcp.py:13-46
 def acp_mcp_servers_to_mcp_config(mcp_servers: list[MCPServer]) -> MCPConfig:
@@ -560,6 +653,12 @@ def _convert_acp_mcp_server(server: MCPServer) -> dict[str, Any]:
             }
 ```
 
+**设计意图**：
+1. **类型安全转换**：使用 Python 3.10+ match-case 进行类型分发，利用 `acp.schema` 的类型定义
+2. **统一配置格式**：转换为内部 `MCPConfig`，与现有 MCP 系统无缝集成
+3. **错误处理**：`ValidationError` 转换为 `MCPConfigError`，提供清晰错误信息
+4. **调用时机**：在 `ACPServer.new_session()` 和 `ACPServer.load_session()` 中调用，将会话级别的 MCP 配置注入到 KimiCLI 实例
+
 #### 5.2.2 转换映射表
 
 | ACP 类型 | 字段映射 | 内部格式 |
@@ -568,14 +667,9 @@ def _convert_acp_mcp_server(server: MCPServer) -> dict[str, Any]:
 | `SseMcpServer` | `url` → `url`<br>`headers[]` → `headers{}` | `{"url": ..., "transport": "sse", "headers": {...}}` |
 | `McpServerStdio` | `command` → `command`<br>`args[]` → `args`<br>`env[]` → `env{}` | `{"command": ..., "args": [...], "env": {...}, "transport": "stdio"}` |
 
-#### 5.2.3 代码要点
-
-1. **类型安全转换**：使用 Python 3.10+ match-case 进行类型分发，利用 `acp.schema` 的类型定义
-2. **统一配置格式**：转换为内部 `MCPConfig`，与现有 MCP 系统无缝集成
-3. **错误处理**：`ValidationError` 转换为 `MCPConfigError`，提供清晰错误信息
-4. **调用时机**：在 `ACPServer.new_session()` 和 `ACPServer.load_session()` 中调用，将会话级别的 MCP 配置注入到 KimiCLI 实例
-
 ### 5.3 权限审批实现
+
+**关键代码**（核心逻辑）：
 
 ```python
 # kimi-cli/src/kimi_cli/acp/session.py:337-422
@@ -609,6 +703,11 @@ async def _handle_approval_request(self, request: ApprovalRequest):
         else:
             request.resolve("reject")
 ```
+
+**设计意图**：
+1. **三种审批选项**：单次批准、会话级批准、拒绝
+2. **异步等待**：通过 ACP 连接异步等待客户端响应
+3. **错误处理**：工具调用不存在时直接拒绝
 
 ### 5.4 流式响应实现细节
 
@@ -780,6 +879,34 @@ acp_main()                    [kimi-cli/src/kimi_cli/acp/__init__.py:1]
 
 ### 6.3 与其他项目的对比
 
+```mermaid
+gitGraph
+    commit id: "单体 Agent"
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "原生 ACP Server"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "task + ACP 并存"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "实验性 ACP"
+    checkout main
+    branch "Qwen Code"
+    checkout "Qwen Code"
+    commit id: "ACP + TaskTool"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "进程内 sub-agent"
+    checkout main
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "单 Agent 无协作"
+```
+
 | 项目 | ACP 支持 | 实现方式 | 多 Agent 协作 |
 |-----|---------|---------|--------------|
 | **Kimi CLI** | **✅** | 原生 ACP Server 实现 | ACP 会话内协作能力 |
@@ -788,6 +915,26 @@ acp_main()                    [kimi-cli/src/kimi_cli/acp/__init__.py:1]
 | Qwen Code | ✅ | `--acp` + acp-integration 模块 | TaskTool + SubAgentTracker |
 | Codex | ❌ | 无 ACP，实现进程内 collab | 实验性进程内 sub-agent |
 | SWE-agent | ❌ | 无 ACP | 单 Agent |
+
+**详细对比分析**：
+
+| 对比维度 | Kimi CLI | OpenCode | Gemini CLI | Codex | SWE-agent |
+|---------|----------|----------|------------|-------|-----------|
+| **协议支持** | ACP 原生 | ACP + 内置 task | ACP 实验性 | 无 | 无 |
+| **架构模式** | Server 模式 | Hybrid 混合 | Server 模式 | 进程内 | 单进程 |
+| **会话管理** | 多会话 dict | 多会话 + task | 单会话 | 单会话 | 单会话 |
+| **能力协商** | 运行时协商 | 配置化 | 部分协商 | 无 | 无 |
+| **流式传输** | 实时推送 | 实时推送 | 实时推送 | 无 | 无 |
+| **MCP 桥接** | 配置转换 | 配置继承 | 配置继承 | 独立配置 | 独立配置 |
+| **远程执行** | ACPKaos fallback | task 委派 | SubAgent | 无 | 无 |
+| **适用场景** | IDE 集成 | 多 Agent 协作 | IDE 集成 | 单用户 | 学术研究 |
+
+**选择建议**：
+
+- 需要**完整的 ACP 协议支持** → Kimi CLI 的原生实现
+- 需要**多 Agent 协作** → OpenCode 的 task + ACP 混合
+- **IDE 集成** + 实验性 → Gemini CLI 的实验性 ACP
+- **简单直接**无协作需求 → Codex 或 SWE-agent
 
 ---
 
@@ -803,7 +950,7 @@ acp_main()                    [kimi-cli/src/kimi_cli/acp/__init__.py:1]
 | auth_required | LLM 未设置 (LLMNotSet) | `kimi-cli/src/kimi_cli/acp/session.py:185` |
 | internal_error | LLM 不支持或其他异常 | `kimi-cli/src/kimi_cli/acp/session.py:188-200` |
 
-### 7.2 资源限制
+### 7.2 超时/资源限制
 
 ```python
 # kimi-cli/src/kimi_cli/acp/kaos.py:13
@@ -856,4 +1003,4 @@ output_byte_limit=builder.max_chars      # 工具输出字符限制
 ---
 
 *✅ Verified: 基于 kimi-cli/src/kimi_cli/acp/*.py 源码分析*
-*基于版本：kimi-cli (2026-02-08) | 最后更新：2026-02-28*
+*基于版本：kimi-cli (2026-02-08) | 最后更新：2026-03-03*

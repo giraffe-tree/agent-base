@@ -1,3 +1,14 @@
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | `01-kimi-cli-overview.md`、`04-kimi-cli-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 # Safety Control（kimi-cli）
 
 ## TL;DR（结论先行）
@@ -5,6 +16,16 @@
 一句话定义：Kimi CLI 的 Safety Control 是**审批状态机驱动的执行门控机制**，通过 `approve / approve_for_session / reject` 三态决策控制工具执行，并在 Agent Loop 中将拒绝结果显式收敛为步骤终止。
 
 Kimi CLI 的核心取舍：**交互式审批状态机 + YOLO 自动放行模式**（对比 Codex 的沙箱隔离 + RejectConfig、Gemini CLI 的规则引擎 + 三级决策、SWE-agent 的过滤策略 + 容器边界）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 审批模式 | 三态状态机（approve/approve_for_session/reject） | `src/kimi_cli/soul/approval.py:24` |
+| 自动放行 | YOLO 模式 + 会话级 auto_approve | `src/kimi_cli/soul/approval.py:27` |
+| 拒绝处理 | ToolRejectedError 终止步骤 | `src/kimi_cli/soul/kimisoul.py:422` |
+| 状态共享 | Approval.share() 子 Agent 继承 | `src/kimi_cli/soul/approval.py:40` |
+| 工具接入 | 统一 request() 接口 | `src/kimi_cli/soul/approval.py:50` |
 
 ---
 
@@ -711,35 +732,27 @@ Agent Loop (_agent_loop)
 ### 6.3 与其他项目的对比
 
 ```mermaid
-flowchart LR
-    subgraph Kimi["Kimi CLI"]
-        K1[审批状态机]
-        K2[YOLO 模式]
-        K3[动作分类]
-    end
-
-    subgraph Codex["Codex"]
-        C1[沙箱隔离]
-        C2[RejectConfig]
-        C3[AskForApproval 五级]
-    end
-
-    subgraph Gemini["Gemini CLI"]
-        G1[PolicyEngine]
-        G2[三级决策]
-        G3[动态规则]
-    end
-
-    subgraph SWE["SWE-agent"]
-        S1[过滤策略]
-        S2[容器边界]
-        S3[自动循环]
-    end
-
-    K1 --> K2 --> K3
-    C1 --> C2 --> C3
-    G1 --> G2 --> G3
-    S1 --> S2 --> S3
+gitGraph
+    commit id: "无安全控制"
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "审批状态机"
+    commit id: "YOLO 模式"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "沙箱隔离"
+    commit id: "RejectConfig"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "PolicyEngine"
+    commit id: "三级决策"
+    checkout main
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "过滤策略"
+    commit id: "容器边界"
 ```
 
 | 项目 | 核心机制 | 安全策略 | 审批机制 | 边界控制 | 适用场景 |

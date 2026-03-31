@@ -1,3 +1,14 @@
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-30 分钟 |
+> | 前置文档 | `01-kimi-cli-overview.md`、`03-kimi-cli-session-runtime.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 # Agent Loop（Kimi CLI）
 
 ## TL;DR（结论先行）
@@ -5,6 +16,17 @@
 一句话定义：Agent Loop 是驱动多轮 LLM 调用与工具执行的循环控制机制，让模型从"一次性回答"变成"多轮迭代执行"。
 
 Kimi CLI 的核心取舍：**命令式 while 循环 + Checkpoint 回滚机制**（对比 Gemini CLI 的递归 continuation、Codex 的 Actor 消息驱动）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 核心机制 | while 循环驱动多轮 LLM 调用 | `src/kimi_cli/soul/kimisoul.py:302` |
+| 状态管理 | Checkpoint 文件保存对话状态 | `src/kimi_cli/soul/kimisoul.py:347` |
+| 错误处理 | 显式 step 上限，超限报错 | `src/kimi_cli/soul/kimisoul.py:332` |
+| 上下文压缩 | Token 超限前置 compaction | `src/kimi_cli/soul/kimisoul.py:344` |
+| D-Mail 机制 | BackToTheFuture 异常驱动回滚 | `src/kimi_cli/soul/kimisoul.py:377` |
+| 并发控制 | 非阻塞审批转发协程 | `src/kimi_cli/wire/server.py:643` |
 
 ---
 
@@ -903,6 +925,10 @@ KimiSoul.run()                      [kimisoul.py:182]
 ```mermaid
 gitGraph
     commit id: "传统方案"
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "forward_with_handling"
+    checkout main
     branch "Kimi CLI"
     checkout "Kimi CLI"
     commit id: "while + Checkpoint"
@@ -918,10 +944,6 @@ gitGraph
     branch "OpenCode"
     checkout "OpenCode"
     commit id: "resetTimeoutOnProgress"
-    checkout main
-    branch "SWE-agent"
-    checkout "SWE-agent"
-    commit id: "forward_with_handling"
 ```
 
 | 项目 | 核心差异 | 适用场景 |
@@ -934,15 +956,18 @@ gitGraph
 
 **详细对比分析**：
 
-| 对比维度 | Kimi CLI | Gemini CLI | Codex | SWE-agent |
-|---------|----------|-----------|-------|-----------|
-| **循环模式** | while 迭代 | 递归 continuation | Actor 消息循环 | 函数式循环 |
-| **状态持久化** | Checkpoint 文件 | 内存状态 | Task 状态机 | 内存 + 日志 |
-| **回滚机制** | D-Mail + revert | 无 | 无 | 无 |
-| **工具并发** | 并发派发、顺序收集 | Scheduler 状态机 | 并发执行 | 顺序执行 |
-| **流式处理** | 回调式 | 事件驱动 | 流式事件 | 阻塞式 |
-| **错误恢复** | tenacity 重试 | 递归重试 | 指数退避 | forward_with_handling |
-| **自动化模式** | Ralph 自动循环 | 手动 continuation | 无 | autosubmit |
+| 对比维度 | Kimi CLI | Gemini CLI | Codex | OpenCode | SWE-agent |
+|---------|----------|-----------|-------|----------|-----------|
+| **循环模式** | while 迭代 | 递归 continuation | Actor 消息循环 | 事件驱动循环 | 函数式循环 |
+| **状态持久化** | Checkpoint 文件 | 内存状态 | Task 状态机 | 内存状态 | 内存 + 日志 |
+| **回滚机制** | D-Mail + revert | 无 | 无 | 无 | 无 |
+| **工具并发** | 并发派发、顺序收集 | Scheduler 状态机 | 并发执行 | 顺序执行 | 顺序执行 |
+| **流式处理** | 回调式 | 事件驱动 | 流式事件 | 流式响应 | 阻塞式 |
+| **错误恢复** | tenacity 重试 | 递归重试 | 指数退避 | 重试机制 | forward_with_handling |
+| **自动化模式** | Ralph 自动循环 | 手动 continuation | 无 | 无 | autosubmit |
+| **上下文压缩** | 前置 compaction | 不支持 | 不支持 | 不支持 | 不支持 |
+| **审批机制** | 独立协程转发 | MessageBus 事件 | 门控等待 | 权限控制 | 无 |
+| **适用场景** | 复杂回滚需求 | 精细状态管理 | 企业级安全 | 长运行任务 | SWE 任务 |
 
 ---
 
@@ -1025,7 +1050,20 @@ reserved_context_size: int = Field(default=50_000, ge=1000)
 
 ---
 
+## 9. 延伸阅读
+
+- 前置知识：`01-kimi-cli-overview.md`
+- Session Runtime：`03-kimi-cli-session-runtime.md`
+- Checkpoint 深度分析：`docs/kimi-cli/questions/kimi-cli-checkpoint-implementation.md`
+- 跨项目对比：`docs/comm/04-comm-agent-loop.md`
+- 其他项目 Agent Loop：
+  - `docs/codex/04-codex-agent-loop.md`
+  - `docs/gemini-cli/04-gemini-cli-agent-loop.md`
+  - `docs/opencode/04-opencode-agent-loop.md`
+
+---
+
 *✅ Verified: 基于 kimi-cli/src/kimi_cli/soul/kimisoul.py:182-540 等源码分析*
 *✅ Verified: 基于 kimi-cli/src/kimi_cli/wire/server.py:446-658 WireServer 非阻塞设计*
 
-*基于版本：kimi-cli (2026-02-11) | 最后更新：2026-03-02*
+*基于版本：kimi-cli (2026-02-11) | 最后更新：2026-03-03*

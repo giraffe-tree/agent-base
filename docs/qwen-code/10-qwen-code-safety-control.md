@@ -1,3 +1,14 @@
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-35 分钟 |
+> | 前置文档 | `01-qwen-code-overview.md`、`05-qwen-code-tools-system.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 # Safety Control（Qwen Code）
 
 ## TL;DR（结论先行）
@@ -5,6 +16,17 @@
 一句话定义：Safety Control 是 Qwen Code 的多层次安全控制机制，通过**ApprovalMode（审批模式）+ 工具级确认 + 文件夹信任模型 + Shell 命令静态分析**四层防护，防止 AI 执行危险操作。
 
 Qwen Code 的核心取舍：**分层渐进式安全模型**（对比 Codex 的强制沙盒、Kimi CLI 的简单确认对话框）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 审批模式 | 四级模式（PLAN/DEFAULT/AUTO_EDIT/YOLO） | `packages/core/src/config/config.ts:131` |
+| 工具确认 | 每个工具自定义 shouldConfirmExecute() 逻辑 | `packages/core/src/tools/tools.ts:45` |
+| 文件夹信任 | 二元信任状态，限制非信任目录功能 | `packages/core/src/config/config.ts:1458` |
+| Shell 安全 | 静态白名单 + 语法分析，无需运行时沙盒 | `packages/core/src/utils/shellReadOnlyChecker.ts:339` |
+| ACP 保护 | Plan 模式在 ACP 会话中强制执行 | `packages/cli/src/acp-integration/session/Session.ts:519` |
+| 限流处理 | 429/503/1302 错误码检测 + 60s 倒计时重试 | `packages/core/src/utils/rateLimit.ts:29` |
 
 ---
 
@@ -117,6 +139,7 @@ sequenceDiagram
 | 4 | 工具级确认检查 | 第二层细粒度控制，每个工具自定义逻辑 |
 | 6a | 显示确认对话框 | 用户介入决策点，支持多种确认选项 |
 | 8a | onConfirm 回调 | 支持"始终允许"等持久化授权 |
+| 9-10 | 工具执行与结果返回 | 主流程与副作用分离，确保核心逻辑稳定 |
 
 ---
 

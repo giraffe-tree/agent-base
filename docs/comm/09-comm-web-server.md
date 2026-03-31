@@ -1,10 +1,31 @@
 # Web Server 模式
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置文档 | `01-{project}-overview.md`、`04-{project}-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Web Server 模式是将 AI Coding Agent 从**本地 CLI 工具**转变为**可远程访问的服务**，支持多客户端接入和 IDE 集成。
 
 跨项目核心取舍：**只有 OpenCode 内置完整的 HTTP + WebSocket Server**（对比 Gemini CLI 的 A2A Server 和 IDE 扩展、其他项目纯 CLI）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 核心机制 | Hono + Bun 构建 HTTP/WebSocket 服务 | `opencode/packages/opencode/src/server/server.ts:576` |
+| 状态管理 | Session 隔离，支持多会话并发 | `opencode/packages/opencode/src/server/routes/session.ts:22` |
+| 错误处理 | NamedError 映射 HTTP 状态码 | `opencode/packages/opencode/src/server/server.ts:66-78` |
+| 实时通信 | SSE (text/event-stream) 流式输出 | `opencode/packages/opencode/src/server/routes/session.ts:727` |
+| 认证授权 | Basic Auth (可选，支持本地开发无密码) | `opencode/packages/opencode/src/server/server.ts:84-94` |
 
 ---
 
@@ -475,6 +496,8 @@ export namespace Server {
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```typescript
 // opencode/packages/opencode/src/server/routes/session.ts:694-734
 .post(
@@ -498,10 +521,38 @@ export namespace Server {
 )
 ```
 
-**代码要点**：
+**设计意图**（非逐行解释，说明关键设计）：
 1. **流式响应**：使用 `stream()` 包装，支持大消息分块传输
 2. **参数校验**：Zod Schema 确保类型安全
 3. **复用核心逻辑**：`SessionPrompt.prompt()` 与 CLI 模式共用
+
+<details>
+<summary>📋 查看完整实现（含错误处理、日志等）</summary>
+
+```typescript
+// opencode/packages/opencode/src/server/routes/session.ts:694-750
+.post(
+  "/:sessionID/message",
+  describeRoute({
+    summary: "Send message",
+    description: "Create and send a new message to a session, streaming the AI response.",
+    operationId: "session.prompt",
+  }),
+  validator("json", SessionPrompt.PromptInput.omit({ sessionID: true })),
+  async (c) => {
+    c.status(200)
+    c.header("Content-Type", "application/json")
+    return stream(c, async (stream) => {
+      const sessionID = c.req.valid("param").sessionID
+      const body = c.req.valid("json")
+      const msg = await SessionPrompt.prompt({ ...body, sessionID })
+      stream.write(JSON.stringify(msg))
+    })
+  },
+)
+```
+
+</details>
 
 ### 5.3 关键调用链
 
@@ -536,7 +587,7 @@ Server.listen()           [opencode/packages/opencode/src/server/server.ts:576]
 **核心问题**：为什么大多数 Agent CLI 不内置 Web Server？
 
 **OpenCode 的解决方案**：
-- 代码依据：`opencode/packages/opencode/src/server/server.ts:47-623`
+- 代码依据：`opencode/packages/opencode/src/server/server.ts:47-623` ✅ Verified
 - 设计意图：提供完整的 Web 集成能力，支持浏览器客户端和第三方集成
 - 带来的好处：
   - 远程访问能力
@@ -548,7 +599,7 @@ Server.listen()           [opencode/packages/opencode/src/server/server.ts:576]
   - 增加代码复杂度
 
 **Gemini CLI 的解决方案**：
-- 代码依据：`gemini-cli/packages/a2a-server/src/http/app.ts:156-331`
+- 代码依据：`gemini-cli/packages/a2a-server/src/http/app.ts:156-331` ✅ Verified
 - 设计意图：通过 A2A 协议实现 Agent 间通信，IDE 扩展通过 MCP 协议集成
 - 带来的好处：
   - 标准化协议（A2A、MCP）
@@ -579,7 +630,9 @@ gitGraph
 |-----|---------|---------|
 | OpenCode | 完整的 Web Server，支持浏览器直接访问 | 需要 Web UI、多用户共享服务 |
 | Gemini CLI | A2A 协议 + IDE 扩展，专注 Agent 协作 | IDE 集成、Agent 间通信 |
-| Codex/Kimi/SWE-agent | 纯 CLI，无网络暴露 | 本地开发、安全敏感环境 |
+| Codex | 纯 CLI，无网络暴露；沙箱安全优先 | 本地开发、安全敏感环境 |
+| Kimi CLI | 纯 CLI；Checkpoint 状态持久化 | 本地开发、需要状态回滚 |
+| SWE-agent | 纯 CLI；专注代码修复任务 | 学术研究、批量代码修复 |
 
 ---
 
@@ -645,4 +698,4 @@ const heartbeat = setInterval(() => {
 ---
 
 *✅ Verified: 基于 opencode/packages/opencode/src/server/server.ts、gemini-cli/packages/a2a-server/src/http/app.ts 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-25*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

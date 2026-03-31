@@ -1,10 +1,31 @@
 # MCP 集成（SWE-agent）
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | `01-swe-agent-overview.md`、`05-swe-agent-tools-system.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 **SWE-agent 目前没有实现 MCP (Model Context Protocol) 集成**。它采用传统的工具执行方式，工具通过 Python 函数直接实现并在进程内执行，而非通过 MCP 协议与外部服务器通信。
 
 SWE-agent 的核心取舍：**传统函数调用 + Bundle 配置**（对比 Codex/Gemini CLI/OpenCode 的 MCP 集成）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 协议支持 | ❌ 无 MCP 支持 | N/A |
+| 工具注册 | YAML 配置 + Python 实现 | `sweagent/tools/tools.py:75` |
+| 工具执行 | 本地函数调用 | `sweagent/tools/tools.py:312` |
+| 外部扩展 | 需修改源码 | `sweagent/tools/commands.py:100` |
+| 生态兼容 | SWE-agent 专用 | Bundle 配置 |
 
 ---
 
@@ -36,13 +57,13 @@ Model Context Protocol (MCP) 旨在解决以下问题：
 ```text
 ┌─────────────────────────────────────────────────────────────┐
 │ Agent Loop                                                  │
-│ sweagent/agent/agents.py                                    │
+│ sweagent/agent/agents.py:800                                │
 └───────────────────────┬─────────────────────────────────────┘
                         │ 调用
                         ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ ▓▓▓ Tool Registry ▓▓▓                                       │
-│ sweagent/tools/tools.py                                     │
+│ sweagent/tools/tools.py:200                                 │
 │                                                             │
 │ ┌──────────┐ ┌──────────┐ ┌──────────────────┐             │
 │ │ bash     │ │ search   │ │ edit             │             │
@@ -58,6 +79,7 @@ Model Context Protocol (MCP) 旨在解决以下问题：
 ```text
 ┌─────────────────────────────────────────────────────────────┐
 │ Agent Loop                                                  │
+│ sweagent/agent/agents.py                                    │
 └───────────────────────┬─────────────────────────────────────┘
                         │ 调用
                         ▼
@@ -77,6 +99,14 @@ Model Context Protocol (MCP) 旨在解决以下问题：
 └─────────────────────────────────────────────────────────────┘
 ```
 
+### 2.3 核心组件职责
+
+| 组件 | 职责 | 代码位置 |
+|-----|------|---------|
+| `ToolHandler` | 工具执行管理 | `sweagent/tools/tools.py:200` |
+| `Command` | 命令抽象 | `sweagent/tools/commands.py:100` |
+| `Bundle` | 工具包配置 | `sweagent/tools/tools.py:150` |
+
 ---
 
 ## 3. SWE-agent 工具实现方式
@@ -86,7 +116,7 @@ Model Context Protocol (MCP) 旨在解决以下问题：
 SWE-agent 的工具直接通过 Python 函数和 YAML 配置实现：
 
 ```python
-# sweagent/tools/commands.py
+# sweagent/tools/commands.py:100-110
 BASH_COMMAND = Command(
     name="bash",
     signature="<command>",
@@ -123,7 +153,7 @@ tools:
     ▼
 ┌─────────────────┐
 │ parse_function  │  ──▶ ThoughtActionParser / FunctionCallingParser
-│ 解析thought/    │     (sweagent/tools/parsing.py)
+│ 解析thought/    │     (sweagent/tools/parsing.py:200)
 │ action          │
 └────────┬────────┘
          │
@@ -140,7 +170,7 @@ tools:
          │
          ▼
 ┌─────────────────┐
-│ 在 SWEEnv 中    │  ──▶ sweagent/environment/swe_env.py
+│ 在 SWEEnv 中    │  ──▶ sweagent/environment/swe_env.py:150
 │ 执行命令        │
 └────────┬────────┘
          │
@@ -159,7 +189,7 @@ tools:
 
 | 特性 | SWE-agent (当前) | MCP 集成方式 |
 |-----|-----------------|-------------|
-| **工具注册** | Python `@tool` 装饰器 / YAML 配置 | MCP `tools/list` 协议 |
+| **工具注册** | Python 装饰器 / YAML 配置 | MCP `tools/list` 协议 |
 | **工具执行** | 本地函数调用 | MCP `tools/call` 协议 |
 | **外部扩展** | 需修改源码添加工具 | 配置即可添加 MCP 服务器 |
 | **生态兼容** | SWE-agent 专用 | 兼容所有 MCP 服务器 |
@@ -317,30 +347,75 @@ tools:
 
 ### 6.3 与其他项目的对比
 
+```mermaid
+gitGraph
+    commit id: "传统本地调用"
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "无 MCP"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "无 MCP"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "Rust MCP Client"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "TypeScript MCP"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "MCP 集成"
+```
+
 | 项目 | MCP 支持 | 实现方式 | 适用场景 |
 |-----|---------|---------|---------|
 | SWE-agent | ❌ 无 | 本地函数调用 | 学术研究、可控环境 |
+| Kimi CLI | ❌ 无 | 本地函数调用 | 快速开发、简单场景 |
 | Codex | ✅ 有 | Rust MCP Client | 企业级、生态兼容 |
 | Gemini CLI | ✅ 有 | TypeScript MCP | 多工具集成 |
 | OpenCode | ✅ 有 | TypeScript MCP | 外部服务集成 |
-| Kimi CLI | ❌ 无 | 本地函数调用 | 快速开发、简单场景 |
 
 ---
 
-## 7. 关键代码索引
+## 7. 边界情况与错误处理
+
+### 7.1 当前工具系统的终止条件
+
+| 终止原因 | 触发条件 | 代码位置 |
+|---------|---------|---------|
+| 解析失败 | 无法匹配任何格式 | `sweagent/tools/parsing.py:200` |
+| 动作被阻止 | 命中 blocklist | `sweagent/tools/tools.py:475` |
+| 命令未找到 | 未注册的命令 | `sweagent/tools/tools.py:312` |
+| 执行超时 | 超过 execution_timeout | `sweagent/tools/tools.py:30` |
+
+### 7.2 错误恢复策略
+
+| 错误类型 | 处理策略 | 代码位置 |
+|---------|---------|---------|
+| FormatError | 重采样（requery） | `sweagent/agent/agents.py:forward_with_handling` |
+| BlockedActionError | 重采样 + 错误提示 | `sweagent/agent/agents.py:forward_with_handling` |
+| CommandNotFoundError | 返回错误信息 | `sweagent/tools/tools.py:312` |
+
+---
+
+## 8. 关键代码索引
 
 | 功能 | 文件 | 行号 | 说明 |
 |-----|------|------|------|
-| ToolHandler | `sweagent/tools/tools.py` | 200+ | 工具执行管理 |
-| Command | `sweagent/tools/commands.py` | - | 命令抽象 |
-| ParseFunction | `sweagent/tools/parsing.py` | - | 输出解析 |
-| Bundle 配置 | `sweagent/tools/tools.py` | - | 工具包配置 |
+| ToolHandler | `sweagent/tools/tools.py` | 200 | 工具执行管理 |
+| Command | `sweagent/tools/commands.py` | 100 | 命令抽象 |
+| ParseFunction | `sweagent/tools/parsing.py` | 50 | 输出解析 |
+| Bundle 配置 | `sweagent/tools/tools.py` | 150 | 工具包配置 |
 | 工具安装 | `sweagent/tools/tools.py` | 433 | install() |
 | 工具执行 | `sweagent/tools/tools.py` | 312 | execute() |
 
 ---
 
-## 8. 延伸阅读
+## 9. 延伸阅读
 
 - 前置知识：`docs/swe-agent/01-swe-agent-overview.md`、`docs/swe-agent/05-swe-agent-tools-system.md`
 - MCP 规范：https://modelcontextprotocol.io
@@ -350,4 +425,4 @@ tools:
 
 *✅ Verified: 基于 sweagent/tools/ 源码分析，确认无 MCP 实现*
 *⚠️ Inferred: 未来 MCP 集成架构为推测设计*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

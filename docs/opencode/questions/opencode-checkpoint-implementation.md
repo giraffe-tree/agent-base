@@ -1,10 +1,33 @@
 # OpenCode Checkpoint 机制实现
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-35 分钟 |
+> | 前置文档 | `01-opencode-overview.md`、`04-opencode-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：OpenCode 的 Checkpoint 是通过**影子 Git 仓库（Shadow Git）**实现文件级可回滚能力，并与消息流强绑定的机制，每个 Agent Step 自动创建 tree hash 快照，支持 revert/unrevert 双向操作。
 
 OpenCode 的核心取舍：**影子 Git + 数据库存储 + Step 级粒度**（对比 Kimi CLI 的内存文件持久化、Gemini CLI 的 Git 快照、Codex 的无回滚），在文件系统与会话状态之间建立同步回滚能力，但需要本地 Git 环境支持。
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 存储介质 | 影子 Git 仓库（与项目解耦） | `opencode/packages/opencode/src/snapshot/index.ts:12` |
+| 快照粒度 | Step 级别（单次 LLM 调用） | `opencode/packages/opencode/src/session/processor.ts:233` |
+| 快照标识 | Git tree hash | `opencode/packages/opencode/src/snapshot/index.ts:70` |
+| 变更追踪 | git diff --name-only | `opencode/packages/opencode/src/snapshot/index.ts:89` |
+| 文件恢复 | git checkout + 删除新增文件 | `opencode/packages/opencode/src/snapshot/index.ts:138` |
+| 消息回滚 | SessionRevert 协调清理 | `opencode/packages/opencode/src/session/revert.ts:24` |
+| 空间管理 | 7 天周期 gc 清理 | `opencode/packages/opencode/src/snapshot/index.ts:26` |
 
 ---
 
@@ -314,6 +337,86 @@ case "finish-step":
 #### 职责定位
 
 SessionRevert 协调文件回滚和消息清理，实现完整的 revert/unrevert 能力。
+
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle: 系统启动
+    Idle --> Reverting: 用户触发 revert
+    Reverting --> Collecting: 验证 session 非 busy
+    Collecting --> Restoring: 收集 patches 完成
+    Restoring --> Diffing: Snapshot.revert() 完成
+    Diffing --> Persisted: Snapshot.diff() 完成
+    Persisted --> CleanupPending: 写入 session_diff
+    CleanupPending --> Idle: cleanup() 执行完成
+
+    Reverting --> Error: session busy
+    Error --> Idle: 返回错误
+
+    Idle --> Unreverting: 用户触发 unrevert
+    Unreverting --> Restoring: 恢复之前状态
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Idle | 空闲等待 | 系统启动/回滚完成 | 收到 revert/unrevert 请求 |
+| Reverting | 开始回滚 | 用户触发 revert | session 验证完成 |
+| Collecting | 收集 patches | session 非 busy | 遍历完所有消息 |
+| Restoring | 恢复文件 | patches 收集完成 | 所有文件处理完成 |
+| Diffing | 计算 diff | 文件恢复完成 | diff 统计完成 |
+| Persisted | 已持久化 | diff 写入存储 | 发布事件完成 |
+| CleanupPending | 等待清理 | revert 元数据更新 | 下次 prompt 触发 cleanup |
+| Unreverting | 撤销回滚 | 用户触发 unrevert | 状态恢复完成 |
+| Error | 错误状态 | session busy | 错误返回 |
+
+#### 内部数据流
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  输入层                                                      │
+│  ├── revert 请求: {sessionID, messageID, partID}             │
+│  └── unrevert 请求: {sessionID}                              │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  验证层                                                      │
+│  ├── assertNotBusy(): 检查 session 状态                      │
+│  └── 失败则抛出错误                                          │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  查询层                                                      │
+│  ├── Session.messages({sessionID})                           │
+│  ├── 遍历消息和 parts                                        │
+│  └── 收集目标位置后的所有 patch parts                        │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  执行层                                                      │
+│  ├── Snapshot.track(): 保存当前状态                          │
+│  ├── Snapshot.revert(patches): 恢复文件                      │
+│  └── Snapshot.diff(): 计算变更统计                           │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  持久化层                                                    │
+│  ├── Storage.write("session_diff", diffs)                    │
+│  ├── Bus.publish(Session.Event.Diff)                         │
+│  └── Session.setRevert(): 更新 revert 元数据                 │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  清理层（下次 prompt 前）                                    │
+│  ├── 查询所有消息                                            │
+│  ├── 分类: preserve / remove / target                        │
+│  ├── 删除 remove 消息                                        │
+│  ├── 删除 target part 之后的 parts                           │
+│  └── Session.clearRevert()                                   │
+└─────────────────────────────────────────────────────────────┘
+```
 
 #### 关键算法逻辑
 
@@ -775,6 +878,19 @@ gitGraph
 | **Codex** | 无 Checkpoint 机制 | 不支持回滚 | 简单场景、Sandbox 隔离保证安全 |
 
 **关键差异分析**：
+
+| 对比维度 | OpenCode | Kimi CLI | Gemini CLI | Codex |
+|---------|----------|----------|------------|-------|
+| **存储介质** | 影子 Git + SQLite | 内存 + JSON Lines | Git 快照 | 无（Sandbox） |
+| **回滚粒度** | Step 级别 | Turn 级别 | Tool Call 级别 | 不支持 |
+| **文件回滚** | ✅ 完整文件系统 | ❌ 仅上下文 | ✅ 文件恢复 | ❌ |
+| **消息回滚** | ✅ 数据库清理 | ✅ 内存状态 | ✅ 上下文恢复 | ❌ |
+| **双向回滚** | ✅ revert/unrevert | ❌ 单向 | ⚠️ 有限支持 | ❌ |
+| **持久化** | 数据库 + Git 对象 | JSON Lines 文件 | Git 对象 | 无 |
+| **空间管理** | 7 天 gc 清理 | 无自动清理 | 无明确策略 | 不适用 |
+| **依赖要求** | 本地 Git 环境 | 无特殊依赖 | Git 仓库 | Sandbox |
+| **新增文件处理** | ✅ 自动删除 | 不适用 | ✅ 支持 | 不适用 |
+| **适用场景** | 企业级安全、审计 | 快速迭代、实验 | 代码修改安全 | 简单隔离场景 |
 
 1. **OpenCode vs Kimi CLI**：
    - OpenCode 使用影子 Git 实现文件级回滚，Kimi 仅回滚上下文

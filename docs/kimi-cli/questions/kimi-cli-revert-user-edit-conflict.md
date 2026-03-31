@@ -1,14 +1,35 @@
 # Kimi CLI：使用 revert 回滚时，用户已编辑与源文件冲突怎么处理？
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | `docs/kimi-cli/04-kimi-cli-agent-loop.md`、`docs/kimi-cli/07-kimi-cli-memory-context.md` |
+> | 文档结构 | 结论 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：**Kimi CLI 的 `revert_to` 仅回滚对话上下文（Context），不触碰工作区文件，因此不存在"revert 时发现用户已编辑与源文件冲突"的处理逻辑。**
 
 Kimi CLI 的核心取舍：**上下文级回滚而非文件级回滚**（对比 Gemini CLI 的 Git 快照、OpenCode 的数据库事务回滚），在保持轻量快速的同时，将文件副作用的管理责任外推到工具层或用户层。
 
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 回滚范围 | 仅对话上下文（消息历史） | `src/kimi_cli/soul/context.py:80-132` |
+| 存储介质 | 本地 JSON Lines 文件 | `src/kimi_cli/soul/context.py:16` |
+| 文件处理 | 不涉及工作区文件操作 | - |
+| 冲突处理 | 无冲突检测（设计边界） | - |
+| D-Mail 机制 | 跨时间消息传递 | `src/kimi_cli/soul/denwarenji.py:16-39` |
+
 ---
 
-## 1. 为什么需要明确这个边界？（问题场景）
+## 1. 为什么需要明确这个边界？
 
 ### 1.1 问题场景
 
@@ -43,7 +64,7 @@ Kimi CLI 的核心取舍：**上下文级回滚而非文件级回滚**（对比 
 
 ---
 
-## 2. 整体架构（ASCII 图）
+## 2. 整体架构
 
 ### 2.1 在系统中的位置
 
@@ -158,12 +179,12 @@ stateDiagram-v2
 
 **状态说明**：
 
-| 状态 | 说明 | 操作对象 |
-|-----|------|---------|
-| Active | 正常运行，追加消息 | 内存 `_history`、上下文文件 |
-| Reverting | 开始回滚流程 | 验证 checkpoint_id 有效性 |
-| FileRotation | 上下文文件备份 | `.context` → `.context.backup.N` |
-| HistoryTruncation | 截断历史到指定点 | 仅操作上下文数据 |
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Active | 正常运行，追加消息 | 初始化完成或处理结束 | 收到新请求 |
+| Reverting | 开始回滚流程 | 验证 checkpoint_id 有效性 | 验证通过 |
+| FileRotation | 上下文文件备份 | `.context` → `.context.backup.N` | 备份完成 |
+| HistoryTruncation | 截断历史到指定点 | 仅操作上下文数据 | 回滚完成 |
 
 #### 内部数据流
 
@@ -237,8 +258,6 @@ flowchart TD
 | `checkpoint()` | `add_user_message: bool` | `None` | 创建新 checkpoint | `context.py:68` |
 | `clear()` | - | `None` | 清空上下文（用于 compaction） | `context.py:134` |
 
----
-
 ### 3.2 组件间协作时序
 
 #### D-Mail 触发回滚场景
@@ -273,8 +292,6 @@ sequenceDiagram
 2. **异常控制流**：BackToTheFuture 将控制权交还 Loop
 3. **回滚边界**：`revert_to` 明确限定在 Context 层
 4. **文件隔离**：工作区文件在整个流程中未被访问
-
----
 
 ### 3.3 关键数据路径
 

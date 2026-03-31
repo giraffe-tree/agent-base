@@ -1,8 +1,28 @@
 # SWE-agent Why Keep Reasoning
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | `docs/swe-agent/04-swe-agent-agent-loop.md`、`docs/swe-agent/questions/swe-agent-tool-error-handling.md` |
+> | 文档结构 | TL;DR → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 SWE-agent 保留 `thinking_blocks` 推理内容是为了支持 **forward_with_handling 的错误恢复**和**多轮尝试的最佳选择**，使 LLM 在代码修复任务中能自我纠错并从中学习。核心取舍是**完整历史保留**（对比简单截断策略）。
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 存储位置 | `HistoryItem.thinking_blocks` | `sweagent/types.py:HistoryItem` |
+| 错误恢复 | 利用原推理构造重试历史 | `sweagent/agent/agents.py:1062` |
+| 重试选择 | `ScoreRetryLoop` 比较各轮推理 | `sweagent/agent/reviewer.py:559` |
+| 历史过滤 | `History Processors` 智能过滤 | `sweagent/agent/history_processors.py` |
 
 ---
 
@@ -62,10 +82,10 @@ SWE-agent 保留 `thinking_blocks` 推理内容是为了支持 **forward_with_ha
 
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
-| `HistoryItem` | 存储 thinking_blocks | `sweagent/types.py` |
-| `StepOutput` | 包含 thought 字段 | `sweagent/types.py` |
-| `forward_with_handling` | 利用推理内容错误恢复 | `sweagent/agent/agents.py` |
-| `ScoreRetryLoop` | 基于推理内容选择最佳结果 | `sweagent/agent/reviewer.py` |
+| `HistoryItem` | 存储 thinking_blocks | `sweagent/types.py:HistoryItem` |
+| `StepOutput` | 包含 thought 字段 | `sweagent/types.py:StepOutput` |
+| `forward_with_handling` | 利用推理内容错误恢复 | `sweagent/agent/agents.py:1062` |
+| `ScoreRetryLoop` | 基于推理内容选择最佳结果 | `sweagent/agent/reviewer.py:559` |
 
 ### 2.3 核心组件交互关系
 
@@ -96,11 +116,81 @@ sequenceDiagram
     end
 ```
 
+**关键交互说明**：
+
+| 步骤 | 交互内容 | 设计意图 |
+|-----|---------|---------|
+| 1-3 | 执行并保存推理 | 确保推理内容持久化 |
+| 4a-7a | 错误恢复流程 | 利用原推理帮助 LLM 自我纠正 |
+| 4b-7b | 多轮尝试选择 | 基于推理质量选择最佳结果 |
+
 ---
 
 ## 3. 核心组件详细分析
 
-### 3.1 错误恢复与 Requery
+### 3.1 HistoryItem 内部结构
+
+#### 职责定位
+
+存储对话历史中的单条记录，包含完整的推理内容。
+
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Created: 初始化
+    Created --> Populated: 填充数据
+    Populated --> InHistory: 加入历史
+    InHistory --> Filtered: History Processor 处理
+    InHistory --> Retrieved: 错误恢复读取
+    InHistory --> Compared: 重试选择比较
+    Filtered --> [*]
+    Retrieved --> [*]
+    Compared --> [*]
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Created | 创建空对象 | 初始化 | 填充数据 |
+| Populated | 已填充数据 | 设置 thinking_blocks 等 | 加入历史列表 |
+| InHistory | 在历史中 | 加入 trajectory | 被处理或读取 |
+| Filtered | 被过滤 | History Processor 处理 | 保留或移除 |
+| Retrieved | 被读取 | 错误恢复时读取 | 用于构造反馈 |
+| Compared | 被比较 | 重试选择时 | 评估质量 |
+
+#### 内部数据流
+
+```text
+┌────────────────────────────────────────────┐
+│  输入层                                     │
+│   LLM Response → 提取 thinking_blocks      │
+└──────────────────┬─────────────────────────┘
+                   ▼
+┌────────────────────────────────────────────┐
+│  处理层                                     │
+│   解析 thought → 存储 thinking_blocks      │
+│   ├── 正常: 直接存储                       │
+│   └── 错误: 保留用于恢复                   │
+└──────────────────┬─────────────────────────┘
+                   ▼
+┌────────────────────────────────────────────┐
+│  输出层                                     │
+│   加入 trajectory → 可供后续使用           │
+└────────────────────────────────────────────┘
+```
+
+#### 关键接口
+
+| 接口 | 输入 | 输出 | 说明 | 代码位置 |
+|-----|------|------|------|---------|
+| `__init__()` | 各字段值 | HistoryItem | 创建历史项 | `sweagent/types.py` |
+| `to_template_format_dict()` | - | `dict` | 转为模板格式 | `sweagent/types.py` |
+
+---
+
+### 3.2 错误恢复与 Requery
 
 #### 职责定位
 
@@ -129,7 +219,7 @@ flowchart TD
 
 ---
 
-### 3.2 Autosubmit 紧急恢复
+### 3.3 Autosubmit 紧急恢复
 
 #### 职责定位
 
@@ -150,7 +240,7 @@ flowchart TD
 
 ---
 
-### 3.3 多轮尝试的最佳选择
+### 3.4 多轮尝试的最佳选择
 
 #### 职责定位
 
@@ -172,9 +262,51 @@ flowchart TD
 
 ---
 
+### 3.5 关键数据路径
+
+#### 主路径（正常流程）
+
+```mermaid
+flowchart LR
+    subgraph Input["输入阶段"]
+        I1[LLM Response] --> I2[提取 thinking_blocks]
+    end
+
+    subgraph Process["处理阶段"]
+        P1[创建 HistoryItem] --> P2[存储 thinking_blocks]
+    end
+
+    subgraph Output["输出阶段"]
+        O1[加入 trajectory] --> O2[后续使用]
+    end
+
+    I2 --> P1
+    P2 --> O1
+
+    style Process fill:#e1f5e1,stroke:#333
+```
+
+#### 异常路径（错误恢复）
+
+```mermaid
+flowchart TD
+    E[发生错误] --> E1{需要恢复?}
+    E1 -->|是| R1[获取原 HistoryItem]
+    R1 --> R2[提取 thinking_blocks]
+    R2 --> R3[构造错误反馈]
+    R3 --> R4[重新查询]
+    E1 -->|否| End[结束]
+    R4 --> End
+
+    style R3 fill:#90EE90
+    style R2 fill:#87CEEB
+```
+
+---
+
 ## 4. 端到端数据流转
 
-### 4.1 正常流程
+### 4.1 正常流程（详细版）
 
 ```mermaid
 sequenceDiagram
@@ -189,6 +321,14 @@ sequenceDiagram
     C->>C: 存储 thinking_blocks
     A->>D: 添加到 trajectory
 ```
+
+**数据变换详情**：
+
+| 阶段 | 输入 | 处理 | 输出 | 代码位置 |
+|-----|------|------|------|---------|
+| 接收 | `response` | 提取 thinking_blocks | `thinking_blocks: list[dict]` | `sweagent/agent/agents.py:1018` |
+| 存储 | `thinking_blocks` | 创建 HistoryItem | `HistoryItem` | `sweagent/types.py:HistoryItem` |
+| 归档 | `HistoryItem` | 加入 trajectory | 更新历史列表 | `sweagent/agent/agents.py` |
 
 ### 4.2 错误恢复流程
 
@@ -263,8 +403,10 @@ class HistoryItem(BaseModel):
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```python
-# sweagent/agent/agents.py
+# sweagent/agent/agents.py:1062-1080
 def forward_with_handling(self, history: list[dict[str, str]]) -> StepOutput:
     """Forward the model and handle errors, requerying the model if we can."""
     n_format_fails = 0
@@ -278,11 +420,40 @@ def forward_with_handling(self, history: list[dict[str, str]]) -> StepOutput:
             # thinking_blocks 保留在历史中，帮助 LLM 理解错误
 ```
 
-**代码要点**：
-
+**设计意图**：
 1. **保留上下文**：错误重试时原推理内容仍在历史中
 2. **自我纠正**：LLM 能看到自己的思考过程并修正
 3. **历史完整**：不丢弃任何推理内容
+
+<details>
+<summary>查看完整实现</summary>
+
+```python
+# sweagent/types.py
+class HistoryItem(BaseModel):
+    """A single item in the history."""
+    thought: str = ""
+    action: str = ""
+    observation: str = ""
+    done: bool = False
+    output: str = ""
+    state: dict[str, Any] | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_ids: list[str] | None = None
+    thinking_blocks: list[dict[str, Any]] | None = None
+
+    def to_template_format_dict(self) -> dict[str, str]:
+        """Convert to dictionary for template rendering."""
+        return {
+            "thought": self.thought,
+            "action": self.action,
+            "observation": self.observation,
+            "output": self.output,
+            "state": json.dumps(self.state) if self.state else "",
+        }
+```
+
+</details>
 
 ### 5.3 关键调用链
 
@@ -367,6 +538,7 @@ gitGraph
 | **保留策略** | 完整保留 | 状态快照 | 智能压缩 | 可配置 | 结构化存储 |
 | **主要用途** | 错误恢复 | 状态回滚 | 上下文保持 | 可观测性 | UI 展示 |
 | **过滤机制** | History Processors | D-Mail 选择 | 分层淘汰 | 摘要配置 | 组件渲染 |
+| **适用场景** | 代码修复 | 交互对话 | 复杂任务 | 企业应用 | 可视化交互 |
 
 ---
 
@@ -413,4 +585,4 @@ class LastNObservations:
 ---
 
 *✅ Verified: 基于 sweagent/types.py、sweagent/agent/agents.py:1062 等源码分析*
-*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-02-25*
+*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-03-03*

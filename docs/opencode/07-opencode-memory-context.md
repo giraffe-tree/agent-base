@@ -1,10 +1,31 @@
 # Memory Context 管理（opencode）
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-35 分钟 |
+> | 前置文档 | `01-opencode-overview.md`、`04-opencode-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：OpenCode 的 Memory Context 采用"**三层层级 + SQLite 持久化 + Event Bus 响应式架构 + WorkspaceContext 多工作空间**"的设计，通过 Session → Message → Part 的三级结构组织对话数据，使用 SQLite + Drizzle ORM 进行类型安全的持久化，基于 Event Bus 实现响应式的流式处理，并通过 **WorkspaceContext** 实现多工作空间隔离。
 
 OpenCode 的核心取舍：**关系型数据库 + 反范化设计 + Prune 压缩 + AsyncLocalStorage 上下文传播**（对比 Kimi CLI 的 JSONL + Checkpoint、Gemini CLI 的分层 GEMINI.md、Codex 的惰性压缩）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 存储引擎 | SQLite + Drizzle ORM | `packages/opencode/src/session/session.sql.ts:11` |
+| 数据建模 | Session → Message → Part 三层层级 | `packages/opencode/src/session/session.sql.ts:11-67` |
+| 上下文压缩 | Prune + Compaction 双重机制 | `packages/opencode/src/session/compaction.ts:18` |
+| 响应式更新 | Event Bus 事件驱动 | `packages/opencode/src/bus/index.ts:41` |
+| 多工作空间 | AsyncLocalStorage 上下文传播 | `packages/opencode/src/control-plane/workspace-context.ts:9` |
 
 ---
 
@@ -134,7 +155,68 @@ sequenceDiagram
 
 ## 3. 核心组件详细分析
 
-### 3.1 数据库 Schema 设计
+### 3.1 Session 生命周期管理
+
+#### 职责定位
+
+Session 是 OpenCode 对话管理的核心实体，负责会话的创建、分支、归档和生命周期管理。
+
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Creating: createNext() 调用
+    Creating --> Active: 创建成功
+    Creating --> Failed: 创建失败
+    Active --> Compacting: 触发上下文压缩
+    Active --> Archived: 归档操作
+    Compacting --> Active: 压缩完成
+    Archived --> [*]
+    Failed --> [*]
+    Active --> Forked: fork() 创建分支
+    Forked --> Active: 新分支激活
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Creating | 创建中 | 调用 createNext() | 创建完成或失败 |
+| Active | 活跃状态 | 创建成功 | 归档或创建分支 |
+| Compacting | 压缩中 | Token 超限触发压缩 | 压缩完成 |
+| Archived | 已归档 | 用户归档或自动归档 | 无 |
+| Forked | 已分支 | 调用 fork() 创建分支 | 新分支激活 |
+| Failed | 失败 | 创建或操作失败 | 无 |
+
+#### 内部数据流
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  输入层                                                      │
+│  ├── 用户输入 ──► Session.createNext()                      │
+│  ├── 分支请求 ──► Session.fork()                            │
+│  └── 上下文 ──► WorkspaceContext.workspaceID                │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  处理层                                                      │
+│  ├── 会话创建: 生成 ID, 设置 workspace_id                    │
+│  ├── 消息管理: updateMessage() + updatePart()               │
+│  ├── 流式读取: stream() Generator                           │
+│  └── 上下文压缩: isOverflow() + prune()                     │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  输出层                                                      │
+│  ├── 持久化: SQLite INSERT/UPDATE                           │
+│  ├── 事件: Bus.publish(Message/Part Updated)                │
+│  └── 查询: list() 自动过滤 workspace                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 3.2 数据库 Schema 设计
 
 #### 职责定位
 
@@ -776,6 +858,10 @@ gitGraph
     branch "codex"
     checkout codex
     commit id: "惰性压缩"
+    checkout main
+    branch "swe-agent"
+    checkout swe-agent
+    commit id: "内存 + 截断"
 ```
 
 | 项目 | 核心差异 | 适用场景 |
@@ -784,6 +870,20 @@ gitGraph
 | Kimi CLI | JSONL + Checkpoint 回滚 | 需要状态回滚的 CLI 工具 |
 | Gemini CLI | 分层 GEMINI.md + JIT 加载 | 需要项目级记忆发现的场景 |
 | Codex | 惰性压缩 + 沙箱 | 企业级安全要求 |
+| SWE-agent | 内存存储 + 截断 | 自动化代码修复场景 |
+
+**详细对比**：
+
+| 特性 | OpenCode | Kimi CLI | Gemini CLI | Codex | SWE-agent |
+|-----|----------|----------|------------|-------|-----------|
+| 存储引擎 | SQLite | JSONL 文件 | 内存 + 文件 | 内存 | 内存 |
+| 数据建模 | 三层 (Session/Message/Part) | 扁平消息 | 分层 GEMINI.md | 消息列表 | 消息列表 |
+| 持久化 | 实时 DB 写入 | Checkpoint 文件 | 按需保存 | 惰性压缩 | 无 |
+| 上下文压缩 | Prune + Compaction | Checkpoint 回滚 | 上下文保护 | 窗口滑动 | 截断 |
+| 响应式更新 | Event Bus | 轮询 | 回调 | 轮询 | 无 |
+| 多工作空间 | AsyncLocalStorage | 不支持 | 不支持 | 不支持 | 不支持 |
+| 类型安全 | Drizzle ORM | Pydantic | TypeScript | Rust 类型 | Python 类型 |
+| 分支支持 | 是 (parent_id) | 是 (Checkpoint) | 否 | 否 | 否 |
 
 ---
 

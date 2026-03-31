@@ -1,10 +1,31 @@
 # Prompt Organization（opencode）
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置文档 | `01-opencode-overview.md`、`04-opencode-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Prompt Organization 是 AI Coding Agent 中用于管理和组织系统提示词的机制，决定如何根据模型提供商、Agent 类型和任务场景选择和组合提示词。
 
 OpenCode 的核心取舍：**Provider-specific 多版本 + TypeScript 模块导入**（对比 Kimi CLI 的单一 prompt 文件、Codex 的动态 prompt 生成）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| Provider 组织 | 目录隔离（anthropic/、gemini/） | `opencode/src/prompts/anthropic/system.txt:1` |
+| 文件加载 | TypeScript 模块导入 txt 文件 | `opencode/src/prompts/index.ts:1` |
+| 变量替换 | 双大括号 `{{VAR}}` 简单替换 | `opencode/src/prompts/utils.ts:1` |
+| 回退策略 | 自动回退到 default 版本 | `opencode/src/prompts/index.ts:1` |
+| 分层结构 | Provider → Session → Agent 三层 | `opencode/src/prompts/` |
 
 ---
 
@@ -609,6 +630,10 @@ gitGraph
     branch "Codex"
     checkout "Codex"
     commit id: "动态 prompt 生成"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "分层 prompt 系统"
 ```
 
 | 项目 | 核心差异 | 适用场景 |
@@ -685,4 +710,4 @@ function validatePromptSize(content: string): boolean {
 ---
 
 *✅ Verified: 基于 opencode/src/prompts/ 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-25*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

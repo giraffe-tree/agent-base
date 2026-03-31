@@ -1,10 +1,30 @@
 # SWE-agent Infinite Loop Prevention
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | `docs/swe-agent/04-swe-agent-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 SWE-agent 通过 **`max_requeries` 重试上限** + **Autosubmit 自动提交** + **连续超时计数器**防止 tool 无限循环。
 
-SWE-agent 的核心取舍：**优雅完成**（对比 Gemini CLI 的递归限制、Kimi CLI 的 Checkpoint 回滚）
+SWE-agent 的核心取舍：**优雅完成**（对比 Gemini CLI 的递归限制、Kimi CLI 的 Checkpoint 回滚、Codex 的 CancellationToken）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 格式错误重试 | max_requeries=3 | `sweagent/agent/agents.py:158` |
+| 连续超时检测 | _n_consecutive_timeouts >= 3 | `sweagent/agent/agents.py:968` |
+| 异常兜底 | Autosubmit 自动提交 | `sweagent/agent/agents.py:823` |
+| 总执行时间 | 1800s 上限 | `sweagent/agent/agents.py:1018` |
 
 ---
 
@@ -13,14 +33,24 @@ SWE-agent 的核心取舍：**优雅完成**（对比 Gemini CLI 的递归限制
 ### 1.1 问题场景
 
 没有防护机制时：
-- LLM 反复生成格式错误的响应，陷入无限重试
-- 长时间运行的命令阻塞整个任务
-- 异常发生时丢失所有工作成果
+- LLM 反复生成格式错误的响应，陷入**无限重试**
+- 长时间运行的命令**阻塞整个任务**
+- 异常发生时**丢失所有工作成果**
 
-有了防护机制：
-- 重试次数受限，防止资源浪费
-- 连续超时自动退出，避免无限等待
-- 异常时自动提交，保留已做的工作
+```text
+场景示例：
+
+无防护：
+  → LLM 生成格式错误响应 → 重试 → 再次错误 → 重试 → ...（无限循环）
+  → 命令执行超时 → 继续等待 → 再次超时 → ...（资源耗尽）
+  → 发生异常 → 任务失败 → 所有工作丢失
+
+有防护（SWE-agent）：
+  → LLM 生成格式错误 → 重试（1/3）→ 再次错误 → 重试（2/3）→ 再次错误
+  → 重试耗尽 → Autosubmit 提交已有工作
+  → 命令超时 → 中断会话 → 反馈给 LLM
+  → 连续超时 3 次 → Autosubmit 优雅退出
+```
 
 ### 1.2 核心挑战
 
@@ -46,7 +76,7 @@ SWE-agent 的核心取舍：**优雅完成**（对比 Gemini CLI 的递归限制
                         ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ ▓▓▓ Loop Prevention ▓▓▓                                     │
-│ SWE-agent/sweagent/agent/agents.py:158                                 │
+│ sweagent/agent/agents.py                                     │
 │ - max_requeries: 格式错误重试上限                           │
 │ - _n_consecutive_timeouts: 连续超时计数器                   │
 │ - attempt_autosubmission_after_error(): 自动提交兜底        │
@@ -65,10 +95,10 @@ SWE-agent 的核心取舍：**优雅完成**（对比 Gemini CLI 的递归限制
 
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
-| `max_requeries` | 限制格式错误重试次数 | `SWE-agent/sweagent/agent/agents.py:158` |
-| `_n_consecutive_timeouts` | 追踪连续超时次数 | `SWE-agent/sweagent/agent/agents.py:968` |
-| `forward_with_handling()` | 集中重试控制 | `SWE-agent/sweagent/agent/agents.py:1062` |
-| `attempt_autosubmission_after_error()` | 异常时自动提交 | `SWE-agent/sweagent/agent/agents.py:823` |
+| `max_requeries` | 限制格式错误重试次数 | `sweagent/agent/agents.py:158` |
+| `_n_consecutive_timeouts` | 追踪连续超时次数 | `sweagent/agent/agents.py:968` |
+| `forward_with_handling()` | 集中重试控制 | `sweagent/agent/agents.py:1062` |
+| `attempt_autosubmission_after_error()` | 异常时自动提交 | `sweagent/agent/agents.py:823` |
 
 ### 2.3 核心组件交互关系
 
@@ -104,6 +134,15 @@ sequenceDiagram
 
     B-->>A: 8. 返回结果
 ```
+
+**关键交互说明**：
+
+| 步骤 | 交互内容 | 设计意图 |
+|-----|---------|---------|
+| 1-2 | Agent 执行 step | 正常执行流程 |
+| 3a-7a | 格式错误重试控制 | 限制重试次数，防止无限循环 |
+| 3b-7b | 超时检测 | 连续超时检测，防止阻塞 |
+| 7a/7b | Autosubmit 兜底 | 异常时保留已有工作 |
 
 ---
 
@@ -143,25 +182,34 @@ stateDiagram-v2
 | Autosubmit | 自动提交 | 重试耗尽 | 完成提交 |
 | Success | 成功 | 模型输出正确 | 自动返回 Idle |
 
-#### 关键算法逻辑
+#### 内部数据流
 
-```mermaid
-flowchart TD
-    A[forward_with_handling] --> B{发生错误?}
-    B -->|否| C[返回结果]
-    B -->|是| D{可重试错误?}
-    D -->|否| E[Autosubmit]
-    D -->|是| F[n_format_fails++]
-    F --> G{< max_requeries?}
-    G -->|是| H[构造错误历史]
-    H --> I[递归重试]
-    I --> B
-    G -->|否| E
-
-    style C fill:#90EE90
-    style E fill:#FFB6C1
-    style H fill:#87CEEB
+```text
+┌────────────────────────────────────────────┐
+│  输入层                                     │
+│   模型输出 / 错误类型                       │
+└──────────────────┬─────────────────────────┘
+                   ▼
+┌────────────────────────────────────────────┐
+│  处理层                                     │
+│   检查错误类型                              │
+│   可重试? → 增加计数器                      │
+│   检查计数 < max_requeries?                 │
+│   是：构造错误历史，递归重试                │
+│   否：触发 Autosubmit                       │
+└──────────────────┬─────────────────────────┘
+                   ▼
+┌────────────────────────────────────────────┐
+│  输出层                                     │
+│   重试结果 / Autosubmit 结果                │
+└────────────────────────────────────────────┘
 ```
+
+#### 关键接口
+
+| 接口 | 输入 | 输出 | 说明 | 代码位置 |
+|-----|------|------|------|---------|
+| `forward_with_handling()` | history | StepOutput | 带重试控制的执行 | `sweagent/agent/agents.py:1062` |
 
 ---
 
@@ -171,37 +219,31 @@ flowchart TD
 
 追踪连续命令超时次数，超过阈值时强制退出，防止无限等待。
 
-#### 内部数据流
+#### 关键算法逻辑
 
-```text
-┌─────────────────────────────────────────────────────────────┐
-│  输入层                                                      │
-│  ├── 命令执行请求                                           │
-│  └── 超时配置                                               │
-└──────────────────────────┬──────────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  处理层                                                      │
-│  ├── 执行命令                                               │
-│  ├── 捕获 TimeoutExpired                                    │
-│  ├── _n_consecutive_timeouts += 1                           │
-│  └── 检查 >= 3?                                             │
-│      ├── 是：raise 终止                                     │
-│      └── 否：interrupt + 反馈                               │
-└──────────────────────────┬──────────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  输出层                                                      │
-│  ├── 成功：计数器重置                                       │
-│  └── 超时：计数器增加或终止                                 │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    A[执行命令] --> B{超时?}
+    B -->|是| C[_n_consecutive_timeouts += 1]
+    C --> D{>= 3?}
+    D -->|是| E[raise 终止]
+    D -->|否| F[中断会话 + 反馈]
+    B -->|否| G[_n_consecutive_timeouts = 0]
+
+    E --> H[结束]
+    F --> H
+    G --> H
+
+    style E fill:#FF6B6B
+    style F fill:#FFD700
+    style G fill:#90EE90
 ```
 
 ---
 
 ## 4. 端到端数据流转
 
-### 4.1 正常流程
+### 4.1 正常流程（详细版）
 
 ```mermaid
 sequenceDiagram
@@ -217,6 +259,14 @@ sequenceDiagram
     D-->>B: _n_consecutive_timeouts = 0
     B-->>A: 返回 observation
 ```
+
+**数据变换详情**：
+
+| 阶段 | 输入 | 处理 | 输出 | 代码位置 |
+|-----|------|------|------|---------|
+| 执行 | action | 调用 shell | 命令结果 | `sweagent/agent/agents.py:900` |
+| 检测 | 命令结果 | 检查超时 | 计数器更新 | `sweagent/agent/agents.py:968` |
+| 反馈 | 结果/超时 | 构造 observation | StepOutput | `sweagent/agent/agents.py` |
 
 ### 4.2 异常流程（连续超时）
 
@@ -288,7 +338,7 @@ flowchart LR
 ### 5.1 核心数据结构
 
 ```python
-# SWE-agent/sweagent/agent/agents.py:158
+# sweagent/sweagent/agent/agents.py:158
 class DefaultAgent(AbstractAgent):
     def __init__(
         self,
@@ -309,8 +359,10 @@ class DefaultAgent(AbstractAgent):
 
 ### 5.2 主链路代码
 
+**关键代码**（连续超时检测）：
+
 ```python
-# SWE-agent/sweagent/agent/agents.py:968
+# sweagent/sweagent/agent/agents.py:968-985
 # 初始化
 self._n_consecutive_timeouts = 0
 
@@ -334,21 +386,39 @@ else:
     self._n_consecutive_timeouts = 0  # 成功则重置计数器
 ```
 
-**代码要点**：
-
+**设计意图**：
 1. **连续检测**：只有连续超时才会触发退出
 2. **中断机制**：超时后尝试中断会话，而非直接终止
 3. **模板反馈**：使用 Jinja2 模板给 LLM 清晰的超时说明
 4. **成功重置**：一次成功执行即重置计数器
 
+<details>
+<summary>查看完整实现（总执行时间检查）</summary>
+
+```python
+# sweagent/sweagent/agent/agents.py:1018
+def forward(self, history: list[dict[str, str]]) -> StepOutput:
+    # 检查总执行时间
+    if self._total_execution_time > self.tools.config.total_execution_timeout:
+        raise _TotalExecutionTimeExceeded()
+```
+
+配置：
+```python
+class ToolConfig(BaseModel):
+    total_execution_timeout: int = 1800  # 30 分钟
+```
+
+</details>
+
 ### 5.3 关键调用链
 
 ```text
-Agent.step()                         [SWE-agent/sweagent/agent/agents.py:790]
+Agent.step()                         [sweagent/agent/agents.py:790]
   -> handle_action()                 [sweagent/agent/agents.py:900]
     -> _env.execute()                [sweagent/environment/swe_env.py:150]
       - subprocess.run(timeout=...)
-    -> CommandTimeoutError 捕获      [SWE-agent/sweagent/agent/agents.py:968]
+    -> CommandTimeoutError 捕获      [sweagent/agent/agents.py:968]
       - _n_consecutive_timeouts += 1
       - 检查 >= 3?
       - 是：raise 终止
@@ -373,17 +443,37 @@ Agent.step()                         [SWE-agent/sweagent/agent/agents.py:790]
 **核心问题**：如何在防止无限循环的同时最大化任务完成率？
 
 **SWE-agent 的解决方案**：
-- 代码依据：`SWE-agent/sweagent/agent/agents.py:158`
-- 设计意图："优雅完成"而非"完美完成"
-- 带来的好处：
+- **代码依据**：`sweagent/agent/agents.py:158`
+- **设计意图**："优雅完成"而非"完美完成"
+- **带来的好处**：
   - 有限重试防止资源浪费
   - 连续超时检测避免阻塞
   - Autosubmit 确保有输出
-- 付出的代价：
+- **付出的代价**：
   - 可能提交不完整修复
   - 需要额外的错误处理逻辑
 
 ### 6.3 与其他项目的对比
+
+```mermaid
+gitGraph
+    commit id: "无防护"
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "max_requeries+Autosubmit"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "递归限制"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "Checkpoint+D-Mail"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "CancellationToken"
+```
 
 | 项目 | 核心差异 | 适用场景 |
 |-----|---------|---------|
@@ -393,6 +483,16 @@ Agent.step()                         [SWE-agent/sweagent/agent/agents.py:790]
 | Codex | CancellationToken | 企业安全环境 |
 | OpenCode | 无显式限制 | 轻量级场景 |
 
+**详细对比**：
+
+| 维度 | SWE-agent | Gemini CLI | Kimi CLI | Codex |
+|-----|-----------|------------|----------|-------|
+| 循环限制 | 重试上限 | 递归深度 | Step 上限 | Token 上限 |
+| 超时处理 | 连续计数 | resetTimeout | 单次超时 | CancellationToken |
+| 异常兜底 | Autosubmit | 错误返回 | Checkpoint | 安全终止 |
+| 设计理念 | 优雅完成 | 状态机驱动 | 对话回滚 | 企业安全 |
+| 适用场景 | 批量自动化 | 复杂任务 | 交互开发 | 安全环境 |
+
 ---
 
 ## 7. 边界情况与错误处理
@@ -401,16 +501,16 @@ Agent.step()                         [SWE-agent/sweagent/agent/agents.py:790]
 
 | 终止原因 | 触发条件 | 代码位置 |
 |---------|---------|---------|
-| 格式重试耗尽 | n_format_fails >= max_requeries | `SWE-agent/sweagent/agent/agents.py:1211` |
-| 连续超时 | _n_consecutive_timeouts >= 3 | `SWE-agent/sweagent/agent/agents.py:971` |
+| 格式重试耗尽 | n_format_fails >= max_requeries | `sweagent/agent/agents.py:1211` |
+| 连续超时 | _n_consecutive_timeouts >= 3 | `sweagent/agent/agents.py:971` |
 | 总执行时间 | _total_execution_time > 1800s | `sweagent/agent/agents.py:1020` |
-| 上下文溢出 | ContextWindowExceededError | `SWE-agent/sweagent/agent/agents.py:1175` |
+| 上下文溢出 | ContextWindowExceededError | `sweagent/agent/agents.py:1175` |
 | 成本超限 | CostLimitExceededError | `sweagent/agent/agents.py:1178` |
 
 ### 7.2 超时/资源限制
 
 ```python
-# SWE-agent/sweagent/agent/agents.py:1018
+# sweagent/sweagent/agent/agents.py:1018
 def forward(self, history: list[dict[str, str]]) -> StepOutput:
     # 检查总执行时间
     if self._total_execution_time > self.tools.config.total_execution_timeout:
@@ -427,9 +527,9 @@ class ToolConfig(BaseModel):
 
 | 错误类型 | 处理策略 | 代码位置 |
 |---------|---------|---------|
-| 格式错误 | 模板反馈 + 重试 | `SWE-agent/sweagent/agent/agents.py:1152` |
-| 连续超时 | Autosubmit | `SWE-agent/sweagent/agent/agents.py:971` |
-| 重试耗尽 | Autosubmit | `SWE-agent/sweagent/agent/agents.py:1211` |
+| 格式错误 | 模板反馈 + 重试 | `sweagent/agent/agents.py:1152` |
+| 连续超时 | Autosubmit | `sweagent/agent/agents.py:971` |
+| 重试耗尽 | Autosubmit | `sweagent/agent/agents.py:1211` |
 
 ---
 
@@ -437,7 +537,7 @@ class ToolConfig(BaseModel):
 
 | 功能 | 文件 | 行号 | 说明 |
 |-----|------|------|------|
-| 重试上限配置 | `sweagent/agent/agents.py` | 451 | max_requeries=3 |
+| 重试上限配置 | `sweagent/agent/agents.py` | 158 | max_requeries=3 |
 | 连续超时计数 | `sweagent/agent/agents.py` | 968 | _n_consecutive_timeouts |
 | 重试控制 | `sweagent/agent/agents.py` | 1062 | forward_with_handling() |
 | 自动提交 | `sweagent/agent/agents.py` | 823 | attempt_autosubmission_after_error() |
@@ -450,8 +550,10 @@ class ToolConfig(BaseModel):
 - 前置知识：`docs/swe-agent/04-swe-agent-agent-loop.md`（Agent 循环中的防护调用点）
 - 相关机制：`docs/swe-agent/questions/swe-agent-tool-error-handling.md`（错误处理详细分析）
 - 深度分析：`docs/swe-agent/questions/swe-agent-skill-execution-timeout.md`（超时处理机制）
+- 对比分析：`docs/gemini-cli/04-gemini-cli-agent-loop.md`（Gemini CLI 的递归限制）
+- 对比分析：`docs/kimi-cli/04-kimi-cli-agent-loop.md`（Kimi CLI 的 Checkpoint 回滚）
 
 ---
 
-*✅ Verified: 基于 SWE-agent/sweagent/agent/agents.py:158、SWE-agent/sweagent/agent/agents.py:968 等源码分析*
-*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-02-25*
+*✅ Verified: 基于 sweagent/agent/agents.py:158、sweagent/agent/agents.py:968 等源码分析*
+*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-03-03*

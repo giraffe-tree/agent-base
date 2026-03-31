@@ -1,10 +1,30 @@
 # Web Server（gemini-cli）
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置文档 | `01-gemini-cli-overview.md`、`04-gemini-cli-agent-loop.md` |
+> | 文档结构 | TL;DR → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：gemini-cli 的 Web Server 是一个**基于 Express.js 的 A2A（Agent-to-Agent）协议实现**，使用 **Server-Sent Events (SSE)** 实现流式响应，支持 **JSON-RPC 2.0** 格式的 agent 间通信。
 
 gemini-cli 的核心取舍：**A2A 标准协议 + SSE 流式通信**（对比 opencode 的 REST/OpenAPI + SSE、codex 的无服务器模式）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 核心机制 | A2A 协议 + JSON-RPC 2.0 + SSE 流式 | `packages/a2a-server/src/http/app.ts:156` |
+| 状态管理 | 内存 Map 缓存 + GCS 持久化 | `packages/a2a-server/src/agent/executor.ts:83` |
+| 任务执行 | CoderAgentExecutor 管理生命周期 | `packages/a2a-server/src/agent/executor.ts:284` |
+| 流式通信 | SSE 单向推送，自动重连友好 | `packages/a2a-server/src/http/app.ts:119` |
 
 ---
 
@@ -13,15 +33,21 @@ gemini-cli 的核心取舍：**A2A 标准协议 + SSE 流式通信**（对比 op
 ### 1.1 问题场景
 
 没有 Web Server：
-- gemini-cli 只能作为本地 CLI 工具使用
-- 无法被其他 Agent 或系统集成
-- 每次交互都需要启动新进程，状态无法持久化
+```
+gemini-cli 只能作为本地 CLI 工具使用
+  -> 无法被其他 Agent 或系统集成
+  -> 每次交互都需要启动新进程，状态无法持久化
+  -> 长时间任务无法保持连接
+```
 
 有 Web Server：
-- 其他 Agent 可以通过 HTTP API 调用 gemini-cli
-- 支持长时间运行的任务，状态保存在内存或 GCS
-- 流式响应让用户可以实时看到执行进度
-- 符合 Google A2A 协议标准，便于生态集成
+```
+其他 Agent 可以通过 HTTP API 调用 gemini-cli
+  -> 支持长时间运行的任务，状态保存在内存或 GCS
+  -> 流式响应让用户可以实时看到执行进度
+  -> 符合 Google A2A 协议标准，便于生态集成
+  -> 支持任务恢复和查询
+```
 
 ### 1.2 核心挑战
 
@@ -59,6 +85,7 @@ gemini-cli 的核心取舍：**A2A 标准协议 + SSE 流式通信**（对比 op
 ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
 │ Task Store   │ │ Task         │ │ Gemini API   │
 │ (内存/GCS)   │ │ (状态机)     │ │ (流式调用)   │
+│ executor.ts  │ │ task.ts      │ │ @google/*    │
 └──────────────┘ └──────────────┘ └──────────────┘
 ```
 
@@ -621,6 +648,8 @@ class TaskWrapper {
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```typescript
 // packages/a2a-server/src/agent/executor.ts:467-550
 async execute(requestContext: RequestContext, eventBus: ExecutionEventBus): Promise<void> {
@@ -695,12 +724,99 @@ async execute(requestContext: RequestContext, eventBus: ExecutionEventBus): Prom
 }
 ```
 
-**代码要点**：
+**设计意图**：
 
 1. **任务去重机制**：`executingTasks` Set 确保同一任务不会并发执行，后续请求让出等待
 2. **工具批处理**：收集所有工具调用后统一调度，减少 LLM 往返次数
 3. **取消传播**：通过 `AbortSignal` 将客户端断开传递到所有异步操作
 4. **状态持久化**：finally 块确保无论成功失败，状态都被保存
+
+<details>
+<summary>查看完整实现（含异常处理、日志等）</summary>
+
+```typescript
+// packages/a2a-server/src/agent/executor.ts:467-607
+async execute(requestContext: RequestContext, eventBus: ExecutionEventBus): Promise<void> {
+  const { taskId, contextId, userMessage, agentSettings, sdkTask } = requestContext;
+
+  // 获取或创建任务
+  let wrapper = this.tasks.get(taskId);
+  if (!wrapper && sdkTask) {
+    wrapper = await this.reconstruct(sdkTask, eventBus);
+  } else if (!wrapper) {
+    wrapper = await this.createTask(taskId, contextId, agentSettings, eventBus);
+  }
+
+  const currentTask = wrapper.task;
+
+  // 检查任务状态
+  if (['canceled', 'failed', 'completed'].includes(currentTask.taskState)) {
+    logger.info(`Task ${taskId} already in terminal state: ${currentTask.taskState}`);
+    return;
+  }
+
+  // 处理正在执行的任务（让出执行）
+  if (this.executingTasks.has(taskId)) {
+    logger.info(`Task ${taskId} already executing, yielding...`);
+    for await (const _ of currentTask.acceptUserMessage(requestContext, abortSignal)) {
+      // 让出执行，等待原执行完成
+    }
+    return;
+  }
+
+  // 主执行循环
+  this.executingTasks.add(taskId);
+  try {
+    let agentTurnActive = true;
+    let agentEvents = currentTask.acceptUserMessage(requestContext, abortSignal);
+
+    while (agentTurnActive) {
+      const toolCallRequests: ToolCallRequestInfo[] = [];
+
+      // 处理 LLM 流式响应
+      for await (const event of agentEvents) {
+        if (event.type === GeminiEventType.ToolCallRequest) {
+          toolCallRequests.push(event.value);
+        } else {
+          await currentTask.acceptAgentMessage(event);
+        }
+      }
+
+      // 调度工具调用
+      if (toolCallRequests.length > 0) {
+        await currentTask.scheduleToolCalls(toolCallRequests, abortSignal);
+      }
+
+      // 等待工具完成
+      await currentTask.waitForPendingTools();
+      const completedTools = currentTask.getAndClearCompletedTools();
+
+      // 判断下一步
+      if (completedTools.length > 0) {
+        if (completedTools.every(tool => tool.status === 'cancelled')) {
+          agentTurnActive = false;
+          currentTask.setTaskStateAndPublishUpdate('input-required', ...);
+        } else {
+          agentEvents = currentTask.sendCompletedToolsToLlm(completedTools, abortSignal);
+        }
+      } else {
+        agentTurnActive = false;
+      }
+    }
+
+    // 任务完成
+    currentTask.setTaskStateAndPublishUpdate('input-required', ..., /*final*/ true);
+  } catch (error) {
+    logger.error(`Task ${taskId} execution failed:`, error);
+    currentTask.setTaskStateAndPublishUpdate('failed', ...);
+  } finally {
+    this.executingTasks.delete(taskId);
+    await this.taskStore?.save(wrapper.toSDKTask());
+  }
+}
+```
+
+</details>
 
 ### 5.3 关键调用链
 
@@ -758,19 +874,28 @@ main()                          [app.ts:333]
 ### 6.3 与其他项目的对比
 
 ```mermaid
-gitGraph
-    commit id: "传统 CLI 工具"
-    branch "gemini-cli"
-    checkout "gemini-cli"
-    commit id: "A2A + SSE"
-    checkout main
-    branch "opencode"
-    checkout "opencode"
-    commit id: "REST/OpenAPI + SSE"
-    checkout main
-    branch "codex"
-    checkout "codex"
-    commit id: "无服务器模式"
+flowchart TD
+    subgraph Gemini["Gemini CLI"]
+        G1[A2A 协议]
+        G2[JSON-RPC 2.0]
+        G3[SSE 流式]
+    end
+
+    subgraph OpenCode["OpenCode"]
+        O1[REST API]
+        O2[OpenAPI]
+        O3[SSE 流式]
+    end
+
+    subgraph Codex["Codex"]
+        C1[纯 CLI]
+        C2[无服务器]
+        C3[TUI 交互]
+    end
+
+    G1 --> G2 --> G3
+    O1 --> O2 --> O3
+    C1 --> C2 --> C3
 ```
 
 | 项目 | 协议设计 | 通信方式 | 部署模式 | 适用场景 |
@@ -875,11 +1000,10 @@ if (store) {
 ## 9. 延伸阅读
 
 - 前置知识：[A2A 协议规范](https://github.com/google/A2A)
-- 相关机制：[03-gemini-cli-session-runtime.md](./03-gemini-cli-session-runtime.md)
-- 相关机制：[04-gemini-cli-agent-loop.md](./04-gemini-cli-agent-loop.md)
-- 深度分析：[Gemini API 流式处理](../questions/gemini-cli-streaming.md)
+- 相关机制：`03-gemini-cli-session-runtime.md`
+- 相关机制：`04-gemini-cli-agent-loop.md`
+- 深度分析：`../questions/gemini-cli-streaming.md`
 
 ---
 
-*✅ Verified: 基于 gemini-cli/packages/a2a-server/src/http/app.ts、executor.ts、task.ts 等源码分析*
 *基于版本：2025-02 | 最后更新：2025-02*

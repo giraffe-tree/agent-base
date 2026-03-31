@@ -6,11 +6,30 @@
 
 ---
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置文档 | `docs/comm/04-comm-agent-loop.md`、`docs/comm/06-comm-mcp-integration.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 **一句话定义**: Skill 执行超时机制是 AI Coding Agent 中防止工具调用无限阻塞、保障系统响应性的关键保护机制。
 
 五个项目的超时机制呈现**分层演进**特征：**Codex/Gemini CLI** 侧重**基础设施级**的异步取消和状态机管理（对比 Kimi CLI 的保守业务级超时）；**Kimi CLI** 强调**状态一致性**的 Checkpoint 联动回滚（对比其他项目无自动回滚）；**OpenCode** 创新性地引入**动态超时重置**（对比静态超时配置）；**SWE-agent** 则面向**学术研究**设计了可重采样错误恢复（对比生产环境的简单超时）。
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 核心机制 | 分层超时配置（启动+执行） | `codex/codex-rs/mcp/src/config.rs` |
+| 状态管理 | Checkpoint 超时回滚 | `kimi-cli/src/kimi_cli/soul/toolset.py:397` |
+| 错误处理 | 动态超时重置 + 连续超时计数 | `opencode/packages/opencode/src/mcp/index.ts:142`、`SWE-agent/sweagent/agent/agents.py:970` |
 
 ---
 
@@ -70,7 +89,7 @@
 ```text
 ┌─────────────────────────────────────────────────────────────┐
 │ Agent Loop / Session Runtime                                 │
-│ 协调工具调用与超时管理                                          │
+│ 协调工具调用与超时管理                                         │
 └───────────────────────┬─────────────────────────────────────┘
                         │ 触发工具调用
                         ▼
@@ -85,11 +104,11 @@
 └───────────────────────┬─────────────────────────────────────┘
                         │ 超时/完成通知
                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 取消机制              │ 状态恢复            │ 错误处理        │
-│ CancellationToken     │ Checkpoint          │ Error Type     │
-│ AbortController       │ rollback            │ retry logic    │
-└──────────────────────┴──────────────────────┴───────────────┘
+┌───────────────────────┬───────────────────────┬─────────────┐
+│ 取消机制              │ 状态恢复              │ 错误处理     │
+│ CancellationToken     │ Checkpoint            │ Error Type   │
+│ AbortController       │ rollback              │ retry logic  │
+└───────────────────────┴───────────────────────┴─────────────┘
 ```
 
 ### 2.2 核心组件职责
@@ -158,6 +177,37 @@ sequenceDiagram
 
 统一管理各类型工具的超时阈值，支持分层配置（全局/工具类型/单次调用）。
 
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle: 初始化
+    Idle --> Configuring: 读取配置
+    Configuring --> Ready: 配置生效
+    Ready --> Executing: 开始执行
+    Executing --> Monitoring: 启动计时器
+    Monitoring --> Completed: 正常完成
+    Monitoring --> Timeout: 超时触发
+    Completed --> [*]
+    Timeout --> Recovering: 状态恢复
+    Recovering --> Ready: 恢复完成
+    Recovering --> Failed: 恢复失败
+    Failed --> [*]
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Idle | 空闲等待 | 系统初始化 | 收到配置请求 |
+| Configuring | 配置加载中 | 读取超时配置 | 配置解析完成 |
+| Ready | 就绪状态 | 配置生效 | 收到执行请求 |
+| Executing | 执行中 | 开始工具调用 | 计时器启动 |
+| Monitoring | 监控中 | 计时器启动 | 完成或超时 |
+| Completed | 完成 | 正常执行结束 | 自动返回 Ready |
+| Timeout | 超时 | 超过阈值 | 触发恢复 |
+| Recovering | 恢复中 | 超时后 | 恢复完成或失败 |
+
 #### 配置结构对比
 
 | 项目 | 配置结构 | 关键字段 | 代码位置 |
@@ -191,6 +241,8 @@ flowchart LR
     Liberal -->|通用场景| User3[企业环境]
 ```
 
+---
+
 ### 3.2 取消机制组件
 
 #### 职责定位
@@ -206,6 +258,25 @@ flowchart LR
 | **Kimi CLI** | `asyncio.CancelledError` | `kimi-cli/src/kimi_cli/soul/toolset.py:377` |
 | **OpenCode** | `AbortController` + `resetTimeoutOnProgress` | `opencode/packages/opencode/src/mcp/index.ts:142` |
 | **SWE-agent** | `subprocess.kill()` | `SWE-agent/sweagent/agent/agents.py:977` |
+
+#### 内部数据流
+
+```text
+┌────────────────────────────────────────────┐
+│  输入层                                     │
+│   超时配置 → 计时器初始化 → 执行启动        │
+└──────────────────┬─────────────────────────┘
+                   ▼
+┌────────────────────────────────────────────┐
+│  处理层                                     │
+│   监控执行 → 超时检测 → 取消信号发送        │
+└──────────────────┬─────────────────────────┘
+                   ▼
+┌────────────────────────────────────────────┐
+│  输出层                                     │
+│   进程终止 → 资源释放 → 错误通知            │
+└────────────────────────────────────────────┘
+```
 
 #### 取消机制时序
 
@@ -238,6 +309,8 @@ sequenceDiagram
     P->>P: 强制终止
 ```
 
+---
+
 ### 3.3 超时后处理组件
 
 #### 职责定位
@@ -253,6 +326,125 @@ sequenceDiagram
 | **Kimi CLI** | `ToolError` + 回滚 | **Checkpoint 恢复状态** | `kimi-cli/src/kimi_cli/soul/toolset.py:397` |
 | **OpenCode** | 返回 error 给 LLM | LLM 自我纠正 | `opencode/packages/opencode/src/` |
 | **SWE-agent** | 构造反馈 history | `forward_with_handling()` 重试 | `SWE-agent/sweagent/agent/agents.py:968` |
+
+---
+
+### 3.4 组件间协作时序
+
+```mermaid
+sequenceDiagram
+    participant U as Agent Loop
+    participant C as Timeout Config
+    participant E as Tool Executor
+    participant M as Monitor
+    participant S as Skill/Tool
+    participant H as Error Handler
+
+    U->>C: 读取超时配置
+    activate C
+    C-->>U: 返回 timeout
+    deactivate C
+
+    U->>E: 执行工具(args, timeout)
+    activate E
+
+    E->>S: 启动执行
+    activate S
+
+    E->>M: 启动计时器(timeout)
+    activate M
+
+    alt 正常完成
+        S->>S: 执行完成
+        S-->>E: 返回结果
+        E->>M: 停止计时器
+        deactivate M
+        E-->>U: ToolResult(success)
+    else 超时触发
+        M->>M: 超时到达
+        M->>E: 触发取消
+        deactivate M
+        E->>S: 取消执行
+        S-->>E: 已取消
+        deactivate S
+        E->>H: 超时错误
+        activate H
+        H->>H: 状态恢复
+        H-->>E: 处理完成
+        deactivate H
+        E-->>U: ToolResult(timeout)
+    end
+
+    deactivate E
+```
+
+**协作要点**：
+
+1. **Agent Loop 与 Timeout Config**: 读取分层配置，支持按工具类型自定义
+2. **Tool Executor 与 Monitor**: 异步监控，超时信号可靠传递
+3. **Error Handler 与外部服务**: 超时后状态恢复，保证系统一致性
+
+---
+
+### 3.5 关键数据路径
+
+#### 主路径（正常流程）
+
+```mermaid
+flowchart LR
+    subgraph Input["输入阶段"]
+        I1[读取配置] --> I2[解析超时值]
+        I2 --> I3[启动执行]
+    end
+
+    subgraph Process["处理阶段"]
+        P1[启动计时器] --> P2[监控执行]
+        P2 --> P3[正常完成]
+    end
+
+    subgraph Output["输出阶段"]
+        O1[停止计时器] --> O2[返回结果]
+        O2 --> O3[继续 Agent Loop]
+    end
+
+    I3 --> P1
+    P3 --> O1
+
+    style Process fill:#e1f5e1,stroke:#333
+```
+
+#### 异常路径（错误恢复）
+
+```mermaid
+flowchart TD
+    E[发生超时] --> E1{超时类型}
+    E1 -->|单命令| R1[Command Timeout]
+    E1 -->|总会话| R2[Total Timeout]
+    E1 -->|启动| R3[Startup Timeout]
+
+    R1 --> F{重试?}
+    F -->|是| G[指数退避重试]
+    F -->|否| H[返回超时错误]
+
+    R2 --> I[立即终止 Agent]
+    R3 --> J[标记服务不可用]
+
+    G -->|成功| K[继续主流程]
+    G -->|失败| H
+
+    H --> L{有 Checkpoint?}
+    L -->|是| M[执行回滚]
+    L -->|否| N[保持当前状态]
+
+    M --> O[返回错误给 LLM]
+    N --> O
+    I --> P[会话结束]
+    J --> Q[尝试备用服务]
+
+    style R1 fill:#FFD700
+    style R2 fill:#FF6B6B
+    style R3 fill:#FFB6C1
+```
 
 ---
 
@@ -283,6 +475,14 @@ sequenceDiagram
     T-->>A: ToolResult(success)
     deactivate T
 ```
+
+**数据变换详情**：
+
+| 阶段 | 输入 | 处理 | 输出 | 代码位置 |
+|-----|------|------|------|---------|
+| 接收 | 工具调用请求 | 读取超时配置 | timeout 值 | 各项目配置文件 |
+| 处理 | args + timeout | 启动异步执行 | 执行句柄 | 语言原生异步机制 |
+| 输出 | 执行结果 | 格式化 | ToolResult | Agent Loop 处理 |
 
 ### 4.2 超时流程（详细版）
 
@@ -453,6 +653,11 @@ except CommandTimeoutError:
 else:
     self._n_consecutive_timeouts = 0
 ```
+
+**设计意图**：
+1. **双层保护**: `execution_timeout` 保护单命令，`max_consecutive_execution_timeouts` 防止连续超时
+2. **优雅中断**: 超时后先尝试 `interrupt_session()` 而非直接 kill
+3. **模板反馈**: 构造结构化超时反馈，便于 LLM 理解
 
 **Kimi CLI - 超时转换**:
 
@@ -636,4 +841,4 @@ max_consecutive_execution_timeouts: int = 3
 ---
 
 *✅ Verified: 基于 codex/codex-rs/mcp/src/config.rs、gemini-cli/packages/core/src/tools/mcp-client.ts:78、kimi-cli/src/kimi_cli/config.py:132、opencode/packages/opencode/src/mcp/index.ts:142、SWE-agent/sweagent/tools/tools.py:139-152 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-25*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

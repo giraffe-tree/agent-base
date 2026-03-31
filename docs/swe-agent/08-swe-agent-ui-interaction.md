@@ -1,8 +1,29 @@
 # UI Interaction（SWE-agent）
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | `01-swe-agent-overview.md`、`04-swe-agent-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
-SWE-agent 采用 **Rich 库驱动的命令行交互界面**，通过进度条、状态钩子和结构化日志提供实时反馈。核心取舍是**终端优先的轻量交互**（对比 Gemini CLI 的复杂 Web UI、Codex 的 TUI 界面）。
+SWE-agent 采用 **Rich 库驱动的命令行交互界面**，通过进度条、状态钩子和结构化日志提供实时反馈。核心取舍是**终端优先的轻量交互**（对比 Gemini CLI 的复杂 Web UI、Codex 的 TUI 界面、Kimi CLI 的简洁 CLI）。
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 交互方式 | Rich 库命令行界面 | `sweagent/run/_progress.py:33` |
+| 进度管理 | 双进度条（主进度 + 任务进度） | `sweagent/run/_progress.py:52` |
+| 状态同步 | Hook 机制（Agent/Environment） | `sweagent/agent/hooks/status.py:7` |
+| 日志样式 | Emoji + 彩色 RichHandler | `sweagent/utils/log.py:57` |
+| 并发支持 | 多线程 + Lock | `sweagent/run/_progress.py:49` |
 
 ---
 
@@ -41,7 +62,7 @@ SWE-agent 采用 **Rich 库驱动的命令行交互界面**，通过进度条、
 ```text
 ┌─────────────────────────────────────────────────────────────┐
 │ Agent Loop / Run Batch                                       │
-│ sweagent/agent/agents.py / run_batch.py                      │
+│ sweagent/agent/agents.py:800 / run_batch.py:100             │
 └───────────────────────┬─────────────────────────────────────┘
                         │ 触发状态更新
                         ▼
@@ -68,11 +89,11 @@ SWE-agent 采用 **Rich 库驱动的命令行交互界面**，通过进度条、
 
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
-| `RunBatchProgressManager` | 批量任务进度管理 | `SWE-agent/sweagent/run/_progress.py:33` |
-| `SetStatusAgentHook` | Agent 状态更新钩子 | `SWE-agent/sweagent/agent/hooks/status.py:7` |
-| `SetStatusEnvironmentHook` | 环境状态更新钩子 | `SWE-agent/sweagent/environment/hooks/status.py:7` |
-| `get_logger` | 带 emoji 的日志记录器 | `SWE-agent/sweagent/utils/log.py:57` |
-| `_RichHandlerWithEmoji` | 富文本日志处理器 | `SWE-agent/sweagent/utils/log.py:44` |
+| `RunBatchProgressManager` | 批量任务进度管理 | `sweagent/run/_progress.py:33` |
+| `SetStatusAgentHook` | Agent 状态更新钩子 | `sweagent/agent/hooks/status.py:7` |
+| `SetStatusEnvironmentHook` | 环境状态更新钩子 | `sweagent/environment/hooks/status.py:7` |
+| `get_logger` | 带 emoji 的日志记录器 | `sweagent/utils/log.py:57` |
+| `_RichHandlerWithEmoji` | 富文本日志处理器 | `sweagent/utils/log.py:44` |
 
 ### 2.3 核心组件交互关系
 
@@ -118,6 +139,31 @@ sequenceDiagram
 
 管理批量任务的进度显示，包括总进度条和各个实例的状态。
 
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Initializing: 创建
+    Initializing --> Running: 开始第一个实例
+    Running --> Running: 实例状态更新
+    Running --> InstanceComplete: 实例完成
+    InstanceComplete --> Running: 开始下一个
+    InstanceComplete --> Completed: 所有实例完成
+    Running --> Failed: 异常发生
+    Failed --> [*]
+    Completed --> [*]
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Initializing | 初始化 | 创建 ProgressManager | 开始第一个实例 |
+| Running | 运行中 | 有实例在执行 | 所有实例完成 |
+| InstanceComplete | 实例完成 | 单个实例结束 | 开始下一个或全部完成 |
+| Completed | 全部完成 | 所有实例成功 | 自动结束 |
+| Failed | 失败 | 发生异常 | 终止 |
+
 #### 内部数据流
 
 ```text
@@ -139,7 +185,7 @@ sequenceDiagram
 #### 核心实现
 
 ```python
-# SWE-agent/sweagent/run/_progress.py:52-77
+# sweagent/run/_progress.py:52-77
 self._main_progress_bar = Progress(
     SpinnerColumn(spinner_name="dots2"),
     TextColumn("[progress.description]{task.description} (${task.fields[total_cost]})"),
@@ -180,17 +226,27 @@ stateDiagram-v2
     StepDone --> [*]: 完成
 ```
 
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Idle | 空闲 | 初始化完成 | 开始 setup |
+| SetupAttempt | 尝试设置 | setup 开始 | step 开始 |
+| StepRunning | Step 运行中 | step 开始 | step 完成 |
+| StepDone | Step 完成 | step 结束 | 继续或完成 |
+
 #### 实现代码
 
 ```python
-# SWE-agent/sweagent/agent/hooks/status.py:25-31
-def on_step_start(self):
-    self._i_step += 1
-    attempt_str = f"Attempt {self._i_attempt} " if self._i_attempt > 1 else ""
-    self._update(f"{attempt_str}Step {self._i_step:>3} (${self._previous_cost + self._cost:.2f})")
+# sweagent/agent/hooks/status.py:25-31
+class SetStatusAgentHook:
+    def on_step_start(self):
+        self._i_step += 1
+        attempt_str = f"Attempt {self._i_attempt} " if self._i_attempt > 1 else ""
+        self._update(f"{attempt_str}Step {self._i_step:>3} (${self._previous_cost + self._cost:.2f})")
 
-def on_step_done(self, *, step: StepOutput, info: AgentInfo):
-    self._cost = info["model_stats"]["instance_cost"]
+    def on_step_done(self, *, step: StepOutput, info: AgentInfo):
+        self._cost = info["model_stats"]["instance_cost"]
 ```
 
 ---
@@ -218,7 +274,7 @@ flowchart TD
 #### 实现代码
 
 ```python
-# SWE-agent/sweagent/utils/log.py:57-90
+# sweagent/utils/log.py:57-90
 def get_logger(name: str, *, emoji: str = "") -> logging.Logger:
     """Get logger with RichHandler and emoji support."""
     thread_name = threading.current_thread().name
@@ -285,11 +341,38 @@ sequenceDiagram
 
 | 阶段 | 输入 | 处理 | 输出 | 代码位置 |
 |-----|------|------|------|---------|
-| 初始化 | 实例数量 | 创建 Progress | 进度条对象 | `SWE-agent/sweagent/run/_progress.py:74` |
-| 实例开始 | 实例 ID | 添加任务 | Spinner 任务 | `SWE-agent/sweagent/run/_progress.py:118` |
-| 状态更新 | 状态消息 | 截断 + 格式化 | 显示文本 | `SWE-agent/sweagent/run/_progress.py:107` |
-| 日志输出 | 日志记录 | 添加 emoji + 样式 | 彩色文本 | `SWE-agent/sweagent/utils/log.py:52` |
-| 实例结束 | 退出状态 | 更新统计 | 完成计数 | `SWE-agent/sweagent/run/_progress.py:127` |
+| 初始化 | 实例数量 | 创建 Progress | 进度条对象 | `sweagent/run/_progress.py:74` |
+| 实例开始 | 实例 ID | 添加任务 | Spinner 任务 | `sweagent/run/_progress.py:118` |
+| 状态更新 | 状态消息 | 截断 + 格式化 | 显示文本 | `sweagent/run/_progress.py:107` |
+| 日志输出 | 日志记录 | 添加 emoji + 样式 | 彩色文本 | `sweagent/utils/log.py:52` |
+| 实例结束 | 退出状态 | 更新统计 | 完成计数 | `sweagent/run/_progress.py:127` |
+
+### 4.3 异常流程（错误恢复）
+
+```mermaid
+flowchart TD
+    E[发生错误] --> E1{错误类型}
+    E1 -->|实例异常| R1[标记失败状态]
+    E1 -->|用户中断| R2[优雅关闭]
+    E1 -->|成本超限| R3[提前终止]
+
+    R1 --> R1A[更新统计表]
+    R1A -->|继续| R1B[开始下一个实例]
+    R1A -->|全部失败| R2
+
+    R2 --> R2A[保存当前状态]
+    R2A --> R2B[清理资源]
+
+    R3 --> R3A[记录成本警告]
+    R3A --> R2
+
+    R1B --> End[结束]
+    R2B --> End
+
+    style R1 fill:#FFD700
+    style R2 fill:#FF6B6B
+    style R3 fill:#FFA500
+```
 
 ---
 
@@ -298,7 +381,7 @@ sequenceDiagram
 ### 5.1 核心数据结构
 
 ```python
-# SWE-agent/sweagent/run/_progress.py:33-79
+# sweagent/run/_progress.py:33-79
 class RunBatchProgressManager:
     def __init__(
         self,
@@ -324,8 +407,10 @@ class RunBatchProgressManager:
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```python
-# SWE-agent/sweagent/run/_progress.py:107-116
+# sweagent/run/_progress.py:107-116
 def update_instance_status(self, instance_id: str, message: str):
     """更新实例状态显示"""
     with self._lock:
@@ -337,21 +422,63 @@ def update_instance_status(self, instance_id: str, message: str):
     self._update_total_costs()
 ```
 
-**代码要点**：
+**设计意图**：
 1. **线程安全**：使用锁保护共享状态
 2. **字符串截断**：防止长消息破坏布局
 3. **成本同步**：每次更新都刷新总成本
 
+<details>
+<summary>📋 查看完整实现</summary>
+
+```python
+# sweagent/run/_progress.py:100-130
+class RunBatchProgressManager:
+    def update_instance_status(self, instance_id: str, message: str):
+        """更新实例状态显示
+
+        线程安全地更新指定实例的状态显示，并同步总成本。
+        """
+        with self._lock:
+            if instance_id not in self._spinner_tasks:
+                return
+
+            # 截断消息防止布局破坏
+            short_message = _shorten_str(message, 30)
+            short_id = _shorten_str(instance_id, 25, shorten_left=True)
+
+            self._task_progress_bar.update(
+                self._spinner_tasks[instance_id],
+                status=short_message,
+                instance_id=short_id,
+            )
+
+        # 在锁外更新成本（避免阻塞）
+        self._update_total_costs()
+
+    def _update_total_costs(self):
+        """更新总成本显示"""
+        total = sum(
+            self._task_progress_bar.tasks[tid].fields.get("cost", 0.0)
+            for tid in self._spinner_tasks.values()
+        )
+        self._main_progress_bar.update(
+            self._main_task_id,
+            total_cost=f"{total:.2f}"
+        )
+```
+
+</details>
+
 ### 5.3 关键调用链
 
 ```text
-RunBatch._run_instance()           [SWE-agent/sweagent/run/run_batch.py]
-  -> on_instance_start()            [SWE-agent/sweagent/run/_progress.py:118]
-  -> SetStatusAgentHook.on_step_start() [SWE-agent/sweagent/agent/hooks/status.py:25]
-    -> update_instance_status()     [SWE-agent/sweagent/run/_progress.py:107]
-  -> get_logger().info()            [SWE-agent/sweagent/utils/log.py:57]
-    -> _RichHandlerWithEmoji.emit() [SWE-agent/sweagent/utils/log.py:44]
-  -> on_instance_end()              [SWE-agent/sweagent/run/_progress.py:127]
+RunBatch._run_instance()           [sweagent/run/run_batch.py:100]
+  -> on_instance_start()            [sweagent/run/_progress.py:118]
+  -> SetStatusAgentHook.on_step_start() [sweagent/agent/hooks/status.py:25]
+    -> update_instance_status()     [sweagent/run/_progress.py:107]
+  -> get_logger().info()            [sweagent/utils/log.py:57]
+    -> _RichHandlerWithEmoji.emit() [sweagent/utils/log.py:44]
+  -> on_instance_end()              [sweagent/run/_progress.py:127]
 ```
 
 ---
@@ -373,7 +500,7 @@ RunBatch._run_instance()           [SWE-agent/sweagent/run/run_batch.py]
 **核心问题**：如何在保持轻量的同时提供有效的执行反馈？
 
 **SWE-agent 的解决方案**：
-- 代码依据：`SWE-agent/sweagent/run/_progress.py`
+- 代码依据：`sweagent/run/_progress.py:33`
 - 设计意图：终端优先，使用 Rich 库提供现代化 CLI 体验
 - 带来的好处：
   - 零 Web 依赖，易于部署
@@ -386,12 +513,37 @@ RunBatch._run_instance()           [SWE-agent/sweagent/run/run_batch.py]
 
 ### 6.3 与其他项目的对比
 
+```mermaid
+gitGraph
+    commit id: "原始 CLI"
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "Rich 进度条"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "简洁 CLI"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "TUI (ratatui)"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "Web UI"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "混合界面"
+```
+
 | 项目 | 核心差异 | 适用场景 |
 |-----|---------|---------|
 | SWE-agent | Rich 命令行界面 | 批量任务、服务器环境 |
 | Gemini CLI | 复杂 Web UI | 本地开发、可视化需求 |
 | Codex | TUI (ratatui) | 终端环境、交互式任务 |
 | Kimi CLI | 简洁 CLI | 轻量级使用 |
+| OpenCode | 混合界面 | 多种使用场景 |
 
 ---
 
@@ -406,7 +558,7 @@ RunBatch._run_instance()           [SWE-agent/sweagent/run/run_batch.py]
 | 用户中断 | Ctrl+C | 优雅关闭，保存状态 |
 | 成本超限 | 达到 cost_limit | 提前终止 |
 
-### 7.2 资源限制
+### 7.2 超时/资源限制
 
 ```python
 # 线程安全
@@ -421,7 +573,7 @@ _shorten_str(instance_id, 25, shorten_left=True)  # ID 截断
 
 | 错误类型 | 处理策略 | 代码位置 |
 |---------|---------|---------|
-| 线程冲突 | 使用 Lock | `SWE-agent/sweagent/run/_progress.py:49` |
+| 线程冲突 | 使用 Lock | `sweagent/run/_progress.py:49` |
 | 长消息 | 字符串截断 | `_shorten_str()` |
 | 日志级别 | 环境变量控制 | `SWE_AGENT_LOG_STREAM_LEVEL` |
 
@@ -431,16 +583,16 @@ _shorten_str(instance_id, 25, shorten_left=True)  # ID 截断
 
 | 功能 | 文件 | 行号 | 说明 |
 |-----|------|------|------|
-| 进度管理器 | `SWE-agent/sweagent/run/_progress.py` | 33 | RunBatchProgressManager 类 |
-| 主进度条 | `SWE-agent/sweagent/run/_progress.py` | 52 | 总体进度显示 |
-| 任务进度条 | `SWE-agent/sweagent/run/_progress.py` | 64 | 各实例状态 |
-| 实例开始 | `SWE-agent/sweagent/run/_progress.py` | 118 | on_instance_start() |
-| 状态更新 | `SWE-agent/sweagent/run/_progress.py` | 107 | update_instance_status() |
-| 实例结束 | `SWE-agent/sweagent/run/_progress.py` | 127 | on_instance_end() |
-| Agent 钩子 | `SWE-agent/sweagent/agent/hooks/status.py` | 7 | SetStatusAgentHook |
-| 环境钩子 | `SWE-agent/sweagent/environment/hooks/status.py` | 7 | SetStatusEnvironmentHook |
-| 日志记录器 | `SWE-agent/sweagent/utils/log.py` | 57 | get_logger() |
-| 富文本处理器 | `SWE-agent/sweagent/utils/log.py` | 44 | _RichHandlerWithEmoji |
+| 进度管理器 | `sweagent/run/_progress.py` | 33 | RunBatchProgressManager 类 |
+| 主进度条 | `sweagent/run/_progress.py` | 52 | 总体进度显示 |
+| 任务进度条 | `sweagent/run/_progress.py` | 64 | 各实例状态 |
+| 实例开始 | `sweagent/run/_progress.py` | 118 | on_instance_start() |
+| 状态更新 | `sweagent/run/_progress.py` | 107 | update_instance_status() |
+| 实例结束 | `sweagent/run/_progress.py` | 127 | on_instance_end() |
+| Agent 钩子 | `sweagent/agent/hooks/status.py` | 7 | SetStatusAgentHook |
+| 环境钩子 | `sweagent/environment/hooks/status.py` | 7 | SetStatusEnvironmentHook |
+| 日志记录器 | `sweagent/utils/log.py` | 57 | get_logger() |
+| 富文本处理器 | `sweagent/utils/log.py` | 44 | _RichHandlerWithEmoji |
 
 ---
 
@@ -452,5 +604,5 @@ _shorten_str(instance_id, 25, shorten_left=True)  # ID 截断
 
 ---
 
-*✅ Verified: 基于 SWE-agent/sweagent/run/_progress.py、SWE-agent/sweagent/utils/log.py 等源码分析*
-*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-02-25*
+*✅ Verified: 基于 sweagent/run/_progress.py、sweagent/utils/log.py 等源码分析*
+*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-03-03*

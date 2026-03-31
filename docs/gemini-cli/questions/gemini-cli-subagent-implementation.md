@@ -1,8 +1,30 @@
 # Gemini CLI Subagent 实现分析
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `docs/gemini-cli/04-gemini-cli-agent-loop.md`、`docs/gemini-cli/06-gemini-cli-mcp-integration.md` |
+> | 文档结构 | TL;DR → 架构 → 核心组件 → 数据流转 → 代码实现 → 设计对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
-**Gemini CLI 实现了完整的 Subagent（子代理）系统**，允许主代理将特定任务委派给专门的子代理执行。核心架构采用**工具包装模式**（Tool Wrapper Pattern），将每个子代理封装为标准工具供主代理调用，支持本地代理（Local Agent）和远程代理（Remote Agent/A2A）两种类型，并通过独立的 Agent Loop 实现上下文隔离。
+**一句话定义**：Gemini CLI 实现了完整的 Subagent（子代理）系统，允许主代理将特定任务委派给专门的子代理执行。核心架构采用**工具包装模式**（Tool Wrapper Pattern），将每个子代理封装为标准工具供主代理调用，支持本地代理（Local Agent）和远程代理（Remote Agent/A2A）两种类型，并通过独立的 Agent Loop 实现上下文隔离。
+
+**Gemini CLI 的核心取舍**：**工具包装 + 独立 Agent Loop**（对比无 Subagent 架构的单代理模式），通过逻辑隔离而非进程隔离实现轻量级子代理。
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 架构模式 | 工具包装模式（Tool Wrapper） | `packages/core/src/agents/subagent-tool.ts:24` |
+| 代理类型 | 本地 + 远程（A2A）双模式 | `packages/core/src/agents/types.ts:78-132` |
+| 上下文隔离 | 独立 GeminiChat + ToolRegistry | `packages/core/src/agents/local-executor.ts:116` |
+| 递归防护 | 运行时工具过滤 | `packages/core/src/agents/local-executor.ts:131-139` |
 
 ---
 
@@ -156,6 +178,43 @@ stateDiagram-v2
     Completed --> [*]
     Failed --> [*]
     Aborted --> [*]
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Idle | 空闲等待 | 初始化完成 | 收到调用请求 |
+| Validating | 验证中 | 收到调用请求 | 验证通过或失败 |
+| Executing | 执行中 | 验证通过 | 需要用户确认或执行出错 |
+| Waiting | 等待用户确认 | 需要用户批准 | 用户确认或拒绝 |
+| Running | 运行中 | 用户确认 | 执行完成或出错 |
+| Completed | 完成 | 执行成功 | 自动结束 |
+| Failed | 失败 | 验证失败或执行出错 | 自动结束 |
+| Aborted | 中止 | 用户拒绝 | 自动结束 |
+
+#### 内部数据流
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  输入层                                                      │
+│  ├── AgentDefinition ──► 工具元数据生成 ──► ToolSchema       │
+│  └── 调用参数 ──► JSON Schema 验证 ──► 结构化输入             │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  处理层                                                      │
+│  ├── 只读检测: 检查代理配置的所有工具是否均为只读               │
+│  ├── 权限检查: shouldConfirmExecute()                        │
+│  ├── 类型路由: 根据 definition.kind 选择本地/远程              │
+│  └── 执行调用: SubAgentInvocation.execute()                  │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  输出层                                                      │
+│  ├── OutputObject ──► 结果格式化 ──► ToolResult              │
+│  └── 错误处理 ──► 错误信息包装 ──► ToolResult                │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 #### 关键算法逻辑
@@ -499,6 +558,69 @@ export interface RemoteAgentDefinition<TOutput extends z.ZodTypeAny = z.ZodUnkno
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
+```typescript
+// packages/core/src/agents/local-executor.ts:420-450
+async run(inputs: AgentInputs, signal: AbortSignal): Promise<OutputObject> {
+  const startTime = Date.now();
+  let turnCounter = 0;
+
+  const maxTimeMinutes = this.definition.runConfig.maxTimeMinutes ?? DEFAULT_MAX_TIME_MINUTES;
+  const maxTurns = this.definition.runConfig.maxTurns ?? DEFAULT_MAX_TURNS;
+
+  // 双层信号：外部取消 + 内部超时
+  const deadlineTimer = new DeadlineTimer(maxTimeMinutes * 60 * 1000, 'Agent timed out.');
+  const combinedSignal = AbortSignal.any([signal, deadlineTimer.signal]);
+
+  // 初始化 Chat 和工具
+  const tools = this.prepareToolsList();
+  const chat = await this.createChatObject(augmentedInputs, tools);
+
+  // 主循环
+  while (true) {
+    // 1. 检查终止条件
+    const reason = this.checkTermination(turnCounter, maxTurns);
+    if (reason) {
+      terminateReason = reason;
+      break;
+    }
+
+    // 2. 检查超时或取消
+    if (combinedSignal.aborted) {
+      terminateReason = deadlineTimer.signal.aborted
+        ? AgentTerminateMode.TIMEOUT
+        : AgentTerminateMode.ABORTED;
+      break;
+    }
+
+    // 3. 执行单轮
+    const turnResult = await this.executeTurn(
+      chat, currentMessage, turnCounter++, combinedSignal, deadlineTimer.signal
+    );
+
+    if (turnResult.status === 'stop') {
+      terminateReason = turnResult.terminateReason;
+      finalResult = turnResult.finalResult;
+      break;
+    }
+
+    currentMessage = turnResult.nextMessage;
+  }
+
+  return { result: finalResult, terminate_reason: terminateReason };
+}
+```
+
+**设计意图**：
+
+1. **双层信号机制**：`combinedSignal` 合并外部取消和内部超时，精确识别终止原因
+2. **恢复流程统一**：超时、超限、协议错误都进入统一的恢复处理
+3. **用户确认时间补偿**：`onWaitingForConfirmation` 暂停计时器，不计入代理执行时间
+
+<details>
+<summary>查看完整实现（含恢复流程）</summary>
+
 ```typescript
 // packages/core/src/agents/local-executor.ts:420-541
 async run(inputs: AgentInputs, signal: AbortSignal): Promise<OutputObject> {
@@ -555,23 +677,19 @@ async run(inputs: AgentInputs, signal: AbortSignal): Promise<OutputObject> {
 }
 ```
 
-**代码要点**：
-
-1. **双层信号机制**：`combinedSignal` 合并外部取消和内部超时，精确识别终止原因
-2. **恢复流程统一**：超时、超限、协议错误都进入统一的 `executeFinalWarningTurn` 恢复
-3. **用户确认时间补偿**：`onWaitingForConfirmation` 暂停计时器，不计入代理执行时间
+</details>
 
 ### 5.3 关键调用链
 
 ```text
 主代理调用工具
-  -> SubagentTool.execute()          [subagent-tool.ts:150]
-    -> SubAgentInvocation.execute()   [subagent-tool.ts:150]
-      -> buildSubInvocation()         [subagent-tool.ts:197]
-        -> SubagentToolWrapper.build() [subagent-tool-wrapper.ts:63]
-          -> LocalSubagentInvocation   [subagent-tool-wrapper.ts:82]
-            -> LocalAgentExecutor.create() [local-invocation.ts:104]
-              -> LocalAgentExecutor.run()  [local-executor.ts:420]
+  -> SubagentTool.execute()          [packages/core/src/agents/subagent-tool.ts:150]
+    -> SubAgentInvocation.execute()   [packages/core/src/agents/subagent-tool.ts:150]
+      -> buildSubInvocation()         [packages/core/src/agents/subagent-tool.ts:197]
+        -> SubagentToolWrapper.build() [packages/core/src/agents/subagent-tool-wrapper.ts:63]
+          -> LocalSubagentInvocation   [packages/core/src/agents/subagent-tool-wrapper.ts:82]
+            -> LocalAgentExecutor.create() [packages/core/src/agents/local-invocation.ts:104]
+              -> LocalAgentExecutor.run()  [packages/core/src/agents/local-executor.ts:420]
                 - 创建隔离 ToolRegistry
                 - 执行 Agent Loop
                 - 返回 OutputObject
@@ -608,6 +726,30 @@ async run(inputs: AgentInputs, signal: AbortSignal): Promise<OutputObject> {
   - 共享内存限制（无法独立限制子代理内存）
 
 ### 6.3 与其他项目的对比
+
+```mermaid
+gitGraph
+    commit id: "单代理架构"
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "工具包装+独立Loop"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "Checkpoint回滚"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "沙箱隔离"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "单代理模式"
+    checkout main
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "单代理+自动提交"
+```
 
 | 项目 | 核心差异 | 适用场景 |
 |-----|---------|---------|
@@ -665,16 +807,16 @@ const onWaitingForConfirmation = (waiting: boolean) => {
 
 | 功能 | 文件 | 行号 | 说明 |
 |-----|------|------|------|
-| 入口 | `agents/subagent-tool.ts` | 24 | SubagentTool 类定义 |
-| 核心 | `agents/local-executor.ts` | 94 | LocalAgentExecutor 类定义 |
-| 路由 | `agents/subagent-tool-wrapper.ts` | 23 | 本地/远程路由 |
-| 远程 | `agents/remote-invocation.ts` | 69 | A2A 远程代理调用 |
-| 注册 | `agents/registry.ts` | 39 | AgentRegistry 管理 |
-| 加载 | `agents/agentLoader.ts` | 233 | Markdown 代理定义解析 |
-| 内置代理 | `agents/codebase-investigator.ts` | 51 | 代码库分析代理 |
-| 配置 | `config/config.ts` | 2608 | registerSubAgentTools |
-| 类型 | `agents/types.ts` | 78 | AgentDefinition 接口 |
-| 测试 | `evals/subagents.eval.ts` | 34 | 子代理评估测试 |
+| 入口 | `packages/core/src/agents/subagent-tool.ts` | 24 | SubagentTool 类定义 |
+| 核心 | `packages/core/src/agents/local-executor.ts` | 94 | LocalAgentExecutor 类定义 |
+| 路由 | `packages/core/src/agents/subagent-tool-wrapper.ts` | 23 | 本地/远程路由 |
+| 远程 | `packages/core/src/agents/remote-invocation.ts` | 69 | A2A 远程代理调用 |
+| 注册 | `packages/core/src/agents/registry.ts` | 39 | AgentRegistry 管理 |
+| 加载 | `packages/core/src/agents/agentLoader.ts` | 233 | Markdown 代理定义解析 |
+| 内置代理 | `packages/core/src/agents/codebase-investigator.ts` | 51 | 代码库分析代理 |
+| 配置 | `packages/core/src/config/config.ts` | 2608 | registerSubAgentTools |
+| 类型 | `packages/core/src/agents/types.ts` | 78 | AgentDefinition 接口 |
+| 测试 | `packages/core/evals/subagents.eval.ts` | 34 | 子代理评估测试 |
 
 ---
 
@@ -688,4 +830,4 @@ const onWaitingForConfirmation = (waiting: boolean) => {
 ---
 
 *✅ Verified: 基于 gemini-cli/packages/core/src/agents/*.ts 源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

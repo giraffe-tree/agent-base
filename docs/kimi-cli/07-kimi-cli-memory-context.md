@@ -1,3 +1,14 @@
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `01-kimi-cli-overview.md`、`04-kimi-cli-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 # Memory Context 管理（kimi-cli）
 
 ## TL;DR（结论先行）
@@ -5,6 +16,16 @@
 一句话定义：Kimi CLI 的 Memory Context 采用"**JSONL 持久化 + Checkpoint 回滚 + D-Mail 时间旅行**"的设计，使用 JSON Lines 格式追加写入对话历史，通过 Checkpoint 标记实现任意点回滚，并提供 D-Mail 机制向历史检查点发送消息创建新的时间线。
 
 Kimi CLI 的核心取舍：**文件持久化 + 显式 Checkpoint 标记**（对比 Gemini CLI 的分层记忆、Codex 的惰性压缩）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 持久化格式 | JSON Lines 追加写入，人类可读 | `src/kimi_cli/soul/context.py:169` |
+| Checkpoint 机制 | 轻量级标记，递增 ID | `src/kimi_cli/soul/context.py:68` |
+| 回滚实现 | 文件轮换 + 历史重建 | `src/kimi_cli/soul/context.py:80` |
+| 上下文压缩 | 保留 N 条 + LLM 摘要 | `src/kimi_cli/soul/compaction.py:46` |
+| D-Mail 支持 | 向历史检查点发送消息 | `src/kimi_cli/soul/kimisoul.py:290` |
 
 ---
 
@@ -786,37 +807,28 @@ Agent Loop
 ### 6.3 与其他项目的对比
 
 ```mermaid
-flowchart TD
-    subgraph Kimi["Kimi CLI"]
-        K1[JSONL WireFile] --> K2[Checkpoint 标记]
-        K2 --> K3[D-Mail 时间旅行]
-        K3 --> K4[文件轮换备份]
-    end
-
-    subgraph Codex["Codex"]
-        C1[内存完整存储] --> C2[惰性压缩]
-        C2 --> C3[Compaction 项替换]
-    end
-
-    subgraph Gemini["Gemini CLI"]
-        G1[Global Memory] --> G2[Extension Memory]
-        G2 --> G3[Project Memory]
-        G3 --> G4[JIT 动态加载]
-    end
-
-    subgraph OpenCode["OpenCode"]
-        O1[简单历史列表] --> O2[Token 截断]
-    end
-
-    subgraph SWEAgent["SWE-agent"]
-        S1[轨迹文件] --> S2[状态回放]
-    end
-
-    style Kimi fill:#ffe1e1
-    style Codex fill:#e1e1f5
-    style Gemini fill:#e1f5e1
-    style OpenCode fill:#fff5e1
-    style SWEAgent fill:#f5e1ff
+gitGraph
+    commit id: "简单内存存储"
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "JSONL + Checkpoint"
+    commit id: "D-Mail 时间旅行"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "惰性压缩"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "分层记忆"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "简单截断"
+    checkout main
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "轨迹回放"
 ```
 
 | 项目 | 内存层次 | 持久化方式 | 回滚能力 | 压缩策略 | 适用场景 |

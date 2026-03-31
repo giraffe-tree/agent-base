@@ -1,8 +1,29 @@
 # ACP / 多 Agent 协作机制（SWE-agent）
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `docs/swe-agent/01-swe-agent-overview.md`、`docs/swe-agent/04-swe-agent-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 **SWE-agent 不支持 ACP (Agent Client Protocol)，采用严格的单 Agent 架构。** 代码库中不存在多 Agent 协作、子 Agent 创建、Agent 间通信或远程 Agent 调用的任何实现。`RetryAgent` 虽然包含"子 Agent"概念，但这只是同一 Agent 配置的多次实例化用于重试机制，而非真正的多 Agent 协作。
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 架构模式 | 严格单 Agent | `sweagent/agent/agents.py:443` |
+| 重试机制 | RetryAgent 顺序实例化 | `sweagent/agent/agents.py:257` |
+| 人机协作 | ShellAgent 模式切换 | `sweagent/agent/extra/shell_agent.py:13` |
+| ACP 支持 | 不支持 | 全局搜索无相关代码 |
+| 设计哲学 | 可复现性优先 | 学术研究场景 |
 
 ---
 
@@ -29,9 +50,9 @@ SWE-agent 专注于**单 Agent 解决软件工程任务**（特别是 GitHub Iss
 
 ---
 
-## 2. 整体架构
+## 2. 整体架构（ASCII 图）
 
-### 2.1 SWE-agent 的严格单 Agent 架构
+### 2.1 在系统中的位置
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
@@ -76,7 +97,7 @@ SWE-agent 专注于**单 Agent 解决软件工程任务**（特别是 GitHub Iss
 └──────────────┘ └──────────────┘ └──────────────┘
 ```
 
-### 2.2 关键组件职责
+### 2.2 核心组件职责
 
 | 组件 | 职责 | 代码位置 | ACP 相关 |
 |-----|------|---------|---------|
@@ -85,28 +106,53 @@ SWE-agent 专注于**单 Agent 解决软件工程任务**（特别是 GitHub Iss
 | `ShellAgent` | 人机交互模式 | `sweagent/agent/extra/shell_agent.py:13` | 仅支持人机切换 |
 | `AbstractAgent` | Agent 抽象基类 | `sweagent/agent/agents.py:224` | 无通信接口 |
 
-### 2.3 Agent 类继承关系
+### 2.3 核心组件交互关系
 
-```text
-                    ┌─────────────────┐
-                    │  AbstractAgent  │
-                    │  （抽象基类）   │
-                    └────────┬────────┘
-                             │
-           ┌─────────────────┼─────────────────┐
-           │                 │                 │
-           ▼                 ▼                 ▼
-    ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
-    │ RetryAgent  │   │DefaultAgent │   │ ShellAgent  │
-    │ （重试包装）│   │ （主实现）  │   │（人机交互） │
-    └─────────────┘   └──────┬──────┘   └─────────────┘
-                             │
-                    ┌────────┴────────┐
-                    │   无子 Agent    │
-                    │  无远程调用     │
-                    │  无协作机制     │
-                    └─────────────────┘
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as CLI
+    participant R as RetryAgent
+    participant D as DefaultAgent
+    participant T as Tools
+    participant M as Model
+
+    C->>R: 1. run(problem)
+    R->>R: 2. attempt = 0
+
+    loop 重试循环
+        R->>R: 3. _setup_agent()
+        R->>D: 4. 创建新实例
+        D->>D: 5. setup()
+
+        loop Agent Loop
+            D->>D: 6. step()
+            D->>M: 7. query()
+            M-->>D: 8. response
+            D->>T: 9. execute()
+            T-->>D: 10. observation
+        end
+
+        D-->>R: 11. result
+        alt 成功
+            R-->>C: 12. 返回结果
+        else 失败且还有重试
+            R->>R: 13. attempt += 1
+            R->>D: 14. 关闭旧实例
+        else 失败且无重试
+            R-->>C: 15. 返回最优结果
+        end
+    end
 ```
+
+**关键交互说明**：
+
+| 步骤 | 交互内容 | 设计意图 |
+|-----|---------|---------|
+| 1-2 | 启动重试循环 | 初始化 attempt 计数 |
+| 3-5 | 创建新 Agent 实例 | 每次重试使用干净状态 |
+| 6-10 | 单 Agent 执行循环 | 标准的 Agent Loop |
+| 11-15 | 结果判断与重试 | 顺序执行，非并发 |
 
 ---
 
@@ -114,7 +160,59 @@ SWE-agent 专注于**单 Agent 解决软件工程任务**（特别是 GitHub Iss
 
 ### 3.1 RetryAgent：重试机制而非多 Agent
 
-**✅ Verified**：`RetryAgent` 的代码明确显示它只是顺序创建 `DefaultAgent` 实例用于重试。
+#### 职责定位
+
+管理多次 attempt，每次创建新的 DefaultAgent 实例用于重试，**不是多 Agent 协作**。
+
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle: 初始化
+    Idle --> SettingUp: 开始 attempt
+    SettingUp --> Running: 创建 Agent 实例
+    Running --> Executing: 执行 Agent Loop
+    Executing --> Running: 继续下一步
+    Executing --> Success: 任务完成
+    Executing --> Failed: 执行失败
+    Failed --> SettingUp: 还有重试次数
+    Failed --> SelectingBest: 无重试次数
+    Success --> [*]: 返回结果
+    SelectingBest --> [*]: 返回最优结果
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Idle | 空闲 | 初始化 | 开始运行 |
+| SettingUp | 设置中 | 开始新 attempt | Agent 创建完成 |
+| Running | 运行中 | Agent 就绪 | 开始执行 |
+| Executing | 执行中 | Agent Loop 运行 | 完成/失败 |
+| Success | 成功 | 任务完成 | 返回结果 |
+| Failed | 失败 | 执行失败 | 重试或终止 |
+| SelectingBest | 选优 | 所有 attempt 完成 | 返回最优 |
+
+#### 内部数据流
+
+```text
+┌────────────────────────────────────────────┐
+│  输入层                                     │
+│   问题描述 → 配置选择 → attempt 计数       │
+└──────────────────┬─────────────────────────┘
+                   ▼
+┌────────────────────────────────────────────┐
+│  处理层                                     │
+│   创建实例 → 执行循环 → 结果判断           │
+└──────────────────┬─────────────────────────┘
+                   ▼
+┌────────────────────────────────────────────┐
+│  输出层                                     │
+│   成功结果 / 失败结果 / 最优选择           │
+└────────────────────────────────────────────┘
+```
+
+#### 实现代码
 
 ```python
 # sweagent/agent/agents.py:303-319
@@ -143,9 +241,15 @@ class RetryAgent(AbstractAgent):
 | 相同配置 | 使用相同配置创建实例 | 非不同角色 Agent |
 | 结果选优 | 从多次尝试中选择最优结果 | 非协作生成结果 |
 
+---
+
 ### 3.2 DefaultAgent：严格单 Agent 实现
 
-**✅ Verified**：`DefaultAgent` 的 `run()` 方法实现显示纯单 Agent 循环：
+#### 职责定位
+
+纯单 Agent 执行核心，无任何多 Agent 或远程调用能力。
+
+#### 实现代码
 
 ```python
 # sweagent/agent/agents.py:1265-1294
@@ -177,9 +281,15 @@ class DefaultAgent(AbstractAgent):
 - 无远程 Agent 调用
 - 无 Agent 服务化封装
 
+---
+
 ### 3.3 ShellAgent：人机交互而非 Agent 协作
 
-**✅ Verified**：`ShellAgent` 仅支持人机模式切换：
+#### 职责定位
+
+仅支持人机模式切换，不是 Agent 间协作。
+
+#### 实现代码
 
 ```python
 # sweagent/agent/extra/shell_agent.py:31-56
@@ -207,75 +317,118 @@ class ShellAgent(DefaultAgent):
 
 ## 4. 端到端数据流转
 
-### 4.1 单 Agent 执行流程
+### 4.1 正常流程（详细版）
 
-```text
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   用户输入   │────▶│  问题解析    │────▶│ Agent Loop  │────▶│  工具执行    │
-│  (Issue/    │     │             │     │             │     │             │
-│   任务描述)  │     │             │     │             │     │             │
-└─────────────┘     └─────────────┘     └──────┬──────┘     └──────┬──────┘
-                                               │                    │
-                                               │◀───────────────────│
-                                               │    执行结果         │
-                                               │                    │
-                                               ▼                    │
-                                        ┌─────────────┐             │
-                                        │  判断终止    │─────────────│
-                                        │  条件满足？  │             │
-                                        └──────┬──────┘             │
-                                               │                     │
-                              否               │        是          │
-                              ┌────────────────┘                     │
-                              │                                      │
-                              ▼                                      ▼
-                       ┌─────────────┐                        ┌─────────────┐
-                       │  继续下一轮  │                        │  返回结果    │
-                       │  LLM 调用   │                        │  Trajectory │
-                       └─────────────┘                        └─────────────┘
+```mermaid
+sequenceDiagram
+    participant U as 用户输入
+    participant C as Config Loader
+    participant R as RetryAgent
+    participant D as DefaultAgent
+    participant T as Tools
+    participant M as Model
+
+    U->>C: 提供问题描述
+    C->>C: 解析配置
+    C->>R: 创建 RetryAgent
+    R->>R: attempt = 0
+
+    loop 重试循环
+        R->>R: _setup_agent()
+        R->>D: 创建 DefaultAgent 实例
+        D->>D: setup()
+
+        loop Agent Loop
+            D->>D: step()
+            D->>M: query(messages)
+            M-->>D: model_response
+            D->>D: parse_actions()
+            D->>T: execute(action)
+            T-->>D: observation
+            D->>D: save_trajectory()
+        end
+
+        D-->>R: AgentRunResult
+        alt 成功
+            R-->>U: 返回结果
+        else 失败且 attempt < max
+            R->>R: attempt += 1
+            R->>D: 关闭实例
+        else 失败且 attempt >= max
+            R->>R: 选择最优结果
+            R-->>U: 返回结果
+        end
+    end
 ```
 
-### 4.2 RetryAgent 重试流程
+**数据变换详情**：
 
-```text
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        RetryAgent 执行流程                               │
-│                                                                         │
-│  ┌─────────────┐                                                        │
-│  │   开始     │                                                        │
-│  └──────┬──────┘                                                        │
-│         │                                                               │
-│         ▼                                                               │
-│  ┌─────────────┐     ┌─────────────────────────────────────────────┐   │
-│  │ attempt = 0 │────▶│ 创建 DefaultAgent 实例 (attempt_0)          │   │
-│  └──────┬──────┘     │ - 使用 agent_configs[0]                     │   │
-│         │            │ - 输出到 output_dir/attempt_0/              │   │
-│         │            └──────────────────────┬──────────────────────┘   │
-│         │                                   │                          │
-│         │                                   ▼                          │
-│         │            ┌─────────────────────────────────────────────┐   │
-│         │            │ 执行 Agent Loop                              │   │
-│         │            │ - 成功 → 记录结果，跳转到结束                │   │
-│         │            │ - 失败 → 继续下一次 attempt                  │   │
-│         │            └──────────────────────┬──────────────────────┘   │
-│         │                                   │                          │
-│         │            失败                    │ 成功                    │
-│         └────────────┐                      │                          │
-│                      ▼                      ▼                          │
-│         ┌─────────────────┐     ┌─────────────────┐                   │
-│         │ attempt < max?  │────▶│  选择最优结果    │                   │
-│         │                 │ 否  │  返回最终结果    │                   │
-│         └────────┬────────┘     └─────────────────┘                   │
-│                  │ 是                                                 │
-│                  ▼                                                    │
-│         ┌─────────────────┐                                           │
-│         │ attempt += 1    │                                           │
-│         │ 创建新实例      │                                           │
-│         │ (循环回去)      │                                           │
-│         └─────────────────┘                                           │
-│                                                                         │
-│  ⚠️ 关键：每次 attempt 是顺序执行，非并发，非协作                        │
-└─────────────────────────────────────────────────────────────────────────┘
+| 阶段 | 输入 | 处理 | 输出 | 代码位置 |
+|-----|------|------|------|---------|
+| 配置解析 | YAML 配置 | Pydantic 解析 | AgentConfig | `sweagent/agent/agents.py:149` |
+| 实例创建 | AgentConfig | from_config() | DefaultAgent | `sweagent/agent/agents.py:443` |
+| 执行循环 | problem | step() | StepOutput | `sweagent/agent/agents.py:790` |
+| 结果选择 | 多 attempt 结果 | 选优逻辑 | AgentRunResult | `sweagent/agent/agents.py:257` |
+
+### 4.2 单 Agent 执行流程
+
+```mermaid
+flowchart LR
+    subgraph Input["输入阶段"]
+        I1[问题描述] --> I2[配置解析]
+        I2 --> I3[Agent 初始化]
+    end
+
+    subgraph Process["执行阶段"]
+        P1[step] --> P2[模型调用]
+        P2 --> P3[动作解析]
+        P3 --> P4[工具执行]
+        P4 --> P5[结果观察]
+        P5 --> P6{完成?}
+        P6 -->|否| P1
+    end
+
+    subgraph Output["输出阶段"]
+        O1[保存轨迹] --> O2[返回结果]
+    end
+
+    I3 --> P1
+    P6 -->|是| O1
+
+    style Process fill:#e1f5e1,stroke:#333
+```
+
+### 4.3 RetryAgent 重试流程
+
+```mermaid
+flowchart TD
+    Start[开始] --> Attempt0[attempt = 0]
+    Attempt0 --> Create0[创建 Agent 实例_0]
+    Create0 --> Run0[执行 Agent Loop]
+    Run0 --> Result0{结果}
+
+    Result0 -->|成功| Success[返回结果]
+    Result0 -->|失败| Check0{attempt < max?}
+
+    Check0 -->|是| Increment[attempt += 1]
+    Check0 -->|否| SelectBest[选择最优结果]
+
+    Increment --> CreateN[创建 Agent 实例_N]
+    CreateN --> RunN[执行 Agent Loop]
+    RunN --> ResultN{结果}
+
+    ResultN -->|成功| Success
+    ResultN -->|失败| CheckN{attempt < max?}
+    CheckN -->|是| Increment
+    CheckN -->|否| SelectBest
+
+    SelectBest --> ReturnBest[返回最优结果]
+    Success --> End[结束]
+    ReturnBest --> End
+
+    style Success fill:#90EE90
+    style SelectBest fill:#FFD700
+    style End fill:#87CEEB
 ```
 
 ---
@@ -355,7 +508,40 @@ class RetryAgentConfig(BaseModel):
 | 成本控制 | 单一 Agent 成本可精确追踪 | 多 Agent 成本分配复杂 |
 | 基准测试 | 结果可对比 | 多 Agent 策略差异大 |
 
-### 6.2 与 ACP 相关项目的对比
+### 6.2 SWE-agent 的选择
+
+| 维度 | SWE-agent 的选择 | 替代方案 | 取舍分析 |
+|-----|-----------------|---------|---------|
+| 架构模式 | 严格单 Agent | 多 Agent 协作 | 简单可控，但无法处理复杂分工 |
+| 重试机制 | 顺序实例化 | 并发执行 | 状态隔离，但无法并行探索 |
+| 人机协作 | 模式切换 | 独立 Agent | 实现简单，但功能有限 |
+| 服务化 | 不支持 | ACP Server | 专注研究，但无法远程调用 |
+
+### 6.3 与其他项目的对比
+
+```mermaid
+gitGraph
+    commit id: "单 Agent"
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "保持单 Agent"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "单 Agent + ACP"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "单 Agent + Actor"
+    checkout main
+    branch "AutoGen"
+    checkout "AutoGen"
+    commit id: "多 Agent 对话"
+    checkout main
+    branch "LangGraph"
+    checkout "LangGraph"
+    commit id: "图结构多 Agent"
+```
 
 | 项目 | ACP 支持 | 架构特点 | 适用场景 |
 |-----|---------|---------|---------|
@@ -381,7 +567,7 @@ class RetryAgentConfig(BaseModel):
 | 环境错误 | Docker/Sandbox 连接失败 | 记录错误，尝试重连或终止 |
 | 模型调用失败 | API 错误或超时 | 根据 `max_requeries` 重试 |
 
-### 7.2 资源限制
+### 7.2 超时/资源限制
 
 ```python
 # 典型资源限制配置（基于 sweagent 配置）
@@ -410,36 +596,27 @@ AGENT_CONFIG = {
 
 ### 7.4 RetryAgent 错误处理
 
-```text
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     RetryAgent 错误恢复流程                              │
-│                                                                         │
-│  ┌─────────────┐                                                        │
-│  │  Attempt N  │ 执行失败（如：模型错误、环境错误、超时等）              │
-│  └──────┬──────┘                                                        │
-│         │                                                               │
-│         ▼                                                               │
-│  ┌─────────────┐                                                        │
-│  │ 捕获异常     │                                                        │
-│  │ 记录错误     │ 保存到 attempt_N/ 目录                                 │
-│  └──────┬──────┘                                                        │
-│         │                                                               │
-│         ▼                                                               │
-│  ┌─────────────┐     是    ┌─────────────────┐                         │
-│  │ 还有剩余     │─────────▶│ 创建 Attempt N+1 │ 新实例，干净状态         │
-│  │ attempt?    │          │  的 Agent 实例   │                         │
-│  └──────┬──────┘          └─────────────────┘                         │
-│         │ 否                                                            │
-│         ▼                                                               │
-│  ┌─────────────┐                                                        │
-│  │ 从所有       │ 选择最优结果（如：测试通过、补丁有效等）                │
-│  │ attempt 中选 │                                                        │
-│  │ 最优结果     │                                                        │
-│  └─────────────┘                                                        │
-│                                                                         │
-│  ✅ 优势：每次 attempt 状态隔离，失败不影响其他尝试                      │
-│  ⚠️ 限制：无状态共享，无法从失败中"学习"                                │
-└─────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    Start[Attempt N 执行] --> Error[发生错误]
+    Error --> Capture[捕获异常]
+    Capture --> Log[记录错误]
+    Log --> Check{还有剩余 attempt?}
+
+    Check -->|是| Create[创建 Attempt N+1]
+    Create --> NewInstance[新 Agent 实例]
+    NewInstance --> CleanState[干净状态]
+    CleanState --> Retry[重新执行]
+
+    Check -->|否| Select[从所有 attempt 中选优]
+    Select --> Best[选择最优结果]
+    Best --> Return[返回结果]
+
+    Retry --> Start
+    Return --> End[结束]
+
+    style Create fill:#90EE90
+    style Select fill:#FFD700
 ```
 
 ---
@@ -473,4 +650,4 @@ AGENT_CONFIG = {
 
 *✅ Verified: 基于 sweagent/agent/agents.py、sweagent/agent/extra/shell_agent.py、sweagent/run/run.py、sweagent/types.py 源码分析*
 *⚠️ Inferred: 扩展方案为基于架构的理论分析*
-*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-02-28*
+*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-03-03*

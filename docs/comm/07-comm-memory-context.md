@@ -1,11 +1,31 @@
 # 记忆与上下文管理
 
-## TL;DR
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置文档 | `04-comm-agent-loop.md` —— Agent Loop 如何驱动上下文累积 |
+> | 文档结构 | 速览 → 架构 → 策略 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
+## TL;DR（结论先行）
 
 一句话定义：LLM 的"记忆"就是每次调用时传入的消息历史，上下文管理的核心问题是 token 有上限，历史会越来越长，必须设计策略应对溢出。
 
-五个项目提供了三种截然不同的策略：**滑动窗口**（最简单）、**动态压缩**（LLM 自己做摘要）、**Checkpoint 回滚**（LLM 主动截断冗余）
-（对比 Gemini CLI 的动态压缩策略、Kimi CLI 的 Checkpoint 回滚机制）
+五个项目提供了三种截然不同的策略：**滑动窗口**（最简单）、**动态压缩**（LLM 自己做摘要）、**Checkpoint 回滚**（LLM 主动截断冗余）。
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 滑动窗口策略 | 丢弃旧消息，保留最近 N 条 | `SWE-agent/sweagent/agent/agents.py:390` |
+| 动态压缩策略 | 触发 LLM 生成摘要替换历史 | `gemini-cli/packages/core/src/core/client.ts:1045` |
+| Checkpoint 策略 | LLM 主动回滚到检查点 | `kimi-cli/src/kimi_cli/soul/context.py:68` |
+| 溢出检测 | 动态计算可用 token 空间 | `opencode/packages/opencode/src/session/compaction.ts:32` |
+| 持久化存储 | SQLite / 文件后端 / 内存 | `kimi-cli/src/kimi_cli/soul/context.py:24` |
 
 ---
 
@@ -13,12 +33,12 @@
 
 ### 1.1 问题场景
 
-没有上下文管理：用户要求"修复这个 bug"，Agent 执行了 50 步后，消息历史累积到 200K tokens，超出 LLM 的 128K 限制，API 调用直接失败，任务中断。
+**没有上下文管理**：用户要求"修复这个 bug"，Agent 执行了 50 步后，消息历史累积到 200K tokens，超出 LLM 的 128K 限制，API 调用直接失败，任务中断。
 
-有上下文管理：
-- 滑动窗口策略：自动丢弃最旧的消息，保留最近 20 步
-- 动态压缩策略：触发 LLM 生成摘要，将 100K tokens 压缩为 5K
-- Checkpoint 策略：LLM 主动决定"之前的探索可以丢弃，只保留结论"
+**有上下文管理**：
+- **滑动窗口策略**：自动丢弃最旧的消息，保留最近 20 步
+- **动态压缩策略**：触发 LLM 生成摘要，将 100K tokens 压缩为 5K
+- **Checkpoint 策略**：LLM 主动决定"之前的探索可以丢弃，只保留结论"
 
 ### 1.2 核心挑战
 
@@ -281,7 +301,9 @@ flowchart TD
 
 ---
 
-## 4. 存储方式对比
+## 4. 端到端数据流转
+
+### 4.1 存储方式对比
 
 上下文管理还涉及持久化：任务中断后能否恢复？
 
@@ -305,6 +327,58 @@ graph TD
 ```
 
 **Kimi CLI 的特殊机制**：使用文件作为"弱持久化"后端，每次操作 append-only 写入日志文件，支持 `restore()` 从文件重建历史。既不是纯内存，也不是完整 SQLite，是轻量的中间方案。
+
+### 4.2 数据流向图
+
+```mermaid
+flowchart LR
+    subgraph Input["输入阶段"]
+        I1[新消息到达] --> I2[Token 计数检查]
+        I2 --> I3{是否超限?}
+    end
+
+    subgraph Process["处理阶段"]
+        P1[滑动窗口: 丢弃旧消息] --> P2[动态压缩: LLM 生成摘要]
+        P2 --> P3[Checkpoint: LLM 回滚决策]
+    end
+
+    subgraph Output["输出阶段"]
+        O1[精简历史] --> O2[持久化存储]
+        O2 --> O3[传递给 LLM]
+    end
+
+    I3 -->|是| P1
+    I3 -->|是| P2
+    I3 -->|是| P3
+    P1 --> O1
+    P2 --> O1
+    P3 --> O1
+    I3 -->|否| O3
+
+    style Process fill:#f9f,stroke:#333
+```
+
+### 4.3 异常/边界流程
+
+```mermaid
+flowchart TD
+    A[上下文操作] --> B{操作类型}
+    B -->|创建 Checkpoint| C[写入标记到文件]
+    B -->|回滚| D{Checkpoint 存在?}
+    B -->|压缩| E{token 变化}
+
+    C --> F[成功]
+    D -->|是| G[截断历史]
+    D -->|否| H[抛出 ValueError]
+    E -->|减少| I[更新历史]
+    E -->|增加| J[标记失败]
+
+    G --> F
+    H --> K[终止回滚]
+    I --> F
+    J --> L[降级为滑动窗口]
+    L --> F
+```
 
 ---
 
@@ -357,11 +431,42 @@ async def revert_to(self, checkpoint_id: int):
     # rotate the context file and truncate history
 ```
 
-**代码要点**：
+**设计意图**：
 
 1. **Checkpoint 创建**：追加 `_checkpoint` 标记到文件，可选添加用户消息提示 LLM
 2. **回滚验证**：检查 checkpoint_id 有效性，无效则抛出 ValueError
 3. **文件轮转**：回滚时轮转上下文文件，保留历史记录
+
+<details>
+<summary>📋 查看完整 Checkpoint 实现</summary>
+
+```python
+# kimi-cli/src/kimi_cli/soul/context.py:68-100
+async def checkpoint(self, add_user_message: bool):
+    """Create a new checkpoint and optionally notify LLM."""
+    checkpoint_id = self._next_checkpoint_id
+    self._next_checkpoint_id += 1
+    logger.debug("Checkpointing, ID: {id}", id=checkpoint_id)
+
+    # 写入 checkpoint 标记到文件
+    async with aiofiles.open(self._file_backend, "a", encoding="utf-8") as f:
+        await f.write(json.dumps({"role": "_checkpoint", "id": checkpoint_id}) + "\n")
+
+    # 可选：添加系统消息提示 LLM
+    if add_user_message:
+        await self.append_message(
+            Message(role="user", content=[system(f"CHECKPOINT {checkpoint_id}")])
+        )
+
+async def revert_to(self, checkpoint_id: int):
+    """Revert context to specified checkpoint."""
+    logger.debug("Reverting checkpoint, ID: {id}", id=checkpoint_id)
+    if checkpoint_id >= self._next_checkpoint_id:
+        raise ValueError(f"Checkpoint {checkpoint_id} does not exist")
+    # 执行文件轮转和历史截断
+```
+
+</details>
 
 **OpenCode 溢出检测**：
 
@@ -380,7 +485,7 @@ export async function isOverflow(input: { tokens: MessageV2.Assistant["tokens"];
 }
 ```
 
-**代码要点**：
+**设计意图**：
 
 1. **可配置开关**：支持通过配置禁用自动压缩
 2. **动态阈值**：根据模型限制和预留 buffer 计算可用空间
@@ -576,4 +681,4 @@ if (info.compressionStatus === CompressionStatus.COMPRESSION_FAILED_INFLATED_TOK
 ---
 
 *✅ Verified: 基于 kimi-cli/src/kimi_cli/soul/context.py、gemini-cli/packages/core/src/core/client.ts、opencode/packages/opencode/src/session/compaction.ts 等源码分析*
-*基于版本：2026-02-08 baseline | 最后更新：2026-02-25*
+*基于版本：2026-02-08 baseline | 最后更新：2026-03-03*

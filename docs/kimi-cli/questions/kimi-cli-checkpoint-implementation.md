@@ -1,10 +1,31 @@
 # Kimi CLI：Checkpoint 机制实现
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-35 分钟 |
+> | 前置文档 | `docs/kimi-cli/04-kimi-cli-agent-loop.md`、`docs/kimi-cli/07-kimi-cli-memory-context.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
-一句话定义：Checkpoint 是 Kimi CLI 在单个 Turn 内为对话上下文创建的"可回退锚点"，通过文件持久化实现状态快照，支持通过 D-Mail 机制进行时间旅行式回滚。
+**一句话定义**：Checkpoint 是 Kimi CLI 在单个 Turn 内为对话上下文创建的"可回退锚点"，通过文件持久化实现状态快照，支持通过 D-Mail 机制进行时间旅行式回滚。
 
 Kimi CLI 的核心取舍：**内存状态 + 文件持久化的轻量级 Checkpoint**（对比 Gemini CLI 的 Git 快照、OpenCode 的数据库事务回滚），在 Turn 级别提供上下文回滚能力，但不自动回滚文件系统副作用。
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 核心机制 | 内存状态 + JSON Lines 文件持久化，支持细粒度回滚 | `kimi-cli/src/kimi_cli/soul/context.py:68` |
+| 状态管理 | `_next_checkpoint_id` 单调递增，文件记录 checkpoint 标记 | `kimi-cli/src/kimi_cli/soul/context.py:72-73` |
+| 回滚触发 | D-Mail + `BackToTheFuture` 异常机制 | `kimi-cli/src/kimi_cli/soul/kimisoul.py:531` |
+| 文件操作 | 文件轮转（rotate）备份，截断重建 | `kimi-cli/src/kimi_cli/soul/context.py:101-132` |
+| 触发时机 | 每个 step 前创建，支持细粒度回滚 | `kimi-cli/src/kimi_cli/soul/kimisoul.py:347` |
 
 ---
 
@@ -16,20 +37,20 @@ Kimi CLI 的核心取舍：**内存状态 + 文件持久化的轻量级 Checkpoi
 
 ```
 用户: "修复这个 bug"
-  → LLM: "先读文件" → 读文件 → 结果写入上下文
-  → LLM: "再跑测试" → 执行测试 → 结果写入上下文
-  → LLM: "修改第 42 行" → 写文件 → 结果写入上下文
-  → (测试失败，想回退到"读文件"之前重新开始)
-  → 无法回退，只能重新开始整个 Turn
+  -> LLM: "先读文件" -> 读文件 -> 结果写入上下文
+  -> LLM: "再跑测试" -> 执行测试 -> 结果写入上下文
+  -> LLM: "修改第 42 行" -> 写文件 -> 结果写入上下文
+  -> (测试失败，想回退到"读文件"之前重新开始)
+  -> 无法回退，只能重新开始整个 Turn
 ```
 
 **有 Checkpoint**：
 ```
-  → 在"读文件"前创建 checkpoint 0
-  → 在"跑测试"前创建 checkpoint 1
-  → 在"修改文件"前创建 checkpoint 2
-  → 测试失败，回滚到 checkpoint 1
-  → 从 checkpoint 1 继续，保留之前读取的文件内容
+  -> 在"读文件"前创建 checkpoint 0
+  -> 在"跑测试"前创建 checkpoint 1
+  -> 在"修改文件"前创建 checkpoint 2
+  -> 测试失败，回滚到 checkpoint 1
+  -> 从 checkpoint 1 继续，保留之前读取的文件内容
 ```
 
 ### 1.2 核心挑战
@@ -192,7 +213,7 @@ stateDiagram-v2
 | `checkpoint()` | `add_user_message: bool` | `None` | 创建新 checkpoint，可选添加系统消息 | `context.py:68` |
 | `revert_to()` | `checkpoint_id: int` | `None` | 回滚到指定 checkpoint | `context.py:80` |
 | `clear()` | - | `None` | 清空上下文（用于 compaction） | `context.py:134` |
-| `append_message()` | `Message | Sequence[Message]` | `None` | 追加消息到历史 | `context.py:162` |
+| `append_message()` | `Message \| Sequence[Message]` | `None` | 追加消息到历史 | `context.py:162` |
 
 ---
 
@@ -581,7 +602,7 @@ gitGraph
 | **Kimi CLI** | 内存状态 + JSON Lines 文件持久化，D-Mail 触发 | Turn 内上下文回滚 | 快速迭代、策略实验 |
 | **Gemini CLI** | Git 快照（checkpointUtils.ts），保存 tool call 数据 | 文件 + 上下文恢复到某次工具调用 | 代码修改安全、可恢复 |
 | **OpenCode** | 数据库存储 + Git 快照（snapshot/index.ts），支持 revert/unrevert | 完整文件系统 + 消息历史回滚 | 企业级安全、审计需求 |
-| **Codex** | ✅ 无 Checkpoint 机制 | 不支持回滚 | 简单场景、Sandbox 隔离保证安全 |
+| **Codex** | 无 Checkpoint 机制 | 不支持回滚 | 简单场景、Sandbox 隔离保证安全 |
 
 **关键差异分析**：
 
@@ -659,4 +680,4 @@ if self._context.token_count + reserved >= self._runtime.llm.max_context_size:
 
 *✅ Verified: 基于 kimi-cli/src/kimi_cli/soul/context.py:68, kimi-cli/src/kimi_cli/soul/kimisoul.py:377, kimi-cli/src/kimi_cli/soul/denwarenji.py:16 等源码分析*
 
-*基于版本：kimi-cli (baseline 2026-02-08) | 最后更新：2026-02-24*
+*基于版本：kimi-cli (baseline 2026-02-08) | 最后更新：2026-03-03*

@@ -1,10 +1,31 @@
 # Memory Context 管理（SWE-agent）
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `01-swe-agent-overview.md`、`04-swe-agent-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 SWE-agent 的 Memory Context 采用"可配置的 Processor 链 + Trajectory 持久化"设计：通过链式 History Processors 对对话历史进行转换和压缩（如 LastNObservations 保留最近 N 条 observation），以 Trajectory 格式持久化到 `.traj` 文件，并支持完整的 Replay 功能用于复现和分析。
 
-SWE-agent 的核心取舍：**Processor 链压缩 + 双轨存储**（对比 Kimi CLI 的 Checkpoint 回滚、Gemini CLI 的分层内存）
+SWE-agent 的核心取舍：**Processor 链压缩 + 双轨存储**（对比 Kimi CLI 的 Checkpoint 回滚、Gemini CLI 的分层内存、Codex 的无状态 Actor）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 上下文压缩 | Processor 链（LastNObservations 等） | `sweagent/agent/history_processors.py:86` |
+| 存储方式 | History + Trajectory 双轨 | `sweagent/agent/agents.py:481-482` |
+| 持久化格式 | JSON 格式 .traj 文件 | `sweagent/agent/agents.py:save_trajectory` |
+| 回放机制 | RunReplay 完整重放 | `sweagent/run/run_replay.py:1` |
+| 缓存控制 | CacheControl Processor（Claude） | `sweagent/agent/history_processors.py:261` |
 
 ---
 
@@ -43,7 +64,7 @@ Code Agent 在处理复杂任务时面临内存管理挑战：
 ```text
 ┌─────────────────────────────────────────────────────────────┐
 │ Agent Loop                                                  │
-│ sweagent/agent/agents.py                                    │
+│ sweagent/agent/agents.py:800                                │
 └───────────────────────┬─────────────────────────────────────┘
                         │ 调用
                         ▼
@@ -77,11 +98,11 @@ Code Agent 在处理复杂任务时面临内存管理挑战：
 
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
-| `history` | 原始对话历史 | `SWE-agent/sweagent/agent/agents.py:481` |
-| `History Processors` | 历史记录变换链 | `SWE-agent/sweagent/agent/history_processors.py` |
-| `trajectory` | 执行轨迹 | `SWE-agent/sweagent/agent/agents.py:482` |
-| `save_trajectory()` | 持久化到文件 | `SWE-agent/sweagent/agent/agents.py` |
-| `RunReplay` | 轨迹重放 | `SWE-agent/sweagent/run/run_replay.py` |
+| `history` | 原始对话历史 | `sweagent/agent/agents.py:481` |
+| `History Processors` | 历史记录变换链 | `sweagent/agent/history_processors.py:1` |
+| `trajectory` | 执行轨迹 | `sweagent/agent/agents.py:482` |
+| `save_trajectory()` | 持久化到文件 | `sweagent/agent/agents.py:720` |
+| `RunReplay` | 轨迹重放 | `sweagent/run/run_replay.py:1` |
 
 ### 2.3 核心组件交互关系
 
@@ -129,6 +150,33 @@ sequenceDiagram
 #### 职责定位
 
 History 存储完整的对话历史，用于构建模型输入和持久化分析。
+
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Empty: 初始化
+    Empty --> Building: 添加第一条消息
+    Building --> Building: 添加后续消息
+    Building --> Processing: 应用 Processors
+    Processing --> Ready: 处理完成
+    Ready --> Queried: 模型调用
+    Queried --> Building: 添加响应
+    Building --> Compacting: 触发压缩
+    Compacting --> Building: 压缩完成
+    Building --> Saved: 持久化
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Empty | 空历史 | 初始化 | 添加消息 |
+| Building | 构建中 | 添加消息 | 调用模型 |
+| Processing | 处理中 | 应用 Processors | 处理完成 |
+| Ready | 就绪 | 处理完成 | 模型调用 |
+| Queried | 已查询 | 模型调用 | 添加响应 |
+| Compacting | 压缩中 | token 超限 | 压缩完成 |
 
 #### 数据结构
 
@@ -190,7 +238,7 @@ History = list[HistoryItem]
 
 通过可配置的 Processor 链对 history 进行变换，实现上下文压缩和优化。
 
-#### Processor 架构
+#### 内部数据流
 
 ```text
 Raw History          Processors              Model Input
@@ -269,6 +317,22 @@ class LastNObservations(BaseModel):
 
 Trajectory 记录完整的执行轨迹，用于持久化、分析和回放。
 
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Empty: 初始化
+    Empty --> Recording: 开始执行
+    Recording --> Recording: 添加 step
+    Recording --> Saving: 触发保存
+    Saving --> Persisted: 写入文件
+    Persisted --> Recording: 继续执行
+    Persisted --> Completed: 任务完成
+    Completed --> [*]
+    Recording --> Failed: 执行异常
+    Failed --> [*]
+```
+
 #### 数据结构
 
 ```text
@@ -321,21 +385,22 @@ TrajectoryStep {
 #### 持久化实现
 
 ```python
-# sweagent/agent/agents.py
-def get_trajectory_data(self) -> dict[str, Any]:
-    """打包所有 session 数据"""
-    return {
-        "trajectory": self.trajectory,
-        "history": self.history,
-        "info": self.info,
-        "replay_config": self.replay_config.model_dump_json() if self.replay_config else None,
-        "environment": self._env.name,
-    }
+# sweagent/agent/agents.py:720-740
+class Agent:
+    def get_trajectory_data(self) -> dict[str, Any]:
+        """打包所有 session 数据"""
+        return {
+            "trajectory": self.trajectory,
+            "history": self.history,
+            "info": self.info,
+            "replay_config": self.replay_config.model_dump_json() if self.replay_config else None,
+            "environment": self._env.name,
+        }
 
-def save_trajectory(self) -> None:
-    """持久化到磁盘"""
-    data = self.get_trajectory_data()
-    self.traj_path.write_text(json.dumps(data, indent=2))
+    def save_trajectory(self) -> None:
+        """持久化到磁盘"""
+        data = self.get_trajectory_data()
+        self.traj_path.write_text(json.dumps(data, indent=2))
 ```
 
 ---
@@ -373,7 +438,7 @@ sequenceDiagram
 #### 实现代码
 
 ```python
-# sweagent/run/run_replay.py
+# sweagent/run/run_replay.py:50-80
 class RunReplay:
     def _create_actions_file(self) -> None:
         """从 trajectory 提取动作用于回放"""
@@ -430,10 +495,39 @@ sequenceDiagram
 |-----|------|------|------|---------|
 | 原始 History | 对话记录 | 构建 HistoryItem | history[] | `sweagent/agent/agents.py:572` |
 | History 处理 | raw history | Processors 链 | processed messages | `sweagent/agent/agents.py:540` |
-| 模型输入 | processed messages | query() | model_response | `sweagent/agent/models.py` |
+| 模型输入 | processed messages | query() | model_response | `sweagent/agent/models.py:100` |
 | History 更新 | StepOutput | add_step_to_history() | 更新后 history | `sweagent/agent/agents.py:556` |
-| Trajectory 更新 | StepOutput | add_step_to_trajectory() | 更新后 trajectory | `SWE-agent/sweagent/agent/agents.py:714` |
-| 持久化 | trajectory + history + info | JSON 序列化 | .traj 文件 | `sweagent/agent/agents.py:save_trajectory` |
+| Trajectory 更新 | StepOutput | add_step_to_trajectory() | 更新后 trajectory | `sweagent/agent/agents.py:714` |
+| 持久化 | trajectory + history + info | JSON 序列化 | .traj 文件 | `sweagent/agent/agents.py:720` |
+
+### 4.3 异常流程（错误恢复）
+
+```mermaid
+flowchart TD
+    E[发生错误] --> E1{错误类型}
+    E1 -->|ContextWindowExceededError| R1[attempt_autosubmit]
+    E1 -->|Trajectory 解析失败| R2[跳过或报错]
+    E1 -->|Processor 配置错误| R3[验证 type 字段]
+    E1 -->|磁盘空间不足| R4[记录警告]
+
+    R1 --> R1A[压缩上下文]
+    R1A -->|成功| R1B[继续主路径]
+    R1A -->|失败| R2
+
+    R2 --> R2A[返回错误信息]
+    R3 --> R3A[提示配置修正]
+    R4 --> R4A[继续执行不保存]
+
+    R1B --> End[结束]
+    R2A --> End
+    R3A --> End
+    R4A --> End
+
+    style R1 fill:#90EE90
+    style R2 fill:#FFD700
+    style R3 fill:#87CEEB
+    style R4 fill:#FFA500
+```
 
 ---
 
@@ -468,7 +562,19 @@ class TrajectoryStep(TypedDict):
     extra_info: dict[str, Any]         # 额外信息
 ```
 
+**字段说明**：
+
+| 字段 | 类型 | 用途 |
+|-----|------|------|
+| `role` | `str` | 消息角色（system/user/assistant/tool） |
+| `message_type` | `Literal` | 消息类型（thought/action/observation） |
+| `cache_control` | `dict | None` | Anthropic 缓存控制标记 |
+| `state` | `dict[str, str]` | 环境状态快照 |
+| `execution_time` | `float` | 步骤执行时间 |
+
 ### 5.2 主链路代码
+
+**关键代码**（核心逻辑）：
 
 ```python
 # sweagent/agent/agents.py:540-551
@@ -486,11 +592,45 @@ def messages(self) -> list[dict[str, Any]]:
     return messages
 ```
 
-**代码要点**：
+**设计意图**：
 1. **延迟处理**：每次调用时动态应用 processors
 2. **过滤机制**：按 agent 名称过滤历史
 3. **链式处理**：支持多个 processors 组合
 4. **无副作用**：返回新列表，不修改原始 history
+
+<details>
+<summary>📋 查看完整实现</summary>
+
+```python
+# sweagent/agent/agents.py:540-570
+@property
+def messages(self) -> list[dict[str, Any]]:
+    """返回经 history_processors 处理的消息
+
+    处理流程：
+    1. 按 agent 名称过滤历史
+    2. 依次应用所有 processor
+    3. 返回处理后的消息列表
+    """
+    # 按 agent 名称过滤
+    filtered_history = [
+        entry for entry in self.history
+        if entry.get("agent") == self.name
+    ]
+
+    # 应用 processor 链
+    messages = filtered_history
+    for processor in self.history_processors:
+        try:
+            messages = processor(messages)
+        except Exception as e:
+            self.logger.warning(f"Processor {processor} failed: {e}")
+            continue
+
+    return messages
+```
+
+</details>
 
 ### 5.3 关键调用链
 
@@ -500,12 +640,12 @@ Agent.step()                       [sweagent/agent/agents.py:800]
     -> filter by agent name
     -> for processor in history_processors:
       -> LastNObservations()        [sweagent/agent/history_processors.py:86]
-      -> CacheControlHistoryProcessor() [sweagent/agent/history_processors.py:200]
-      -> RemoveRegex()              [sweagent/agent/history_processors.py]
-  -> model.query(messages)         [sweagent/agent/models.py]
+      -> CacheControlHistoryProcessor() [sweagent/agent/history_processors.py:261]
+      -> RemoveRegex()              [sweagent/agent/history_processors.py:150]
+  -> model.query(messages)         [sweagent/agent/models.py:100]
   -> add_step_to_history()         [sweagent/agent/agents.py:556]
-  -> add_step_to_trajectory()      [SWE-agent/sweagent/agent/agents.py:714]
-  -> save_trajectory()             [sweagent/agent/agents.py]
+  -> add_step_to_trajectory()      [sweagent/agent/agents.py:714]
+  -> save_trajectory()             [sweagent/agent/agents.py:720]
 ```
 
 ---
@@ -540,12 +680,33 @@ Agent.step()                       [sweagent/agent/agents.py:800]
 
 ### 6.3 与其他项目的对比
 
+```mermaid
+gitGraph
+    commit id: "原始历史"
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "Processor 链"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "Checkpoint 回滚"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "分层内存"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "无状态 Actor"
+```
+
 | 项目 | 核心差异 | 适用场景 |
 |-----|---------|---------|
 | SWE-agent | Processor 链 + Trajectory 持久化 | 学术研究、可复现实验 |
 | Kimi CLI | Checkpoint 文件回滚 | 对话回滚、状态恢复 |
 | Gemini CLI | 分层内存管理 | 长上下文任务 |
 | Codex | 无状态 Actor | 高并发、无状态服务 |
+| OpenCode | resetTimeoutOnProgress | 长运行任务 |
 
 ---
 
@@ -556,19 +717,11 @@ Agent.step()                       [sweagent/agent/agents.py:800]
 | 终止原因 | 触发条件 | 代码位置 |
 |---------|---------|---------|
 | History 过长 | 超过模型上下文限制 | `sweagent/agent/agents.py:forward_with_handling` |
-| Trajectory 损坏 | JSON 解析失败 | `sweagent/run/run_replay.py` |
-| Processor 错误 | 配置错误 | `sweagent/agent/history_processors.py` |
+| Trajectory 损坏 | JSON 解析失败 | `sweagent/run/run_replay.py:50` |
+| Processor 错误 | 配置错误 | `sweagent/agent/history_processors.py:390` |
 | 磁盘空间不足 | 无法保存 trajectory | `sweagent/agent/agents.py:save_trajectory` |
 
-### 7.2 错误恢复策略
-
-| 错误类型 | 处理策略 | 代码位置 |
-|---------|---------|---------|
-| ContextWindowExceededError | attempt_autosubmit | `sweagent/agent/agents.py:forward_with_handling` |
-| Trajectory 解析失败 | 跳过或报错 | `sweagent/run/run_replay.py` |
-| Processor 未生效 | 验证配置 type 字段 | `sweagent/agent/history_processors.py:390` |
-
-### 7.3 资源限制
+### 7.2 超时/资源限制
 
 ```python
 # 上下文长度控制
@@ -580,6 +733,14 @@ class LastNObservations:
 # 100 步任务约 100KB-1MB
 ```
 
+### 7.3 错误恢复策略
+
+| 错误类型 | 处理策略 | 代码位置 |
+|---------|---------|---------|
+| ContextWindowExceededError | attempt_autosubmit | `sweagent/agent/agents.py:forward_with_handling` |
+| Trajectory 解析失败 | 跳过或报错 | `sweagent/run/run_replay.py:50` |
+| Processor 未生效 | 验证配置 type 字段 | `sweagent/agent/history_processors.py:390` |
+
 ---
 
 ## 8. 关键代码索引
@@ -587,26 +748,26 @@ class LastNObservations:
 | 功能 | 文件 | 行号 | 说明 |
 |-----|------|------|------|
 | History 定义 | `sweagent/types.py` | 44 | HistoryItem |
-| Trajectory 定义 | `SWE-agent/sweagent/types.py` | - | TrajectoryStep |
-| History Processors | `SWE-agent/sweagent/agent/history_processors.py` | - | 处理器链 |
-| LastNObservations | `SWE-agent/sweagent/agent/history_processors.py` | 85 | 上下文压缩 |
-| CacheControl | `SWE-agent/sweagent/agent/history_processors.py` | 261 | 缓存控制 |
-| messages property | `SWE-agent/sweagent/agent/agents.py` | 540 | 获取处理后 history |
-| 添加 History | `SWE-agent/sweagent/agent/agents.py` | 556 | add_step_to_history() |
-| 添加 Trajectory | `SWE-agent/sweagent/agent/agents.py` | 714 | add_step_to_trajectory() |
-| 持久化 | `SWE-agent/sweagent/agent/agents.py` | - | save_trajectory() |
-| Replay | `SWE-agent/sweagent/run/run_replay.py` | - | RunReplay |
-| Trajectory 转 Demo | `SWE-agent/sweagent/run/run_traj_to_demo.py` | - | convert_trajectory_to_demo() |
+| Trajectory 定义 | `sweagent/types.py` | 78 | TrajectoryStep |
+| History Processors | `sweagent/agent/history_processors.py` | 1 | 处理器链 |
+| LastNObservations | `sweagent/agent/history_processors.py` | 86 | 上下文压缩 |
+| CacheControl | `sweagent/agent/history_processors.py` | 261 | 缓存控制 |
+| messages property | `sweagent/agent/agents.py` | 540 | 获取处理后 history |
+| 添加 History | `sweagent/agent/agents.py` | 556 | add_step_to_history() |
+| 添加 Trajectory | `sweagent/agent/agents.py` | 714 | add_step_to_trajectory() |
+| 持久化 | `sweagent/agent/agents.py` | 720 | save_trajectory() |
+| Replay | `sweagent/run/run_replay.py` | 1 | RunReplay |
+| Trajectory 转 Demo | `sweagent/run/run_traj_to_demo.py` | 1 | convert_trajectory_to_demo() |
 
 ---
 
 ## 9. 延伸阅读
 
-- 前置知识：`docs/swe-agent/01-swe-agent-overview.md`、`docs/swe-agent/02-swe-agent-session-management.md`
+- 前置知识：`docs/swe-agent/01-swe-agent-overview.md`、`docs/swe-agent/02-swe-agent-cli-entry.md`
 - 相关机制：`docs/swe-agent/04-swe-agent-agent-loop.md`
 - 深度分析：`docs/swe-agent/questions/swe-agent-history-compression.md`
 
 ---
 
-*✅ Verified: 基于 SWE-agent/sweagent/agent/agents.py、SWE-agent/sweagent/agent/history_processors.py 等源码分析*
-*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-02-25*
+*✅ Verified: 基于 sweagent/agent/agents.py、sweagent/agent/history_processors.py 等源码分析*
+*基于版本：SWE-agent (baseline 2026-02-08) | 最后更新：2026-03-03*

@@ -1,10 +1,31 @@
 # Kimi CLI 工具调用错误处理机制
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-35 分钟 |
+> | 前置文档 | `04-kimi-cli-agent-loop.md`、`q08-kimi-cli-checkpoint-mechanism.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Kimi CLI 采用 **四层 ToolError 继承体系** 与 **Checkpoint + D-Mail 时间旅行** 机制，通过 `ToolReturnValue` 统一封装成功与失败结果，实现了工具调用错误的优雅降级与状态回滚。
 
 Kimi CLI 的核心取舍：**统一返回值封装 + 显式状态回滚**（对比 Codex 的异常抛出、Gemini CLI 的 Promise 链、OpenCode 的重试包装器、SWE-agent 的 forward_with_handling 拦截器）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 错误表示 | 统一返回值封装 (`ToolReturnValue`) | `kosong/tooling/__init__.py:112` |
+| 错误分类 | 四层继承体系 (`ToolNotFound/Parse/Validate/Runtime`) | `kosong/tooling/error.py:4` |
+| 状态恢复 | Checkpoint + D-Mail 回滚 | `kimisoul.py:531` |
+| 用户审批 | 内嵌在工具调用中 | `kimi-cli/src/kimi_cli/soul/approval.py:34` |
+| 重试策略 | tenacity 指数退避 | `kimisoul.py:388` |
 
 ---
 
@@ -599,6 +620,8 @@ class ToolError(ToolReturnValue):
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```python
 # kimi-cli/src/kimi_cli/soul/toolset.py:97-124
 class KimiToolset:
@@ -635,8 +658,7 @@ class KimiToolset:
             current_tool_call.reset(token)
 ```
 
-**代码要点**：
-
+**设计意图**：
 1. **ContextVar 管理当前工具调用**：通过 `current_tool_call` 让工具内部能获取调用上下文，支持审批等功能
 2. **分层错误处理**：路由错误、解析错误、运行时错误分别在不同层级处理
 3. **异步任务封装**：工具调用包装为 `asyncio.Task`，支持并发执行和结果收集
@@ -732,6 +754,8 @@ gitGraph
 | **超时处理** | 配置化 | 内置 | 内置 | resetTimeoutOnProgress | 内置 |
 | **重试机制** | tenacity | 内置 | 内置 | 包装器 | 手动 |
 | **LLM 自纠正** | 直接注入错误 | 异常捕获后提示 | 错误回调 | 重试提示 | 拦截后提示 |
+| **架构复杂度** | 中等 | 高 | 中等 | 低 | 中等 |
+| **适用语言** | Python | Rust | TypeScript | TypeScript | Python |
 
 **选择建议**：
 
@@ -823,4 +847,4 @@ result = await client.call_tool(
 
 *✅ Verified: 基于 kimi-cli/packages/kosong/src/kosong/tooling/__init__.py:112、kimi-cli/packages/kosong/src/kosong/tooling/error.py:4、kimi-cli/src/kimi_cli/soul/toolset.py:97、kimi-cli/src/kimi_cli/soul/kimisoul.py:531 等源码分析*
 
-*基于版本：kimi-cli (baseline 2026-02-08) | 最后更新：2026-02-25*
+*基于版本：kimi-cli (baseline 2026-02-08) | 最后更新：2026-03-03*

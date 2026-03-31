@@ -1,10 +1,30 @@
 # Code Agent 全局认知
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置知识 | LLM 基础、函数调用（Function Calling）机制 |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：**Code Agent = LLM + 工具调用循环 + 本地环境**，它不是"更聪明的代码补全"，而是一个能自主规划、执行、观察、修正的工程执行器。
 
 核心取舍：**统一的多轮循环架构**（对比单次调用 LLM），通过 **LLM 推理与工具执行的解耦** 实现从"思考"到"行动"的跨越。
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 核心机制 | Agent Loop 驱动多轮 LLM 调用与工具执行 | `kimi-cli/packages/kosong/src/kosong/__main__.py:47` |
+| 状态管理 | 上下文管理器维护历史消息与 Token 控制 | `gemini-cli/packages/core/src/core/client.ts:789` |
+| 错误处理 | 显式 step 上限 + Token compaction 防止资源耗尽 | `gemini-cli/packages/core/src/core/client.ts:68` |
+| 安全模型 | 沙箱/确认机制隔离本地环境操作 | `codex/codex-rs/core/src/agent/control.rs:55` |
 
 ---
 
@@ -55,15 +75,15 @@
 │ │ - 协调循环直到任务完成                                    │ │
 │ │ - 解析 LLM 输出，分发工具调用                             │ │
 │ └───────────────────────┬─────────────────────────────────┘ │
-│                         │
-│         ┌───────────────┼───────────────┐
-│         ▼               ▼               ▼
-│ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-│ │ LLM 推理引擎  │ │ 工具系统      │ │ 上下文管理    │
-│ │ - 下一步决策  │ │ - 文件读写    │ │ - 历史消息    │
-│ │ - 工具选择   │ │ - Shell 执行  │ │ - Token 控制  │
-│ └──────────────┘ └──────────────┘ └──────────────┘
-│                         │
+│                         │                                   │
+│         ┌───────────────┼───────────────┐                   │
+│         ▼               ▼               ▼                   │
+│ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐         │
+│ │ LLM 推理引擎  │ │ 工具系统      │ │ 上下文管理    │         │
+│ │ - 下一步决策  │ │ - 文件读写    │ │ - 历史消息    │         │
+│ │ - 工具选择   │ │ - Shell 执行  │ │ - Token 控制  │         │
+│ └──────────────┘ └──────────────┘ └──────────────┘         │
+│                         │                                   │
 └─────────────────────────┼───────────────────────────────────┘
                           │ 读写文件、执行命令
                           ▼
@@ -77,10 +97,10 @@
 
 | 组件 | 职责 | 类比 | 代码位置（示例） |
 |-----|------|------|-----------------|
-| `Agent Loop` | 协调循环，直到任务完成 | 操作系统调度器 | `kimi-cli/packages/kosong/src/kosong/__main__.py:47` |
+| `Agent Loop` | 协调循环，直到任务完成 | 操作系统调度器 | `kimi-cli/packages/kosong/src/kosong/__main__.py:47` ✅ |
 | `LLM` | 推理：下一步该做什么 | 大脑 | 各项目 LLM 客户端模块 |
-| `Tool System` | 执行具体操作（读写文件、运行命令） | 手和工具 | `SWE-agent/sweagent/tools/tools.py` |
-| `Context Manager` | 管理历史消息，不超出 token 限制 | 短期记忆 | `gemini-cli/packages/core/src/core/client.ts:789` |
+| `Tool System` | 执行具体操作（读写文件、运行命令） | 手和工具 | `SWE-agent/sweagent/tools/tools.py` ✅ |
+| `Context Manager` | 管理历史消息，不超出 token 限制 | 短期记忆 | `gemini-cli/packages/core/src/core/client.ts:789` ✅ |
 | `Local Environment` | 实际的文件系统、Shell、网络 | 操作台 | 系统级调用 |
 
 ### 2.3 核心组件交互关系
@@ -190,6 +210,14 @@ stateDiagram-v2
 └─────────────────────────────────────────────────────────────┘
 ```
 
+#### 关键接口
+
+| 接口 | 输入 | 输出 | 说明 | 代码位置 |
+|-----|------|------|------|---------|
+| `run()` | 用户输入 + 配置 | 执行结果 | 主循环入口 | `kimi-cli/packages/kosong/src/kosong/__main__.py:47` ✅ |
+| `step()` | 当前上下文 | LLM 响应 + 工具调用 | 单步执行 | `kimi-cli/packages/kosong/src/kosong/__init__.py` ⚠️ |
+| `execute()` | 工具名称 + 参数 | 执行结果 | 工具执行核心 | `SWE-agent/sweagent/tools/tools.py` ✅ |
+
 ---
 
 ### 3.2 工具系统内部结构
@@ -202,9 +230,9 @@ stateDiagram-v2
 
 | 接口 | 输入 | 输出 | 说明 | 代码位置（示例） |
 |-----|------|------|------|-----------------|
-| `execute()` | 工具名称 + 参数 | 执行结果 | 核心执行方法 | `SWE-agent/sweagent/tools/tools.py` |
-| `validate()` | 工具调用请求 | 验证结果 | 参数校验 | 各项目工具定义模块 |
-| `list_available()` | - | 工具列表 | 获取可用工具 | `codex/codex-rs/core/src/tools/` |
+| `execute()` | 工具名称 + 参数 | 执行结果 | 核心执行方法 | `SWE-agent/sweagent/tools/tools.py` ✅ |
+| `validate()` | 工具调用请求 | 验证结果 | 参数校验 | 各项目工具定义模块 ⚠️ |
+| `list_available()` | - | 工具列表 | 获取可用工具 | `codex/codex-rs/core/src/tools/` ⚠️ |
 
 ---
 
@@ -284,6 +312,65 @@ sequenceDiagram
 
 ---
 
+### 3.4 关键数据路径
+
+#### 主路径（正常流程）
+
+```mermaid
+flowchart LR
+    subgraph Input["输入阶段"]
+        I1[用户输入] --> I2[意图解析]
+        I2 --> I3[任务对象]
+    end
+
+    subgraph Process["处理阶段"]
+        P1[构建 Prompt] --> P2[LLM 推理]
+        P2 --> P3{是否有工具调用?}
+        P3 -->|是| P4[工具执行]
+        P3 -->|否| P5[任务完成]
+        P4 --> P6[结果处理]
+        P6 --> P1
+    end
+
+    subgraph Output["输出阶段"]
+        O1[结果生成] --> O2[格式化输出]
+        O2 --> O3[上下文保存]
+    end
+
+    I3 --> P1
+    P5 --> O1
+
+    style Process fill:#e1f5e1,stroke:#333
+```
+
+#### 异常路径（错误恢复）
+
+```mermaid
+flowchart TD
+    E[发生错误] --> E1{错误类型}
+    E1 -->|可恢复| R1[重试机制]
+    E1 -->|不可恢复| R2[降级处理]
+    E1 -->|严重错误| R3[终止并告警]
+
+    R1 --> R1A[指数退避重试]
+    R1A -->|成功| R1B[继续主路径]
+    R1A -->|失败| R2
+
+    R2 --> R2A[返回错误信息给 LLM]
+    R3 --> R3A[记录错误日志]
+    R3A --> R3B[通知监控]
+
+    R1B --> End[结束]
+    R2A --> End
+    R3B --> End
+
+    style R1 fill:#90EE90
+    style R2 fill:#FFD700
+    style R3 fill:#FF6B6B
+```
+
+---
+
 ## 4. 端到端数据流转
 
 ### 4.1 正常流程（详细版）
@@ -351,7 +438,7 @@ flowchart LR
     I3 --> P1
     P5 --> O1
 
-    style Process fill:#e1f5e1,stroke:#333
+    style Process fill:#f9f,stroke:#333
 ```
 
 ### 4.3 异常/边界流程
@@ -439,14 +526,65 @@ class AgentLoop:
 | `llm` | `LLMClient` | LLM 调用封装，处理 API 细节 |
 | `max_steps` | `int` | 防止无限循环的安全限制 |
 
-### 5.2 主链路代码示例
+### 5.2 主链路代码
 
 以下展示各项目 Agent Loop 的核心实现：
 
 **Kimi CLI（Python + asyncio）**：
 
 ```python
-# kimi-cli/packages/kosong/src/kosong/__main__.py:47
+# kimi-cli/packages/kosong/src/kosong/__main__.py:47-86
+async def agent_loop(chat_provider: ChatProvider, toolset: Toolset):
+    """核心 Agent 循环：驱动多轮 LLM 调用直到任务完成"""
+    system_prompt = "You are a helpful assistant."
+    history: list[Message] = []
+
+    while True:
+        user_input = input("You: ").strip()
+        if not user_input:
+            continue
+        if user_input.lower() in {"exit", "quit"}:
+            break
+
+        history.append(Message(role="user", content=user_input))
+
+        # 内层循环：处理单轮对话中的多步工具调用
+        while True:
+            result = await kosong.step(
+                chat_provider=chat_provider,
+                system_prompt=system_prompt,
+                toolset=toolset,
+                history=history,
+            )
+
+            tool_results = await result.tool_results()
+            assistant_message = result.message
+            tool_messages = [tool_result_to_message(tr) for tr in tool_results]
+
+            # 更新上下文历史
+            history.append(assistant_message)
+            history.extend(tool_messages)
+
+            # 输出结果
+            if s := assistant_message.extract_text():
+                print("Assistant:\n", textwrap.indent(s, "  "))
+
+            # 无工具调用时结束本轮
+            if not result.tool_calls:
+                break
+```
+
+**设计意图**：
+
+1. **双层循环设计**：外层处理用户输入，内层处理单轮对话中的多步工具调用
+2. **显式状态管理**：通过 `history` 列表维护对话状态，支持多轮推理
+3. **工具结果注入**：工具执行结果格式化后重新注入上下文，供 LLM 下一轮使用
+
+<details>
+<summary>📋 查看完整实现（含输出格式化）</summary>
+
+```python
+# kimi-cli/packages/kosong/src/kosong/__main__.py:47-95
 async def agent_loop(chat_provider: ChatProvider, toolset: Toolset):
     system_prompt = "You are a helpful assistant."
     history: list[Message] = []
@@ -486,10 +624,12 @@ async def agent_loop(chat_provider: ChatProvider, toolset: Toolset):
                 break
 ```
 
+</details>
+
 **SWE-agent（Python + Docker）**：
 
 ```python
-# SWE-agent/sweagent/agent/agents.py:1265
+# SWE-agent/sweagent/agent/agents.py:1265-1318
 class DefaultAgent(AbstractAgent):
     def run(
         self,
@@ -497,31 +637,32 @@ class DefaultAgent(AbstractAgent):
         problem_statement: ProblemStatement | ProblemStatementConfig,
         output_dir: Path = Path("."),
     ) -> AgentRunResult:
-        """Run the agent on a problem instance. This method contains the
-        main loop that repeatedly calls `self._step` until the problem is solved.
+        """Run the agent on a problem instance.
+
+        主循环反复调用 self._step 直到问题解决或达到终止条件。
         """
         self.setup(env=env, problem_statement=problem_statement, output_dir=output_dir)
 
-        # Run action/observation loop
+        # 启动 action/observation 循环
         self._chook.on_run_start()
         step_output = StepOutput()
         while not step_output.done:
             step_output = self.step()
-            self.save_trajectory()
+            self.save_trajectory()  # 保存执行轨迹用于分析
         self._chook.on_run_done(trajectory=self.trajectory, info=self.info)
 
         self.logger.info("Trajectory saved to %s", self.traj_path)
 
-        # Here we want to return the "global" information
+        # 返回全局信息供评估使用
         data = self.get_trajectory_data()
         return AgentRunResult(info=data["info"], trajectory=data["trajectory"])
 ```
 
-**代码要点**：
+**设计意图**：
 
-1. **统一循环模式**：所有项目都遵循"调用 LLM → 检查工具调用 → 执行工具 → 循环"的模式
-2. **显式 step 计数**：防止无限循环，可配置上限
-3. **上下文追加**：每轮结果写入历史，支持多轮推理
+1. **轨迹保存**：每步执行后保存 trajectory，支持学术研究中的可复现性要求
+2. **钩子机制**：通过 `_chook` 钩子支持扩展，便于集成评估框架
+3. **显式终止条件**：`step_output.done` 控制循环终止，避免无限执行
 
 ### 5.3 关键调用链
 
@@ -565,7 +706,7 @@ Codex:
 
 | 维度 | SWE-agent | Codex | Gemini CLI | Kimi CLI | OpenCode |
 |-----|-----------|-------|------------|----------|----------|
-| **Loop 驱动** | 迭代循环 | Actor 消息 | 递归 continuation | while 迭代 | 状态机 |
+| **Loop 驱动** | while 迭代 | Actor 消息 | 递归 continuation | while 迭代 | 状态机 |
 | **安全模型** | Docker 隔离 | 原生沙箱 | 确认机制 | 确认机制 | 权限控制 |
 | **状态管理** | 内存 | 内存 + 持久化 | 内存 | Checkpoint 文件 | SQLite |
 | **工具定义** | YAML 配置 | Rust trait | TypeScript | Python 类 | Zod Schema |
@@ -624,11 +765,11 @@ gitGraph
 
 | 终止原因 | 触发条件 | 代码位置（示例） |
 |---------|---------|-----------------|
-| 任务完成 | LLM 返回无工具调用的响应 | `kimi-cli/packages/kosong/src/kosong/__main__.py:82` |
-| Step 超限 | 执行步数达到 `max_steps` | `gemini-cli/packages/core/src/core/client.ts:68` |
-| Token 超限 | 上下文超过模型限制 | `gemini-cli/packages/core/src/core/client.ts:789` |
-| 用户中断 | Ctrl+C 或取消请求 | `codex/codex-rs/core/src/agent/control.rs:55` |
-| 严重错误 | 工具执行不可恢复错误 | `opencode/packages/opencode/src/session/prompt.ts:294` |
+| 任务完成 | LLM 返回无工具调用的响应 | `kimi-cli/packages/kosong/src/kosong/__main__.py:85` ✅ |
+| Step 超限 | 执行步数达到 `max_steps` | `gemini-cli/packages/core/src/core/client.ts:68` ⚠️ |
+| Token 超限 | 上下文超过模型限制 | `gemini-cli/packages/core/src/core/client.ts:789` ✅ |
+| 用户中断 | Ctrl+C 或取消请求 | `codex/codex-rs/core/src/agent/control.rs:55` ✅ |
+| 严重错误 | 工具执行不可恢复错误 | `opencode/packages/opencode/src/session/prompt.ts:294` ✅ |
 
 ### 7.2 超时/资源限制
 
@@ -647,11 +788,11 @@ AGENT_CONFIG = {
 
 | 错误类型 | 处理策略 | 代码位置（示例） |
 |---------|---------|-----------------|
-| LLM 调用超时 | 指数退避重试，最多 3 次 | 各项目 LLM 客户端模块 |
-| 工具执行失败 | 返回错误信息给 LLM，让其决定 | `SWE-agent/sweagent/tools/tools.py` |
-| Token 超限 | 触发 Compaction，摘要历史 | `gemini-cli/packages/core/src/core/client.ts` |
-| 参数校验失败 | 返回错误给 LLM，要求修正 | `codex/codex-rs/core/src/tools/` |
-| 沙箱违规 | 立即终止，记录审计日志 | `codex/codex-rs/core/src/agent/` |
+| LLM 调用超时 | 指数退避重试，最多 3 次 | 各项目 LLM 客户端模块 ⚠️ |
+| 工具执行失败 | 返回错误信息给 LLM，让其决定 | `SWE-agent/sweagent/tools/tools.py` ✅ |
+| Token 超限 | 触发 Compaction，摘要历史 | `gemini-cli/packages/core/src/core/client.ts` ✅ |
+| 参数校验失败 | 返回错误给 LLM，要求修正 | `codex/codex-rs/core/src/tools/` ⚠️ |
+| 沙箱违规 | 立即终止，记录审计日志 | `codex/codex-rs/core/src/agent/` ⚠️ |
 
 ---
 
@@ -729,7 +870,8 @@ AGENT_CONFIG = {
 
 ---
 
-*基于版本：2026-02-08 代码快照 | 最后更新：2026-02-25*
+*基于版本：2026-02-08 代码快照 | 最后更新：2026-03-03*
 
 *✅ Verified: 基于各项目源码分析*
 *⚠️ Inferred: 基于代码结构的合理推断*
+*❓ Pending: 待进一步验证的假设*

@@ -1,10 +1,31 @@
 # OpenCode 上下文压缩机制
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-30 分钟 |
+> | 前置文档 | `docs/opencode/04-opencode-agent-loop.md`、`docs/opencode/07-opencode-memory-context.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Context Compaction 是 OpenCode 解决长对话上下文超限问题的双重机制，通过专用 Agent 生成结构化摘要（Compaction）+ Part 级别裁剪（Prune）实现上下文空间回收。
 
 OpenCode 的核心取舍：**专用 Compaction Agent + Part 级 Prune 双重机制**（对比 Kimi CLI 的 Checkpoint 回滚、Codex 的 LLM 摘要 + 截断）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 溢出检测 | Token 阈值检测，保留 20K 缓冲区 | `opencode/packages/opencode/src/session/compaction.ts:32` |
+| Compaction | 专用 Agent 生成结构化摘要 | `opencode/packages/opencode/src/session/compaction.ts:101` |
+| Prune 裁剪 | Part 级别清理，保护最近 40K | `opencode/packages/opencode/src/session/compaction.ts:58` |
+| 保护策略 | 最近 2 turns + Skill 工具不受裁剪 | `opencode/packages/opencode/src/session/compaction.ts:70-77` |
+| 插件扩展 | `experimental.session.compacting` 钩子 | `opencode/packages/opencode/src/session/compaction.ts:138` |
 
 ---
 
@@ -728,20 +749,26 @@ gitGraph
     branch "Gemini CLI"
     checkout "Gemini CLI"
     commit id: "两阶段验证"
+    checkout main
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "无自动压缩"
 ```
 
-| 项目 | 核心差异 | 适用场景 |
-|-----|---------|---------|
-| OpenCode | Compaction + Prune 双重机制，专用 Agent，Part 级裁剪 | 频繁使用 Skill 的长任务，需要结构化摘要 |
-| Kimi CLI | Checkpoint 回滚机制，支持对话回退 | 需要状态回滚的交互式场景 |
-| Codex | LLM 摘要 + Message 级截断 | 简单对话，追求实现简洁 |
-| Gemini CLI | 两阶段验证 + 分层内存 | 复杂多轮对话，需要严格验证 |
+| 项目 | 核心机制 | 压缩粒度 | 保护策略 | 适用场景 |
+|-----|---------|---------|---------|---------|
+| **OpenCode** | Compaction + Prune 双重机制 | Part 级别（工具输出） | 最近 2 turns + 40K tokens + Skill 工具 | 频繁使用 Skill 的长任务，需要结构化摘要 |
+| **Kimi CLI** | Checkpoint 回滚机制 | Session 级别 | 完整状态快照 | 需要状态回滚的交互式场景 |
+| **Codex** | LLM 摘要 + 截断 | Message 级别 | 无特殊保护 | 简单对话，追求实现简洁 |
+| **Gemini CLI** | 两阶段验证 + 分层内存 | Message 级别 | 最近用户消息 + 系统消息 | 复杂多轮对话，需要严格验证 |
+| **SWE-agent** | 无自动压缩 | - | - | 短任务，依赖用户手动管理 |
 
 **关键差异分析**：
 
 1. **vs Kimi CLI**：Kimi 通过 Checkpoint 支持状态回滚，OpenCode 通过 Compaction 生成摘要，两者解决不同问题（回滚 vs 压缩）
 2. **vs Codex**：Codex 使用 LLM 生成自由文本摘要后截断，OpenCode 使用结构化模板，更便于下游处理
 3. **vs Gemini CLI**：Gemini 采用两阶段验证确保摘要质量，OpenCode 依赖专用 Agent 和结构化 Prompt
+4. **vs SWE-agent**：SWE-agent 无自动压缩机制，依赖用户手动管理上下文，适合短任务场景
 
 ---
 

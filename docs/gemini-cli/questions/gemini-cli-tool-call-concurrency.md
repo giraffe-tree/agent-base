@@ -1,10 +1,30 @@
 # Gemini CLI Tool Call 并发机制
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | `docs/gemini-cli/04-gemini-cli-agent-loop.md`、`docs/gemini-cli/05-gemini-cli-tools-system.md` |
+> | 文档结构 | 结论先行 → 架构位置 → 核心组件 → 数据流转 → 关键代码 → 设计对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
-**Gemini CLI 采用"单 active call + 队列串行执行"的调度策略**，而非多工具并行执行。
+**一句话定义**：Gemini CLI 采用"单 active call + 队列串行执行"的调度策略，通过 Scheduler 状态机管理工具调用生命周期，确保同一时间只有一个工具在执行。
 
 Gemini CLI 的核心取舍：**串行执行 + 状态机管理**（对比 Kimi CLI 的并发派发、顺序收集策略）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 执行模式 | 单 active call 串行执行 | `packages/core/src/scheduler/scheduler.ts:388` |
+| 状态管理 | 7 状态显式状态机（Validating/Scheduled/Executing 等） | `packages/core/src/scheduler/types.ts:25` |
+| 队列策略 | 双层队列缓冲（requestQueue + state.queue） | `packages/core/src/scheduler/scheduler.ts:169` |
+| 并发控制 | `isActive` 标志位检查 | `packages/core/src/scheduler/scheduler.ts:439` |
 
 ---
 
@@ -173,50 +193,118 @@ stateDiagram-v2
 └─────────────────────────────────────────────────────────────┘
 ```
 
-#### 关键算法逻辑
+#### 关键接口
 
-```text
-┌─────────────────────────────────────────────────────────┐
-│  schedule(requests)                                     │
-│  ├── 检查 isProcessing || state.isActive               │
-│  │   └── 是: _enqueueRequest() 入 requestQueue         │
-│  │   └── 否: 立即 _startBatch()                        │
-│  │                                                      │
-│  └── _startBatch()                                      │
-│      ├── 转换 requests -> ToolCall[]                   │
-│      ├── state.enqueue(newCalls)                       │
-│      └── _processQueue(signal)                         │
-│                                                         │
-└─────────────────────────┬───────────────────────────────┘
-                          ▼
-┌─────────────────────────────────────────────────────────┐
-│  _processQueue() 循环                                   │
-│  ├── while (queueLength > 0 || isActive)               │
-│  │   └── _processNextItem(signal)                      │
-│  │                                                      │
-│  └── _processNextItem()                                 │
-│      ├── 检查 signal.aborted / isCancelling            │
-│      ├── 若 !isActive: dequeue 下一个 call             │
-│      ├── 批量处理 Validating calls (Promise.all)       │
-│      ├── 执行 Scheduled calls (若 allReady)            │
-│      └── finalize terminal calls                       │
-│                                                         │
-└─────────────────────────┬───────────────────────────────┘
-                          ▼
-┌─────────────────────────────────────────────────────────┐
-│  当前 call 结束后                                       │
-│  ├── finalize terminal calls                           │
-│  ├── checkAndNotifyCompletion()                        │
-│  └── 继续 _processQueue() 循环                         │
-└─────────────────────────────────────────────────────────┘
+| 接口 | 输入 | 输出 | 说明 | 代码位置 |
+|-----|------|------|------|---------|
+| `schedule()` | `ToolCallRequestInfo[]` | `CompletedToolCall[]` | 工具调度入口 | `packages/core/src/scheduler/scheduler.ts:169` |
+| `_processQueue()` | `AbortSignal` | `void` | 核心调度循环 | `packages/core/src/scheduler/scheduler.ts:373` |
+| `_processNextItem()` | `AbortSignal` | `boolean` | 单步执行 | `packages/core/src/scheduler/scheduler.ts:384` |
+
+---
+
+### 3.2 组件间协作时序
+
+展示多个组件如何协作完成一个复杂操作。
+
+```mermaid
+sequenceDiagram
+    participant U as Agent Loop
+    participant A as Scheduler
+    participant B as Policy/Approval
+    participant C as Tool Executor
+    participant S as State Manager
+
+    U->>A: schedule([call1, call2])
+    activate A
+
+    A->>A: 前置检查
+    Note right of A: 检查 isProcessing / isActive
+
+    A->>A: _startBatch()
+    activate A
+
+    A->>S: state.enqueue([call1, call2])
+    A->>A: _processQueue()
+    A->>A: _processNextItem()
+    A->>B: 检查审批策略
+    B-->>A: 返回审批结果
+    A->>C: 执行工具调用
+    activate C
+
+    C->>C: 实际工具执行
+    C-->>A: 返回执行结果
+    deactivate C
+
+    A->>S: finalize 状态更新
+    A->>A: 继续处理队列
+    deactivate A
+
+    A->>A: 结果组装
+    A-->>U: 返回 CompletedToolCall[]
+    deactivate A
 ```
 
-**算法要点**：
+**协作要点**：
 
-1. **串行执行保证**：通过 `isActive` 检查确保同一时间只有一个活跃调用
-2. **队列缓冲**：双层队列（requestQueue + state.queue）解耦请求与执行
-3. **状态驱动**：每个工具调用经历完整状态机流转，便于追踪和恢复
-4. **只读工具优化**：连续的只读工具可以批量处理
+1. **Agent Loop 与 Scheduler**：Agent Loop 批量提交请求，Scheduler 内部串行化处理
+2. **Scheduler 与 Policy**：每个工具调用前检查审批策略，决定是否需用户确认
+3. **Tool Executor 与 State Manager**：执行完成后立即更新状态，确保状态一致性
+
+---
+
+### 3.3 关键数据路径
+
+#### 主路径（正常流程）
+
+```mermaid
+flowchart LR
+    subgraph Input["输入阶段"]
+        I1[ToolCallRequestInfo] --> I2[验证转换]
+        I2 --> I3[ToolCall 对象]
+    end
+
+    subgraph Process["调度阶段"]
+        P1[入队 state.queue] --> P2[_processQueue 循环]
+        P2 --> P3[_processNextItem 单步]
+    end
+
+    subgraph Output["输出阶段"]
+        O1[执行工具] --> O2[状态流转]
+        O2 --> O3[CompletedToolCall]
+    end
+
+    I3 --> P1
+    P3 --> O1
+
+    style Process fill:#e1f5e1,stroke:#333
+```
+
+#### 异常路径（错误恢复）
+
+```mermaid
+flowchart TD
+    E[发生错误] --> E1{错误类型}
+    E1 -->|验证失败| R1[Validating -> Error]
+    E1 -->|执行失败| R2[Executing -> Error]
+    E1 -->|用户取消| R3[Executing -> Cancelled]
+    E1 -->|审批拒绝| R4[AwaitingApproval -> Cancelled]
+
+    R1 --> R1A[finalize 错误状态]
+    R2 --> R2A[finalize 错误状态]
+    R3 --> R3A[finalize 取消状态]
+    R4 --> R4A[跳过执行]
+
+    R1A --> End[继续处理队列]
+    R2A --> End
+    R3A --> End
+    R4A --> End
+
+    style R1 fill:#FFD700
+    style R2 fill:#FFD700
+    style R3 fill:#FF6B6B
+    style R4 fill:#FF6B6B
+```
 
 ---
 
@@ -267,65 +355,76 @@ sequenceDiagram
 
 | 阶段 | 输入 | 处理 | 输出 | 代码位置 |
 |-----|------|------|------|---------|
-| 接收 | `ToolCallRequestInfo[]` | 验证并转换为 `ToolCall` | 内部状态对象 | `scheduler.ts:169-186` |
-| 调度 | `ToolCall[]` | 入队并启动处理循环 | 排程状态 | `scheduler.ts:265-309` |
-| 执行 | `ToolCall` | 状态流转 + 实际执行 | `CompletedToolCall` | `scheduler.ts:384-492` |
-| 输出 | 执行结果 | 格式化 + 返回 | `CompletedToolCall[]` | `scheduler.ts:946-1024` |
+| 接收 | `ToolCallRequestInfo[]` | 验证并转换为 `ToolCall` | 内部状态对象 | `packages/core/src/scheduler/scheduler.ts:169-186` |
+| 调度 | `ToolCall[]` | 入队并启动处理循环 | 排程状态 | `packages/core/src/scheduler/scheduler.ts:265-309` |
+| 执行 | `ToolCall` | 状态流转 + 实际执行 | `CompletedToolCall` | `packages/core/src/scheduler/scheduler.ts:384-492` |
+| 输出 | 执行结果 | 格式化 + 返回 | `CompletedToolCall[]` | `packages/core/src/scheduler/scheduler.ts:946-1024` |
 
 ### 4.2 数据流向图
 
-```text
-┌─────────────────────────────────────────────────────────────┐
-│  输入阶段                                                    │
-│  ToolCallRequestInfo                                        │
-│  ├── callId: 唯一标识                                       │
-│  ├── name: 工具名称                                         │
-│  ├── args: 工具参数                                         │
-│  ├── prompt_id: 关联的 prompt                               │
-│  └── checkpoint?: 可选 checkpoint 引用                      │
-└──────────────────────────┬──────────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  处理阶段                                                    │
-│  ToolCall (内部状态包装)                                     │
-│  ├── 原始请求数据                                           │
-│  ├── status: CoreToolCallStatus                             │
-│  ├── active: 是否为当前执行                                 │
-│  └── 结果占位符                                             │
-└──────────────────────────┬──────────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  输出阶段                                                    │
-│  CompletedToolCall                                          │
-│  ├── SuccessfulToolCall: 成功结果                           │
-│  ├── ErroredToolCall: 错误信息                              │
-│  └── CancelledToolCall: 取消原因                            │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph Input["输入阶段"]
+        I1[ToolCallRequestInfo]
+        I1a[callId] --> I1
+        I1b[name/args] --> I1
+        I1c[prompt_id] --> I1
+    end
+
+    subgraph Process["处理阶段"]
+        P1[ToolCall 包装] --> P2[状态机流转]
+        P2 --> P3[串行执行]
+    end
+
+    subgraph Output["输出阶段"]
+        O1[CompletedToolCall]
+        O1a[SuccessfulToolCall] --> O1
+        O1b[ErroredToolCall] --> O1
+        O1c[CancelledToolCall] --> O1
+    end
+
+    I1 --> P1
+    P3 --> O1
+
+    style Process fill:#f9f,stroke:#333
 ```
 
 ### 4.3 异常/边界流程
 
-```text
-┌─────────────────────────────────────────────────────────┐
-│  边界情况处理                                             │
-│                                                         │
-│  1. 当前有活跃调用时收到新请求                           │
-│     └── 新请求入 requestQueue，等待当前完成后再处理     │
-│                                                         │
-│  2. 工具执行失败                                        │
-│     └── Executing -> Error                              │
-│     └── finalize 并继续处理队列中下一个                 │
-│                                                         │
-│  3. 用户取消                                            │
-│     └── Executing -> Cancelled                          │
-│     └── 终止当前执行（如可能）                          │
-│     └── finalize 并回调取消状态                         │
-│                                                         │
-│  4. 审批拒绝                                            │
-│     └── AwaitingApproval -> Cancelled                   │
-│     └── 跳过执行直接回调                                │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    A[schedule 接收请求] --> B{isProcessing?}
+    B -->|是| C[入 requestQueue]
+    B -->|否| D[_startBatch]
+    C --> E[等待当前批次完成]
+    E --> D
+
+    D --> F[_processQueue 循环]
+    F --> G{signal.aborted?}
+    G -->|是| H[取消所有队列]
+    G -->|否| I[_processNextItem]
+
+    I --> J{isActive?}
+    J -->|是| K[等待当前完成]
+    J -->|否| L[dequeue 下一个]
+
+    L --> M[状态流转]
+    M --> N[执行工具]
+    N --> O{执行结果}
+    O -->|成功| P[Success]
+    O -->|失败| Q[Error]
+    O -->|取消| R[Cancelled]
+
+    P --> S[finalize]
+    Q --> S
+    R --> S
+    S --> T{队列空?}
+    T -->|否| F
+    T -->|是| U[返回结果]
+
+    style H fill:#FF6B6B
+    style Q fill:#FFD700
+    style R fill:#FF6B6B
 ```
 
 ---
@@ -372,6 +471,8 @@ export enum CoreToolCallStatus {
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```typescript
 // packages/core/src/scheduler/scheduler.ts:169-186
 async schedule(
@@ -394,6 +495,40 @@ async schedule(
   );
 }
 
+// packages/core/src/scheduler/scheduler.ts:373-378
+private async _processQueue(signal: AbortSignal): Promise<void> {
+  while (this.state.queueLength > 0 || this.state.isActive) {
+    const shouldContinue = await this._processNextItem(signal);
+    if (!shouldContinue) break;
+  }
+}
+
+// packages/core/src/scheduler/scheduler.ts:384-400
+private async _processNextItem(signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted || this.isCancelling) {
+    this.state.cancelAllQueued('Operation cancelled');
+    return false;
+  }
+
+  // ✅ Verified: 检查 isActive 确保串行执行
+  if (!this.state.isActive) {
+    const next = this.state.dequeue();
+    if (!next) return false;
+    // ... 处理下一个调用
+  }
+  // ...
+}
+```
+
+**设计意图**：
+1. **串行执行保证**：`_processNextItem()` 中检查 `state.isActive`，确保同一时间只有一个活跃调用
+2. **队列驱动**：`_processQueue()` 循环处理直到队列为空，天然支持批量请求的串行化
+3. **状态分离**：`isProcessing`（调度器状态）与 `state.isActive`（工具状态）双层检查
+
+<details>
+<summary>查看完整实现</summary>
+
+```typescript
 // packages/core/src/scheduler/scheduler.ts:265-309
 private async _startBatch(
   requests: ToolCallRequestInfo[],
@@ -419,56 +554,23 @@ private async _startBatch(
     this._processNextInRequestQueue();
   }
 }
-
-// packages/core/src/scheduler/scheduler.ts:373-378
-private async _processQueue(signal: AbortSignal): Promise<void> {
-  while (this.state.queueLength > 0 || this.state.isActive) {
-    const shouldContinue = await this._processNextItem(signal);
-    if (!shouldContinue) break;
-  }
-}
-
-// packages/core/src/scheduler/scheduler.ts:384-492
-private async _processNextItem(signal: AbortSignal): Promise<boolean> {
-  if (signal.aborted || this.isCancelling) {
-    this.state.cancelAllQueued('Operation cancelled');
-    return false;
-  }
-
-  // ✅ Verified: 检查 isActive 确保串行执行
-  if (!this.state.isActive) {
-    const next = this.state.dequeue();
-    if (!next) return false;
-    // ... 处理下一个调用
-  }
-
-  // 1. Process all 'validating' calls (Policy & Confirmation)
-  // 2. Execute scheduled calls
-  // 3. Finalize terminal calls
-  // ...
-}
 ```
 
-**代码要点**：
-
-1. **串行执行保证**：`_processNextItem()` 中检查 `state.isActive`，确保单活跃调用
-2. **队列驱动**：`_processQueue()` 循环处理直到队列为空，天然支持批量请求的串行化
-3. **状态分离**：`isProcessing`（调度器状态）与 `state.isActive`（工具状态）双层检查
-4. **只读工具优化**：连续的只读工具可以批量 dequeue
+</details>
 
 ### 5.3 关键调用链
 
 ```text
-schedule(requests)              [scheduler.ts:169]
-  -> _enqueueRequest()          [scheduler.ts:180] (若忙)
-  -> _startBatch(requests)      [scheduler.ts:183] (若空闲)
-    -> state.enqueue(newCalls)  [scheduler.ts:301]
-    -> _processQueue(signal)    [scheduler.ts:302]
-      -> _processNextItem()     [scheduler.ts:375]
+schedule(requests)              [packages/core/src/scheduler/scheduler.ts:169]
+  -> _enqueueRequest()          [packages/core/src/scheduler/scheduler.ts:180] (若忙)
+  -> _startBatch(requests)      [packages/core/src/scheduler/scheduler.ts:183] (若空闲)
+    -> state.enqueue(newCalls)  [packages/core/src/scheduler/scheduler.ts:301]
+    -> _processQueue(signal)    [packages/core/src/scheduler/scheduler.ts:302]
+      -> _processNextItem()     [packages/core/src/scheduler/scheduler.ts:375]
         - 检查 state.isActive
         - dequeue 一个 call
-        - _processValidatingCall() [scheduler.ts:494]
-        - _execute(call)        [scheduler.ts:600]
+        - _processValidatingCall() [packages/core/src/scheduler/scheduler.ts:494]
+        - _execute(call)        [packages/core/src/scheduler/scheduler.ts:600]
           - 状态流转: Validating -> Scheduled -> Executing
           - 实际工具执行
           - 状态流转: -> Success/Error/Cancelled
@@ -506,11 +608,33 @@ schedule(requests)              [scheduler.ts:169]
 
 ### 6.3 与其他项目的对比
 
+```mermaid
+gitGraph
+    commit id: "传统串行"
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "单active call + 状态机"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "并发派发 + 顺序收集"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "Actor消息驱动"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "resetTimeoutOnProgress"
+```
+
 | 项目 | 并发策略 | 核心差异 | 适用场景 |
 |-----|---------|---------|---------|
-| **Gemini CLI** | 串行执行 | 单 active call + 状态机 | 需要严格顺序保证、资源安全 |
+| **Gemini CLI** | 串行执行 | 单 active call + 7 状态状态机 | 需要严格顺序保证、资源安全 |
 | **Kimi CLI** | 并发派发、顺序收集 | 同时发起多个调用，结果按序注入 | 需要并行 I/O 提升效率 |
-| **Codex** | ⚠️ Inferred: 可能并行 | Rust 异步特性天然支持并发 | 高性能异步场景 |
+| **Codex** | Actor 消息驱动 | Rust 异步特性，消息队列调度 | 高性能异步场景 |
+| **OpenCode** | 超时重置机制 | `resetTimeoutOnProgress` 长任务支持 | 长时间运行任务 |
+| **SWE-agent** | 顺序执行 | `forward_with_handling()` 错误恢复 | 错误恢复优先 |
 
 **对比分析**：
 
@@ -526,9 +650,9 @@ schedule(requests)              [scheduler.ts:169]
 
 | 终止原因 | 触发条件 | 代码位置 |
 |---------|---------|---------|
-| 队列处理完成 | `state.queueLength === 0` 且 `!state.isActive` | `scheduler.ts:373-378` |
-| 用户取消 | 调用 cancelAll() 方法 | `scheduler.ts:225-249` |
-| 信号中断 | `signal.aborted` 为 true | `scheduler.ts:385-388` |
+| 队列处理完成 | `state.queueLength === 0` 且 `!state.isActive` | `packages/core/src/scheduler/scheduler.ts:373-378` |
+| 用户取消 | 调用 cancelAll() 方法 | `packages/core/src/scheduler/scheduler.ts:225-249` |
+| 信号中断 | `signal.aborted` 为 true | `packages/core/src/scheduler/scheduler.ts:385-388` |
 | 会话结束 | Agent Loop 终止 | 外部触发 |
 
 ### 7.2 超时/资源限制
@@ -543,10 +667,10 @@ schedule(requests)              [scheduler.ts:169]
 
 | 错误类型 | 处理策略 | 代码位置 |
 |---------|---------|---------|
-| 工具执行错误 | 状态流转为 Error，继续处理队列 | `scheduler.ts:494-522` |
-| 验证失败 | 状态流转为 Error，不进入执行阶段 | `scheduler.ts:329-369` |
-| 审批拒绝 | 状态流转为 Cancelled，跳过执行 | `scheduler.ts:582-590` |
-| 策略拒绝 | 状态流转为 Error，返回拒绝信息 | `scheduler.ts:535-551` |
+| 工具执行错误 | 状态流转为 Error，继续处理队列 | `packages/core/src/scheduler/scheduler.ts:494-522` |
+| 验证失败 | 状态流转为 Error，不进入执行阶段 | `packages/core/src/scheduler/scheduler.ts:329-369` |
+| 审批拒绝 | 状态流转为 Cancelled，跳过执行 | `packages/core/src/scheduler/scheduler.ts:582-590` |
+| 策略拒绝 | 状态流转为 Error，返回拒绝信息 | `packages/core/src/scheduler/scheduler.ts:535-551` |
 
 ---
 
@@ -576,4 +700,4 @@ schedule(requests)              [scheduler.ts:169]
 
 *✅ Verified: 基于 gemini-cli/packages/core/src/scheduler/scheduler.ts 等源码分析*
 *⚠️ Inferred: 部分设计意图基于代码结构推断*
-*基于版本：2026-02-08 | 最后更新：2026-02-25*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

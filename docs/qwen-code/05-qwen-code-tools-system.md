@@ -1,10 +1,32 @@
 # Tools 系统（Qwen Code）
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `01-qwen-code-overview.md`、`04-qwen-code-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 Qwen Code 的 Tools 系统是「**注册表 + 调度器**」双层架构：ToolRegistry 负责工具注册和发现，CoreToolScheduler 负责参数校验、用户确认和实际执行。
 
 Qwen Code 的核心取舍：**声明式工具定义 + 统一调度器**（对比 Kimi CLI 的函数装饰器、Codex 的 Rust trait 系统）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 工具定义 | 声明式基类 + TypeScript 泛型 | `packages/core/src/tools/tools.ts:234` |
+| 注册管理 | ToolRegistry 集中式注册表 | `packages/core/src/tools/tool-registry.ts:174` |
+| 调度执行 | CoreToolScheduler 统一调度 | `packages/core/src/core/coreToolScheduler.ts:276` |
+| MCP 集成 | McpClientManager 动态发现 | `packages/core/src/tools/mcp-client-manager.ts:29` |
+| 参数校验 | Zod Schema 运行时校验 | `coreToolScheduler.ts:301` |
+| 用户确认 | 工具级别 shouldConfirmExecute | `packages/core/src/tools/tools.ts:246` |
 
 ---
 
@@ -34,7 +56,7 @@ Qwen Code 的核心取舍：**声明式工具定义 + 统一调度器**（对比
 
 ---
 
-## 2. 整体架构
+## 2. 整体架构（ASCII 图）
 
 ### 2.1 在系统中的位置
 
@@ -80,10 +102,10 @@ Qwen Code 的核心取舍：**声明式工具定义 + 统一调度器**（对比
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
 | `ToolRegistry` | 管理工具注册表，支持内置/MCP/发现工具 | `packages/core/src/tools/tool-registry.ts:174` |
-| `CoreToolScheduler` | 调度执行工具调用，处理确认和错误 | `packages/core/src/core/coreToolScheduler.ts:76` |
+| `CoreToolScheduler` | 调度执行工具调用，处理确认和错误 | `packages/core/src/core/coreToolScheduler.ts:276` |
 | `BaseDeclarativeTool` | 声明式工具基类，定义工具元数据 | `packages/core/src/tools/tools.ts:234` |
 | `BaseToolInvocation` | 工具调用执行基类，封装执行逻辑 | `packages/core/src/tools/tools.ts:222` |
-| `McpClientManager` | MCP 客户端管理，动态发现 MCP 工具 | `packages/core/src/tools/mcp-client-manager.ts` |
+| `McpClientManager` | MCP 客户端管理，动态发现 MCP 工具 | `packages/core/src/tools/mcp-client-manager.ts:29` |
 
 ### 2.3 核心组件交互关系
 
@@ -99,7 +121,7 @@ sequenceDiagram
     AL->>TR: 1. getTool(name)
     TR-->>AL: 返回工具实例
 
-    AL->>CS: 2. executePendingCalls(calls)
+    AL->>CS: 2. executePendingCalls(calls, signal)
 
     CS->>CS: 3. validateParams(tool, args)
     Note over CS: 参数校验
@@ -136,67 +158,60 @@ sequenceDiagram
 
 ToolRegistry 是工具系统的「中央注册表」，负责管理所有可用工具的生命周期，包括注册、发现、查询和冲突处理。
 
-#### 类图
+#### 状态机图
 
 ```mermaid
-classDiagram
-    class ToolRegistry {
-        -Map~string,AnyDeclarativeTool~ tools
-        -McpClientManager mcpClientManager
-        +registerTool(tool)
-        +discoverAllTools()
-        +getTool(name)
-        +getAllTools()
-        +getFunctionDeclarations()
-        -removeDiscoveredTools()
-        -discoverAndRegisterToolsFromCommand()
-    }
+stateDiagram-v2
+    [*] --> Empty: 初始化
+    Empty --> Registering: 注册内置工具
+    Registering --> Registering: 继续注册
+    Registering --> Registered: 内置工具注册完成
 
-    class CoreToolScheduler {
-        -Config config
-        -ToolRegistry toolRegistry
-        -ApprovalMode approvalMode
-        +executePendingCalls(calls, signal)
-        -validateParams(tool, args)
-    }
+    Registered --> Discovering: 调用 discoverAllTools()
+    Discovering --> Discovering: 发现 MCP/命令工具
+    Discovering --> Ready: 发现完成
 
-    class BaseDeclarativeTool~TParams,TResult~ {
-        <<abstract>>
-        +name: string
-        +displayName: string
-        +description: string
-        +kind: Kind
-        +schema: FunctionDeclaration
-        +shouldConfirmExecute(params)*
-        +execute(params, signal)
-        #createInvocation(params)*
-    }
+    Ready --> Updating: 重新发现
+    Updating --> Ready: 更新完成
 
-    class BaseToolInvocation~TParams,TResult~ {
-        <<abstract>>
-        -params: TParams
-        +getDescription()*
-        +execute(signal, updateOutput)*
-    }
+    Ready --> [*]: 应用关闭
+```
 
-    class McpClientManager {
-        +discoverAllMcpTools(config)
-    }
+**状态说明**：
 
-    class DiscoveredMCPTool {
-        +asFullyQualifiedTool()
-    }
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Empty | 空注册表 | 初始化 | 开始注册内置工具 |
+| Registering | 注册中 | 开始注册工具 | 内置工具注册完成 |
+| Registered | 已注册内置工具 | 内置工具注册完成 | 开始发现外部工具 |
+| Discovering | 发现外部工具中 | 调用 discoverAllTools | 发现完成 |
+| Ready | 就绪状态 | 发现完成 | 重新发现或关闭 |
+| Updating | 更新中 | 重新发现 | 更新完成 |
 
-    class DiscoveredTool {
-        +callCommand: string
-    }
+#### 内部数据流
 
-    ToolRegistry --> McpClientManager : 管理
-    ToolRegistry --> BaseDeclarativeTool : 注册
-    CoreToolScheduler --> ToolRegistry : 查询
-    BaseDeclarativeTool --> BaseToolInvocation : 创建
-    McpClientManager --> DiscoveredMCPTool : 发现
-    ToolRegistry --> DiscoveredTool : 命令发现
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  输入层                                                      │
+│  ├── 内置工具类 ──► registerTool()                          │
+│  ├── MCP 配置   ──► discoverAllMcpTools()                   │
+│  └── 命令配置   ──► discoverAndRegisterToolsFromCommand()   │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  处理层                                                      │
+│  ├── 工具实例化                                              │
+│  ├── 名称冲突检测                                            │
+│  │   └── MCP 工具使用完全限定名 (serverName__toolName)      │
+│  └── Map 存储 (name -> tool)                                 │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  输出层                                                      │
+│  ├── getTool(name) 查询                                      │
+│  ├── getAllTools() 获取全部                                  │
+│  └── getFunctionDeclarations() 获取 LLM Schema               │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 #### 关键算法逻辑
@@ -832,5 +847,5 @@ async execute(params: TParams, signal: AbortSignal, ...): Promise<TResult>
 
 ---
 
-*✅ Verified: 基于 qwen-code/packages/core/src/tools/tool-registry.ts:174、coreToolScheduler.ts:76 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*✅ Verified: 基于 qwen-code/packages/core/src/tools/tool-registry.ts:174、coreToolScheduler.ts:276 等源码分析*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

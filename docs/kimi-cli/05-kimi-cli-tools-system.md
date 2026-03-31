@@ -1,10 +1,32 @@
-# Tool System（kimi-cli）
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `01-kimi-cli-overview.md`、`04-kimi-cli-agent-loop.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
+# Tool System（Kimi CLI）
 
 ## TL;DR（结论先行）
 
 一句话定义：Kimi CLI 的 Tool System 是「**模块化功能域 + 统一参数提取 + ACP 协议扩展**」的三层架构：工具按功能分组实现，通过 `extract_key_argument` 统一提取关键参数用于 UI 展示，通过 ACP 协议集成外部 MCP 服务。
 
 Kimi CLI 的核心取舍：**模块化功能域组织 + 流式参数提取 + ACP 协议适配**（对比 Gemini CLI 的 Zod Schema 声明式定义、Codex 的 Trait-based Handler 模式、SWE-agent 的 Bundle 配置驱动）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 工具定义 | Python 模块化功能域组织 | `kimi-cli/src/kimi_cli/tools/file/` |
+| 参数提取 | `extract_key_argument` 统一提取 | `kimi-cli/src/kimi_cli/tools/__init__.py:1` |
+| 流式支持 | `streamingjson.Lexer` 实时解析 | `kimi-cli/src/kimi_cli/tools/__init__.py:1` |
+| MCP 集成 | ACP 协议桥接 + fastmcp 执行 | `kimi-cli/src/kimi_cli/acp/mcp.py:1` |
+| 工具跳过 | `SkipThisTool` 异常机制 | `kimi-cli/src/kimi_cli/tools/__init__.py:1` |
+| UI 一致性 | `shorten_middle` 截断显示 | `kimi-cli/src/kimi_cli/tools/__init__.py:1` |
 
 ---
 
@@ -131,6 +153,36 @@ sequenceDiagram
 #### 职责定位
 
 Kimi CLI 的工具系统采用模块化功能域组织方式，按功能将工具分组到不同目录，每个目录包含相关工具的实现。
+
+#### 状态机图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Loading: 工具加载启动
+    Loading --> Validating: 验证工具可用性
+    Validating --> Registered: 工具注册成功
+    Validating --> Skipped: 抛出 SkipThisTool
+
+    Registered --> Executing: 收到工具调用
+    Executing --> Completed: 执行成功
+    Executing --> Failed: 执行失败
+
+    Skipped --> [*]: 跳过加载
+    Completed --> [*]: 返回结果
+    Failed --> [*]: 返回错误
+```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Loading | 加载工具模块 | 启动时初始化 | 模块导入完成 |
+| Validating | 验证工具可用性 | 模块加载后 | 验证通过或跳过 |
+| Registered | 已注册到工具集 | 验证通过 | 收到工具调用 |
+| Skipped | 工具自跳过 | 抛出 SkipThisTool | 加载结束 |
+| Executing | 执行中 | 收到工具调用 | 执行完成 |
+| Completed | 执行成功 | 工具逻辑正常返回 | 返回结果 |
+| Failed | 执行失败 | 工具逻辑抛出异常 | 返回错误 |
 
 #### 目录结构
 
@@ -667,47 +719,27 @@ Agent Loop
 ### 6.3 与其他项目的对比
 
 ```mermaid
-flowchart TD
-    subgraph Kimi["Kimi CLI"]
-        K1[模块化功能域组织]
-        K2[extract_key_argument 统一提取]
-        K3[ACP 协议适配]
-        K4[直接执行]
-    end
-
-    subgraph Gemini["Gemini CLI"]
-        G1[Zod Schema 声明式定义]
-        G2[validate → build → execute]
-        G3[MessageBus 事件确认]
-        G4[三层工具优先级]
-    end
-
-    subgraph Codex["Codex"]
-        C1[Rust Trait + ToolsConfig]
-        C2[ToolRouter 分发]
-        C3[tool_call_gate 门控]
-        C4[变异检测]
-    end
-
-    subgraph SWE["SWE-agent"]
-        S1[Bundle 配置驱动]
-        S2[YAML + Command 抽象]
-        S3[多解析器适配]
-        S4[安全过滤]
-    end
-
-    subgraph OpenCode["OpenCode"]
-        O1[Zod Schema 类型安全]
-        O2[ToolRegistry 动态注册]
-        O3[ctx.ask() 权限控制]
-        O4[插件系统扩展]
-    end
-
-    style Kimi fill:#f5e1f1
-    style Gemini fill:#e1f5e1
-    style Codex fill:#e1e5f5
-    style SWE fill:#fff4e1
-    style OpenCode fill:#e5f5f1
+gitGraph
+    commit id: "传统方案"
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "Bundle 配置驱动"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "模块化功能域"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "Rust Trait"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "Zod Schema"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "AI SDK 集成"
 ```
 
 | 项目 | 工具定义方式 | 参数验证 | 执行流程 | MCP 集成 | 适用场景 |
@@ -717,6 +749,20 @@ flowchart TD
 | **Codex** | Rust Trait + ToolsConfig | 运行时类型检查 | ToolRouter 解析 → Registry 分发 → Handler 执行 | 原生 `McpHandler` | 需要精细并发控制和高性能的场景 |
 | **SWE-agent** | YAML Bundle + Command 抽象 | Pydantic Model | Parse → Filter → Execute | 配置驱动 | 需要灵活配置和多解析器适配的场景 |
 | **OpenCode** | Zod Schema + 工厂函数 | Zod 运行时验证 | Tool.define → execute | 插件化 | 需要高度可扩展和第三方工具集成的场景 |
+
+**详细对比分析**：
+
+| 对比维度 | Kimi CLI | Gemini CLI | Codex | SWE-agent | OpenCode |
+|---------|----------|------------|-------|-----------|----------|
+| **工具定义** | 模块化函数，按功能域分组 | `DeclarativeTool` 抽象类 | `ToolHandler` Trait | YAML Bundle + Command | `Tool.define` 工厂函数 |
+| **参数验证** | 依赖 LLM 生成正确参数 | JSON Schema + 自定义验证 | 运行时类型检查 | Pydantic Model | Zod Schema |
+| **参数提取** | `extract_key_argument` 统一提取 | 内置在 `build` 流程中 | Handler 自行处理 | Command 解析 | 内置在 `execute` 中 |
+| **执行流程** | 直接调用 | 显式三阶段分离 | Router → Registry → Handler | Parse → Filter → Execute | 直接执行 |
+| **确认机制** | 简单确认对话框 | MessageBus 事件驱动 | 变异检测 + 门控等待 | 安全过滤 | `ctx.ask()` 细粒度权限 |
+| **MCP 支持** | ACP 协议适配层 | 原生 `McpClientManager` | 原生 `McpHandler` | 配置驱动 | 插件化 |
+| **扩展方式** | 添加模块 + 注册 | 继承基类 + 注册 | 实现 Trait + 注册 | 添加 Bundle | 插件系统 |
+| **类型安全** | 运行时（Python） | 编译期（TypeScript） | 编译期（Rust） | 运行时（Python） | 运行时（TypeScript） |
+| **流式支持** | `streamingjson.Lexer` | 不支持 | 不支持 | 不支持 | 不支持 |
 
 **详细对比分析**：
 
@@ -792,5 +838,18 @@ flowchart TD
 
 ---
 
+## 9. 延伸阅读
+
+- 前置知识：`04-kimi-cli-agent-loop.md`
+- 相关机制：`06-kimi-cli-mcp-integration.md`
+- 跨项目对比：`docs/comm/05-comm-tools-system.md`
+- 其他项目 Tool System：
+  - `docs/codex/05-codex-tools-system.md`
+  - `docs/gemini-cli/05-gemini-cli-tools-system.md`
+  - `docs/opencode/05-opencode-tools-system.md`
+  - `docs/swe-agent/05-swe-agent-tools-system.md`
+
+---
+
 *✅ Verified: 基于 kimi-cli/src/kimi_cli/tools/ 源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

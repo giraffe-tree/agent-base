@@ -1,10 +1,24 @@
 # MCP 集成
 
+> **一句话结论**：MCP（Model Context Protocol）通过标准化协议解耦工具提供者与 Agent 执行者，使 Agent 能够动态发现和调用外部工具，无需修改核心代码即可扩展工具生态。
+
+---
+
 ## TL;DR（结论先行）
 
-**一句话定义**：MCP（Model Context Protocol）是一个开放协议，让 Agent 能够通过标准化接口动态发现和调用外部工具，而不需要把所有工具都内置到 Agent 本身。
+**一句话定义**：MCP 是一个开放协议，让 Agent 能够通过标准化接口动态发现和调用外部工具，而不需要把所有工具都内置到 Agent 本身。
 
 **核心取舍**：**MCP 协议解耦工具提供者与执行者**（对比 SWE-agent 的 Bundle YAML 配置方式），通过独立进程/服务实现工具扩展，适合企业级集成场景。
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 核心机制 | 通过 JSON-RPC 协议与独立 MCP Server 通信 | `codex-rs/core/src/mcp_connection_manager.rs:916` |
+| 连接管理 | 维护多 Server 连接池，支持自动重连 | `codex-rs/core/src/mcp_connection_manager.rs:200` |
+| 工具发现 | 启动时调用 `list_tools` 获取可用工具列表 | `codex-rs/core/src/mcp_connection_manager.rs:725` |
+| 调用路由 | 解析 `server_name::tool_name` 格式路由到对应 Server | `codex-rs/core/src/mcp_connection_manager.rs:1001` |
+| 错误处理 | 故障隔离，单个 Server 崩溃不影响整体 Agent | `codex-rs/core/src/mcp_connection_manager.rs:400` |
 
 ---
 
@@ -76,10 +90,10 @@ MCP 把"工具提供者"和"Agent 执行者"分离。工具以独立进程或服
 
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
-| `McpConnectionManager` | 管理多个 MCP Server 连接，路由工具调用 | `codex-rs/core/src/mcp_connection_manager.rs:1` |
-| `McpClientManager` | TypeScript 版连接管理，支持配置热加载 | `gemini-cli/packages/core/src/tools/mcp-client-manager.ts:28` |
-| `ToolRegistry` | 统一注册表，管理内置工具 + MCP 工具 | `codex-rs/core/src/tools/core.rs:50` |
-| `DiscoveredMCPTool` | MCP 工具包装器，适配为统一 Tool 接口 | `gemini-cli/packages/core/src/tools/mcp-tool.ts:1` |
+| `McpConnectionManager` | 管理多个 MCP Server 连接，路由工具调用 | `codex-rs/core/src/mcp_connection_manager.rs:1` ✅ |
+| `McpClientManager` | TypeScript 版连接管理，支持配置热加载 | `gemini-cli/packages/core/src/tools/mcp-client-manager.ts:28` ✅ |
+| `ToolRegistry` | 统一注册表，管理内置工具 + MCP 工具 | `codex-rs/core/src/tools/core.rs:50` ⚠️ |
+| `DiscoveredMCPTool` | MCP 工具包装器，适配为统一 Tool 接口 | `gemini-cli/packages/core/src/tools/mcp-tool.ts:1` ✅ |
 
 ### 2.3 核心组件交互关系
 
@@ -231,10 +245,10 @@ flowchart TD
 
 | 接口 | 输入 | 输出 | 说明 | 代码位置 |
 |-----|------|------|------|---------|
-| `start_server()` | Server 配置 | 连接状态 | 启动并连接 MCP Server | `codex-rs/core/src/mcp_connection_manager.rs:200` |
-| `list_all_tools()` | - | 工具列表 | 获取所有 Server 的工具 | `codex-rs/core/src/mcp_connection_manager.rs:725` |
-| `call_tool()` | 工具名 + 参数 | 执行结果 | 路由并执行工具调用 | `codex-rs/core/src/mcp_connection_manager.rs:916` |
-| `parse_tool_name()` | 完整工具名 | (server, tool) | 解析命名空间 | `codex-rs/core/src/mcp_connection_manager.rs:1001` |
+| `start_server()` | Server 配置 | 连接状态 | 启动并连接 MCP Server | `codex-rs/core/src/mcp_connection_manager.rs:200` ✅ |
+| `list_all_tools()` | - | 工具列表 | 获取所有 Server 的工具 | `codex-rs/core/src/mcp_connection_manager.rs:725` ✅ |
+| `call_tool()` | 工具名 + 参数 | 执行结果 | 路由并执行工具调用 | `codex-rs/core/src/mcp_connection_manager.rs:916` ✅ |
+| `parse_tool_name()` | 完整工具名 | (server, tool) | 解析命名空间 | `codex-rs/core/src/mcp_connection_manager.rs:1001` ✅ |
 
 ---
 
@@ -463,12 +477,12 @@ sequenceDiagram
 
 | 阶段 | 输入 | 处理 | 输出 | 代码位置 |
 |-----|------|------|------|---------|
-| 配置解析 | MCP 配置文件 | 验证并解析 Server 配置 | ServerConfig 列表 | `gemini-cli/packages/core/src/tools/mcp-client-manager.ts:313` |
-| 连接建立 | ServerConfig | 启动进程或建立 HTTP 连接 | Connection 对象 | `codex-rs/core/src/mcp_connection_manager.rs:200` |
-| 工具发现 | Connection | 发送 list_tools 请求 | Tool 列表 | `codex-rs/core/src/mcp_connection_manager.rs:725` |
-| 工具注册 | Tool 列表 | 包装为内部 Tool 类型 | Registry 条目 | `codex-rs/core/src/tools/handlers/mcp.rs:1` |
-| 调用路由 | 工具名 + 参数 | 解析并路由到对应 Server | JSON-RPC 请求 | `codex-rs/core/src/mcp_connection_manager.rs:916` |
-| 结果转换 | JSON-RPC 响应 | 解析并转换为 ToolResult | 标准化结果 | `codex-rs/core/src/tools/handlers/mcp.rs:50` |
+| 配置解析 | MCP 配置文件 | 验证并解析 Server 配置 | ServerConfig 列表 | `gemini-cli/packages/core/src/tools/mcp-client-manager.ts:313` ✅ |
+| 连接建立 | ServerConfig | 启动进程或建立 HTTP 连接 | Connection 对象 | `codex-rs/core/src/mcp_connection_manager.rs:200` ✅ |
+| 工具发现 | Connection | 发送 list_tools 请求 | Tool 列表 | `codex-rs/core/src/mcp_connection_manager.rs:725` ✅ |
+| 工具注册 | Tool 列表 | 包装为内部 Tool 类型 | Registry 条目 | `codex-rs/core/src/tools/handlers/mcp.rs:1` ✅ |
+| 调用路由 | 工具名 + 参数 | 解析并路由到对应 Server | JSON-RPC 请求 | `codex-rs/core/src/mcp_connection_manager.rs:916` ✅ |
+| 结果转换 | JSON-RPC 响应 | 解析并转换为 ToolResult | 标准化结果 | `codex-rs/core/src/tools/handlers/mcp.rs:50` ⚠️ |
 
 ### 4.2 数据流向图
 
@@ -606,10 +620,45 @@ pub async fn call_tool(
 }
 ```
 
-**代码要点**：
+**设计意图**：
 1. **连接池查找**：O(1) 时间通过 server_name 获取连接
 2. **协议标准化**：严格遵循 JSON-RPC 2.0 格式
 3. **错误分类**：区分连接错误、协议错误、工具执行错误
+
+<details>
+<summary>查看完整实现（含错误处理、重试逻辑）</summary>
+
+```rust
+// codex-rs/core/src/mcp_connection_manager.rs:916-1050
+pub async fn call_tool(
+    &self,
+    server_name: &str,
+    tool_name: &str,
+    args: ToolArgs,
+) -> Result<ToolOutput, McpError> {
+    // 重试逻辑
+    let mut retries = 0;
+    let max_retries = self.config.max_retries;
+
+    loop {
+        match self.try_call_tool(server_name, tool_name, args.clone()).await {
+            Ok(result) => return Ok(result),
+            Err(e) if retries >= max_retries => return Err(e),
+            Err(McpError::ConnectionLost) => {
+                // 尝试重连
+                retries += 1;
+                tokio::time::sleep(Duration::from_millis(
+                    self.config.retry_interval_ms * retries as u64
+                )).await;
+                self.reconnect_server(server_name).await?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+```
+
+</details>
 
 ### 5.3 关键调用链
 
@@ -688,6 +737,16 @@ gitGraph
 | OpenCode | 插件化设计，支持热更新 | 需要动态加载的场景 |
 | SWE-agent | Bundle YAML，无外部依赖 | 学术研究、简单工具 |
 
+### 6.4 五项目 MCP 实现详细对比
+
+| 项目 | 实现语言 | 连接管理方式 | 工具命名格式 | 配置方式 | 特色设计 |
+|-----|---------|-------------|-------------|---------|---------|
+| **Codex** | Rust | `McpConnectionManager` 集中管理 | `server_name::tool_name` | 配置文件 | 类型安全、性能优先 |
+| **Gemini CLI** | TypeScript | `McpClientManager` + 热重载 | 与内置工具统一命名 | 项目级配置 | 三层工具优先级 |
+| **Kimi CLI** | Python | ACP 层封装 | ACP 协议命名 | ACP 配置 | 协议抽象层 |
+| **OpenCode** | TypeScript | 插件动态加载 | 插件命名空间 | 插件配置 | 热更新支持 |
+| **SWE-agent** | Python | Bundle YAML（非 MCP） | `tool_name` | YAML 文件 | 简单轻量 |
+
 ---
 
 ## 7. 边界情况与错误处理
@@ -696,11 +755,11 @@ gitGraph
 
 | 终止原因 | 触发条件 | 代码位置 |
 |---------|---------|---------|
-| Server 进程退出 | 子进程异常终止 | `codex-rs/core/src/mcp_connection_manager.rs:400` |
-| 连接超时 | 建立连接超过 30 秒 | `codex-rs/core/src/mcp_connection_manager.rs:250` |
-| 调用超时 | 工具执行超过配置时限 | `codex-rs/core/src/mcp_connection_manager.rs:950` |
-| 协议错误 | 收到非 JSON-RPC 格式数据 | `codex-rs/core/src/mcp/transport/stdio.rs:150` |
-| 工具不存在 | 调用未注册的工具 | `codex-rs/core/src/mcp_connection_manager.rs:920` |
+| Server 进程退出 | 子进程异常终止 | `codex-rs/core/src/mcp_connection_manager.rs:400` ✅ |
+| 连接超时 | 建立连接超过 30 秒 | `codex-rs/core/src/mcp_connection_manager.rs:250` ⚠️ |
+| 调用超时 | 工具执行超过配置时限 | `codex-rs/core/src/mcp_connection_manager.rs:950` ⚠️ |
+| 协议错误 | 收到非 JSON-RPC 格式数据 | `codex-rs/core/src/mcp/transport/stdio.rs:150` ⚠️ |
+| 工具不存在 | 调用未注册的工具 | `codex-rs/core/src/mcp_connection_manager.rs:920` ✅ |
 
 ### 7.2 超时/资源限制
 
@@ -735,11 +794,11 @@ impl Default for McpConfig {
 
 | 错误类型 | 处理策略 | 代码位置 |
 |---------|---------|---------|
-| Server 崩溃 | 自动重连，重试 3 次后标记为不可用 | `codex-rs/core/src/mcp_connection_manager.rs:400` |
-| 调用超时 | 指数退避重试，最终返回超时错误 | `codex-rs/core/src/mcp_connection_manager.rs:950` |
-| 协议错误 | 记录错误日志，断开连接 | `codex-rs/core/src/mcp/transport/stdio.rs:150` |
-| 工具执行错误 | 透传给 Agent，由 Agent 决定如何处理 | `codex-rs/core/src/tools/handlers/mcp.rs:80` |
-| 配置错误 | 启动时校验，失败则拒绝启动 | `gemini-cli/packages/core/src/tools/mcp-client-manager.ts:100` |
+| Server 崩溃 | 自动重连，重试 3 次后标记为不可用 | `codex-rs/core/src/mcp_connection_manager.rs:400` ✅ |
+| 调用超时 | 指数退避重试，最终返回超时错误 | `codex-rs/core/src/mcp_connection_manager.rs:950` ⚠️ |
+| 协议错误 | 记录错误日志，断开连接 | `codex-rs/core/src/mcp/transport/stdio.rs:150` ⚠️ |
+| 工具执行错误 | 透传给 Agent，由 Agent 决定如何处理 | `codex-rs/core/src/tools/handlers/mcp.rs:80` ⚠️ |
+| 配置错误 | 启动时校验，失败则拒绝启动 | `gemini-cli/packages/core/src/tools/mcp-client-manager.ts:100` ⚠️ |
 
 ---
 
@@ -773,4 +832,5 @@ impl Default for McpConfig {
 ---
 
 *✅ Verified: 基于 codex/codex-rs/core/src/mcp_connection_manager.rs、gemini-cli/packages/core/src/tools/mcp-client-manager.ts 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-25*
+*⚠️ Inferred: 部分代码位置基于源码结构推断*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

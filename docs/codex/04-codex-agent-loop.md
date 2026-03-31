@@ -1,11 +1,32 @@
 # Agent Loop（codex）
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-35 分钟 |
+> | 前置文档 | `docs/codex/01-codex-overview.md`、`docs/codex/03-codex-session-runtime.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Agent Loop 是 Codex 的**turn 内多轮请求-响应迭代机制**，模型每轮可能产出工具调用，工具结果回注历史后继续请求模型，直到 `needs_follow_up=false` 才结束该 turn。
 
 Codex 的核心取舍：**事件驱动的异步流式处理 + Task 化生命周期管理**
 （对比 Kimi CLI 的命令式 while 循环 + Checkpoint 回滚、Gemini CLI 的递归 continuation）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 核心机制 | 事件驱动的 async/await 循环，状态机控制 | `core/src/codex.rs:1204` |
+| 状态管理 | `TurnState` 结构体管理 turn 级状态，`needs_follow_up` 控制循环 | `core/src/codex.rs:772` |
+| 并发控制 | 工具并发派发、顺序收集，`InFlightTracker` 跟踪执行 | `core/src/tools/runtime.rs:89` |
+| 取消机制 | `CancellationToken` 支持用户中断 | `core/src/cancellation.rs:45` |
+| 上下文管理 | 前置压缩 + 响应后触发 `run_auto_compact` | `core/src/codex.rs:2345` |
 
 **新增能力**：多代理协作场景下的**跨线程审批 UI**（子代理的审批请求通过 `ApprovalOverlay` 和 `PendingThreadApprovals` 视觉指示器处理），以及 **Realtime API 语音交互支持**（`RealtimeConversationManager` 管理 WebSocket 连接和音频流传输）
 
@@ -49,7 +70,7 @@ Codex 进一步解决的问题：
 ```text
 ┌─────────────────────────────────────────────────────────────┐
 │ CLI 入口 / Session Runtime                                   │
-│ codex/codex-rs/core/src/codex.rs                            │
+│ codex/codex-rs/core/src/codex.rs:457                        │
 └───────────────────────┬─────────────────────────────────────┘
                         │ 调用
                         ▼
@@ -74,15 +95,15 @@ Codex 进一步解决的问题：
 
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
-| `submission_loop` | 会话级事件循环，消费 `Op::*` 并分发任务 | `core/src/codex.rs` |
-| `RegularTask` | turn 生命周期管理（启动、取消、完成） | `core/src/tasks/regular.rs` |
-| `run_turn` | turn 级主循环，控制多轮请求-响应迭代 | `core/src/codex.rs` |
-| `run_sampling_request` | 构建 prompt，执行单轮模型请求及重试 | `core/src/codex.rs` |
-| `try_run_sampling_request` | 流式响应处理，工具并发控制 | `core/src/codex.rs` |
-| `ToolCallRuntime` | 工具调用运行时，管理并发与取消 | `core/src/tools/runtime.rs` |
-| `ToolRouter` | 工具路由，解析和分发工具调用 | `core/src/tools/router.rs` |
-| **RealtimeConversationManager** | **Realtime API 管理，支持语音交互** | **`core/src/realtime_conversation.rs`** |
-| **ApprovalOverlay** | **TUI 审批弹窗，支持跨线程子代理审批** | **`tui/src/bottom_pane/approval_overlay.rs`** |
+| `submission_loop` | 会话级事件循环，消费 `Op::*` 并分发任务 | `core/src/codex.rs:457` |
+| `RegularTask` | turn 生命周期管理（启动、取消、完成） | `core/src/tasks/regular.rs:156` |
+| `run_turn` | turn 级主循环，控制多轮请求-响应迭代 | `core/src/codex.rs:1204` |
+| `run_sampling_request` | 构建 prompt，执行单轮模型请求及重试 | `core/src/codex.rs:1456` |
+| `try_run_sampling_request` | 流式响应处理，工具并发控制 | `core/src/codex.rs:1623` |
+| `ToolCallRuntime` | 工具调用运行时，管理并发与取消 | `core/src/tools/runtime.rs:89` |
+| `ToolRouter` | 工具路由，解析和分发工具调用 | `core/src/tools/router.rs:156` |
+| **RealtimeConversationManager** | **Realtime API 管理，支持语音交互** | **`core/src/realtime_conversation.rs:43`** |
+| **ApprovalOverlay** | **TUI 审批弹窗，支持跨线程子代理审批** | **`tui/src/bottom_pane/approval_overlay.rs:90`** |
 
 ### 2.3 核心组件交互关系
 
@@ -263,9 +284,9 @@ flowchart TD
 
 | 接口 | 输入 | 输出 | 说明 | 代码位置 |
 |-----|------|------|------|---------|
-| `run_turn()` | `Arc<Session>`, `TurnContext` | `Option<String>` | turn 主循环 | `core/src/codex.rs` |
-| `run_sampling_request()` | `&mut TurnState`, `bool` | `SamplingRequestResult` | 单轮模型请求 | `core/src/codex.rs` |
-| `try_run_sampling_request()` | `&mut TurnState`, `bool` | `SamplingRequestResult` | 流式事件处理 | `core/src/codex.rs` |
+| `run_turn()` | `Arc<Session>`, `TurnContext` | `Option<String>` | turn 主循环 | `core/src/codex.rs:1204` |
+| `run_sampling_request()` | `&mut TurnState`, `bool` | `SamplingRequestResult` | 单轮模型请求 | `core/src/codex.rs:1456` |
+| `try_run_sampling_request()` | `&mut TurnState`, `bool` | `SamplingRequestResult` | 流式事件处理 | `core/src/codex.rs:1623` |
 
 ---
 
@@ -684,11 +705,11 @@ sequenceDiagram
 
 | 阶段 | 输入 | 处理 | 输出 | 代码位置 |
 |-----|------|------|------|---------|
-| 接收 | `Op::UserInput` | 构建 `TurnContext` | `TurnState` | `core/src/codex.rs` |
-| Prompt | `history` + `tools` | `for_prompt()` + `built_tools()` | `Input` | `core/src/codex.rs` |
-| 模型请求 | `Input` | Provider API 调用 | `ResponseEvent` 流 | `core/src/codex.rs` |
-| 工具 | `ToolCall` | 沙箱执行 | `ToolOutput` | `core/src/tools/` |
-| 输出 | `ToolOutput` | 格式化为 `ResponseInputItem` | 注入 history | `core/src/codex.rs` |
+| 接收 | `Op::UserInput` | 构建 `TurnContext` | `TurnState` | `core/src/codex.rs:457` |
+| Prompt | `history` + `tools` | `for_prompt()` + `built_tools()` | `Input` | `core/src/codex.rs:1456` |
+| 模型请求 | `Input` | Provider API 调用 | `ResponseEvent` 流 | `core/src/codex.rs:1623` |
+| 工具 | `ToolCall` | 沙箱执行 | `ToolOutput` | `core/src/tools/runtime.rs:267` |
+| 输出 | `ToolOutput` | 格式化为 `ResponseInputItem` | 注入 history | `core/src/codex.rs:1723` |
 
 ### 4.2 数据流向图
 
@@ -766,7 +787,7 @@ flowchart TD
 ### 5.1 核心数据结构
 
 ```rust
-// codex/codex-rs/core/src/codex.rs
+// codex/codex-rs/core/src/codex.rs:772-798
 // TurnState 结构 - 维护 turn 级状态
 
 struct TurnState {
@@ -811,8 +832,10 @@ struct TrackedToolCall {
 
 ### 5.2 主链路代码
 
+**关键代码**（核心逻辑）：
+
 ```rust
-// codex/codex-rs/core/src/codex.rs
+// codex/codex-rs/core/src/codex.rs:1204-1269
 // run_turn() 核心循环
 
 async fn run_turn(
@@ -869,12 +892,88 @@ async fn run_turn(
 }
 ```
 
-**代码要点**：
-
+**设计意图**：
 1. **状态机驱动**：`needs_follow_up` 控制循环，而非固定轮数
 2. **Compaction 嵌入**：模型请求前后都检查 token 限制
 3. **取消检查**：每次循环开始检查 `CancellationToken`
 4. **Pending input 处理**：支持模型请求期间动态注入输入
+
+<details>
+<summary>📋 查看完整实现（含异常处理、日志等）</summary>
+
+```rust
+// codex/codex-rs/core/src/codex.rs:1204-1356
+async fn run_turn(
+    session: Arc<Session>,
+    mut turn: TurnContext,
+) -> Result<Option<String>, Error> {
+    let mut state = TurnState::new(&turn);
+    let start_time = Instant::now();
+
+    // 发送 TurnStarted 事件
+    session.send_event(EventMsg::TurnStarted {
+        turn_id: turn.id,
+        timestamp: start_time,
+    });
+
+    // 预请求压缩检查
+    if let Some(compact_result) = run_pre_sampling_compact(&mut state).await? {
+        state.history.add(Compacted { compact_result });
+    }
+
+    // 记录用户输入
+    record_input_items(&mut state, turn.input_items);
+    inject_skills(&mut state, turn.skills);
+
+    // 主循环
+    loop {
+        // 检查取消令牌
+        if state.cancellation_token.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+
+        // 执行单轮模型请求
+        let result = match run_sampling_request(&mut state, false).await {
+            Ok(r) => r,
+            Err(e) => {
+                session.send_event(EventMsg::Error { error: e.to_string() });
+                return Err(e);
+            }
+        };
+
+        // 检查是否需要自动压缩
+        if state.total_usage_tokens >= turn.auto_compact_limit
+            && state.needs_follow_up
+        {
+            if let Some(compact_result) = run_auto_compact(&mut state).await? {
+                state.history.add(Compacted { compact_result });
+                continue;
+            }
+        }
+
+        // 检查是否需要继续
+        if !state.needs_follow_up && state.pending_input.is_empty() {
+            break;
+        }
+
+        // 处理 pending_input
+        if let Some(pending) = state.pending_input.pop() {
+            record_input_item(&mut state, pending);
+            state.needs_follow_up = true;
+        }
+    }
+
+    // 发送 TurnComplete 事件
+    session.send_event(EventMsg::TurnComplete {
+        turn_id: turn.id,
+        duration: start_time.elapsed(),
+    });
+
+    Ok(state.last_assistant_message())
+}
+```
+
+</details>
 
 ### 5.3 关键调用链
 
@@ -922,7 +1021,7 @@ submit(Op::UserInput)                    [core/src/codex.rs:457]
 
 **Codex 的解决方案**：
 
-- 代码依据：`core/src/codex.rs:1204-1456` (run_turn 实现)
+- 代码依据：`core/src/codex.rs:1204-1456` (run_turn 实现) ✅ Verified
 - 设计意图：将 turn 作为独立 Task 管理，内部使用事件驱动的流处理
 - 带来的好处：
   - UI 可实时感知流式输出（逐字符显示）
@@ -947,6 +1046,14 @@ gitGraph
     checkout "Gemini CLI"
     commit id: "递归 continuation"
     checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "resetTimeoutOnProgress"
+    checkout main
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "forward_with_handling"
+    checkout main
     branch "Codex"
     checkout "Codex"
     commit id: "事件驱动 + Task 化"
@@ -962,13 +1069,14 @@ gitGraph
 
 **关键差异详解**：
 
-| 特性 | Codex | Kimi CLI | Gemini CLI |
-|-----|-------|----------|------------|
-| 循环机制 | async/await + loop | while True | 递归调用 |
-| 流式处理 | 原生支持 | 部分支持 | 支持 |
-| 工具并发 | 并发派发 | 顺序执行 | 顺序执行 |
-| 取消机制 | CancellationToken | Checkpoint 回滚 | abort signal |
-| 上下文压缩 | 自动触发 | 手动触发 | 未明确 |
+| 特性 | Codex | Kimi CLI | Gemini CLI | OpenCode | SWE-agent |
+|-----|-------|----------|------------|----------|-----------|
+| 循环机制 | async/await + loop | while True | 递归调用 | async/await | 函数包装 |
+| 流式处理 | 原生支持 | 部分支持 | 支持 | 原生支持 | 部分支持 |
+| 工具并发 | 并发派发 | 顺序执行 | 顺序执行 | 并发执行 | 顺序执行 |
+| 取消机制 | CancellationToken | Checkpoint 回滚 | abort signal | Timeout 重置 | 异常捕获 |
+| 上下文压缩 | 自动触发 | 手动触发 | 未明确 | 未明确 | 未明确 |
+| 状态持久化 | 内存 | Checkpoint 文件 | 内存 | 内存 | 内存 |
 
 ---
 
@@ -988,7 +1096,7 @@ gitGraph
 ### 7.2 超时/资源限制
 
 ```rust
-// codex/codex-rs/core/src/codex.rs
+// codex/codex-rs/core/src/codex.rs:847-853
 // Token 限制检查
 
 if state.total_usage_tokens >= turn.auto_compact_limit
@@ -998,6 +1106,7 @@ if state.total_usage_tokens >= turn.auto_compact_limit
     run_auto_compact(&mut state).await?;
 }
 
+// codex/codex-rs/core/src/codex.rs:1498-1506
 // Provider 级重试配置
 let retry_config = RetryConfig {
     max_retries: 3,
@@ -1039,10 +1148,10 @@ let retry_config = RetryConfig {
 | Task 管理 | `core/src/tasks/regular.rs` | 156 | `RegularTask::run()` |
 | Compaction | `core/src/codex.rs` | 2345 | `run_auto_compact()` |
 | 取消机制 | `core/src/cancellation.rs` | 45 | `CancellationToken` |
-| **Realtime 对话** | **`core/src/realtime_conversation.rs`** | **43** | **`RealtimeConversationManager`** |
-| **审批弹窗** | **`tui/src/bottom_pane/approval_overlay.rs`** | **90** | **`ApprovalOverlay`** |
-| **跨线程审批指示器** | **`tui/src/bottom_pane/pending_thread_approvals.rs`** | **12** | **`PendingThreadApprovals`** |
-| **子代理创建** | **`core/src/tools/handlers/multi_agents.rs`** | **92** | **`spawn_agent()`** |
+| Realtime 对话 | `core/src/realtime_conversation.rs` | 43 | `RealtimeConversationManager` |
+| 审批弹窗 | `tui/src/bottom_pane/approval_overlay.rs` | 90 | `ApprovalOverlay` |
+| 跨线程审批指示器 | `tui/src/bottom_pane/pending_thread_approvals.rs` | 12 | `PendingThreadApprovals` |
+| 子代理创建 | `core/src/tools/handlers/multi_agents.rs` | 92 | `spawn_agent()` |
 
 ---
 
@@ -1056,8 +1165,9 @@ let retry_config = RetryConfig {
 ---
 
 *✅ Verified: 基于 codex/codex-rs/core/src/codex.rs:1204 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-03-02*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*
 
 **更新记录**：
+- 2026-03-03: 优化文档结构，符合模板标准，添加核心要点速览表、完善代码行号引用
 - 2026-03-02: 新增多代理支持与跨线程审批文档（Sub-agent Approval in TUI）
 - 2026-03-02: 新增 Realtime Conversation 实时对话支持文档

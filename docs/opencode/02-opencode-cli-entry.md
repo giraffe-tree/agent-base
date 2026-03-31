@@ -1,10 +1,30 @@
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `01-opencode-overview.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 # CLI Entry（opencode）
 
 ## TL;DR（结论先行）
 
 一句话定义：OpenCode CLI Entry 是命令行接口的入口层，负责平台检测、参数解析、命令路由和全局初始化。
 
-OpenCode 的核心取舍：**yargs Command Module + 平台二进制分发**（对比 Kimi CLI 的 argparse、Codex 的 Rust CLI）
+OpenCode 的核心取舍：**yargs Command Module + 平台二进制分发**（对比 Kimi CLI 的 argparse、Codex 的 Rust CLI、Gemini CLI 的 oclif）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 平台分发 | Node wrapper 检测 platform/arch/AVX2/libc，分发最优二进制 | `packages/opencode/bin/opencode:1-180` |
+| 参数解析 | yargs 框架，支持 middleware、completion、严格模式 | `packages/opencode/src/index.ts:48-156` |
+| 全局初始化 | Middleware 统一处理日志 + 数据库迁移 | `packages/opencode/src/index.ts:65-120` |
+| 命令组织 | Command Module 模式，类型安全的 cmd() 包装器 | `packages/opencode/src/cli/cmd/cmd.ts:1-7` |
 
 ---
 
@@ -690,13 +710,13 @@ src/index.ts                          [src/index.ts:1]
 **核心问题**：如何在跨平台环境中提供一致的 CLI 体验，同时保持高性能？
 
 **OpenCode 的解决方案**：
-- 代码依据：`packages/opencode/bin/opencode:1-180`
-- 设计意图：Node wrapper 负责平台检测和二进制分发，实际逻辑在编译后的二进制中执行
-- 带来的好处：
+- **代码依据**：`packages/opencode/bin/opencode:1-180` ✅ Verified
+- **设计意图**：Node wrapper 负责平台检测和二进制分发，实际逻辑在编译后的二进制中执行
+- **带来的好处**：
   - 性能：核心逻辑使用 Bun 编译，启动速度快
   - 兼容性：自动检测 AVX2、musl/glibc，选择最优二进制
   - 用户体验：用户无感知，统一使用 `opencode` 命令
-- 付出的代价：
+- **付出的代价**：
   - 发布复杂度：需构建 10+ 个平台包
   - 包体积：每个平台包独立，总发布体积大
 
@@ -728,6 +748,18 @@ gitGraph
 | Kimi CLI | argparse + Python 单包 | 快速迭代，跨平台简单 |
 | Codex | Rust 原生 CLI | 极致性能，单二进制分发 |
 | Gemini CLI | oclif 框架 | 丰富插件生态，标准化命令结构 |
+
+**详细对比维度**：
+
+| 维度 | OpenCode | Kimi CLI | Codex | Gemini CLI |
+|-----|----------|----------|-------|------------|
+| CLI 框架 | yargs | argparse | Rust clap | oclif |
+| 分发方式 | 多平台二进制 | Python 包 | 单二进制 | npm 包 |
+| 平台检测 | 运行时检测 | 无需检测 | 编译时确定 | 运行时检测 |
+| 启动性能 | 快（编译后） | 慢（解释执行） | 极快（原生） | 中等 |
+| 命令扩展 | Command Module | 装饰器注册 | 宏定义 | 插件系统 |
+| 全局初始化 | Middleware | 手动初始化 | 显式初始化 | Hook 机制 |
+| 类型安全 | TypeScript | Python 类型 | Rust 类型 | TypeScript |
 
 **关键差异分析**：
 
@@ -801,4 +833,4 @@ const result = childProcess.spawnSync(exe, ["-NoProfile", "-NonInteractive", "-C
 ---
 
 *✅ Verified: 基于 opencode/packages/opencode/src/ 源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

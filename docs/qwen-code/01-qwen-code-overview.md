@@ -1,10 +1,32 @@
 # Qwen Code 概述
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | 无（本文档为项目入口文档） |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Qwen Code 是基于 Google Gemini CLI 架构构建的开源 AI 编程助手，采用 TypeScript/React/Ink 技术栈，通过 Monorepo 结构实现 cli/core 分层，提供企业级的 Session 管理、工具调度和 MCP 集成能力。
 
 Qwen Code 的核心取舍：**继承 Gemini CLI 的成熟架构 + 开源社区驱动**（对比其他项目的独立架构如 Kimi CLI 的 Python 实现、Codex 的 Rust 实现）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 架构基础 | 继承 Gemini CLI 架构，Monorepo 分层设计 | `packages/cli/index.ts:14` |
+| Agent Loop | 递归 continuation 驱动 + 流式事件架构 | `packages/core/src/core/client.ts:403` |
+| 状态管理 | JSONL 文件 + UUID 消息树 + 项目隔离 | `packages/core/src/services/sessionService.ts:128` |
+| 工具系统 | 声明式工具定义 + 统一调度器 | `packages/core/src/tools/tool-registry.ts:174` |
+| UI 框架 | React + Ink 终端渲染 | `packages/cli/src/gemini.tsx:209` |
+| 沙盒策略 | Docker/Podman + macOS Seatbelt 双进程架构 | `packages/cli/src/utils/sandbox.ts:175` |
 
 ---
 
@@ -31,6 +53,7 @@ AI 编程助手需要解决的核心问题：
 | 上下文 Token 限制 | 长对话时无法处理，导致性能下降或失败 |
 | MCP 生态集成 | 无法扩展外部工具能力，功能受限 |
 | 交互式 UI 体验 | 纯文本交互体验差，用户难以跟踪进度 |
+| 安全隔离执行 | 危险操作可能影响系统稳定性 |
 
 ### 1.3 技术栈
 
@@ -99,7 +122,6 @@ AI 编程助手需要解决的核心问题：
 │  ├─ sessionService.ts:128    # JSONL 会话持久化                  │
 │  ├─ chatCompressionService.ts:78 # 上下文压缩                    │
 │  └─ loopDetectionService.ts:78   # 循环检测                      │
-└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### 2.2 核心组件职责
@@ -118,7 +140,7 @@ AI 编程助手需要解决的核心问题：
 | `ChatCompressionService` | 历史压缩、token 管理 | `packages/core/src/services/chatCompressionService.ts:78` |
 | `LoopDetectionService` | 循环检测、防止无限循环 | `packages/core/src/services/loopDetectionService.ts:78` |
 
-### 2.3 组件交互时序
+### 2.3 核心组件交互关系
 
 ```mermaid
 sequenceDiagram
@@ -561,34 +583,27 @@ main()                          [packages/cli/index.ts:14]
 ### 6.3 与其他项目的对比
 
 ```mermaid
-flowchart LR
-    subgraph "AI Coding Agent 生态"
-        direction TB
-
-        subgraph "TypeScript 阵营"
-            G[Gemini CLI<br/>递归续跑]
-            Q[Qwen Code<br/>继承 Gemini]
-            O[OpenCode<br/>resetTimeoutOnProgress]
-        end
-
-        subgraph "Python 阵营"
-            K[Kimi CLI<br/>Checkpoint 回滚]
-            S[SWE-agent<br/>forward_with_handling]
-        end
-
-        subgraph "Rust 阵营"
-            C[Codex<br/>Actor 消息驱动]
-        end
-    end
-
-    G -->|开源实现| Q
-
-    style G fill:#90EE90
-    style Q fill:#87CEEB
-    style K fill:#FFB6C1
-    style C fill:#FFD700
-    style O fill:#DDA0DD
-    style S fill:#F0E68C
+gitGraph
+    commit id: "传统方案"
+    branch "Qwen Code"
+    checkout "Qwen Code"
+    commit id: "继承 Gemini CLI"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "官方实现"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "Checkpoint 回滚"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "Actor 消息驱动"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "resetTimeoutOnProgress"
 ```
 
 | 项目 | 核心差异 | 适用场景 |
@@ -713,4 +728,4 @@ const COMPRESSION_PRESERVE_THRESHOLD = 0.3; // 保留最近 30% 历史
 ---
 
 *✅ Verified: 基于 qwen-code/packages/core/src/core/client.ts:403、qwen-code/packages/core/src/core/turn.ts:233、qwen-code/packages/core/src/services/loopDetectionService.ts:78 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-25*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

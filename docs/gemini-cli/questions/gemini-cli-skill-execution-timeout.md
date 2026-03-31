@@ -1,10 +1,30 @@
 # Gemini CLI Skill 执行超时机制
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | `docs/gemini-cli/06-gemini-cli-mcp-integration.md`、`docs/gemini-cli/04-gemini-cli-agent-loop.md` |
+> | 文档结构 | TL;DR → 架构 → 核心组件 → 数据流转 → 代码实现 → 设计对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 **一句话定义**：Gemini CLI 采用 **Scheduler 状态机驱动** 的超时管理机制，通过 `Promise.race()` 实现工具执行与超时竞速，默认 10 分钟超时可通过 `MCPServerConfig` 配置。
 
-Gemini CLI 的核心取舍：**状态机 + Promise.race 竞速**（对比 OpenCode 的 `resetTimeoutOnProgress` 动态续期机制）
+**Gemini CLI 的核心取舍**：**状态机 + Promise.race 竞速**（对比 OpenCode 的 `resetTimeoutOnProgress` 动态续期机制）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 超时实现 | Promise.race 竞速模式 | `packages/core/src/mcp/scheduler.ts:276` |
+| 状态管理 | ToolExecutionState 枚举 | `packages/core/src/mcp/types.ts:20-50` |
+| 配置方式 | MCPServerConfig.timeout | `packages/core/src/mcp/config.ts:15-35` |
+| 取消机制 | AbortController + cancelAll() | `packages/core/src/mcp/client.ts:200-250` |
 
 ---
 
@@ -42,13 +62,13 @@ Gemini CLI 的核心取舍：**状态机 + Promise.race 竞速**（对比 OpenCo
 ```text
 ┌─────────────────────────────────────────────────────────────┐
 │ Agent Loop / Session Runtime                                 │
-│ gemini-cli/src/index.ts                                      │
+│ packages/core/src/core/geminiChat.ts                        │
 └───────────────────────┬─────────────────────────────────────┘
                         │ 调用工具
                         ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ ▓▓▓ Scheduler 超时管理 ▓▓▓                                  │
-│ gemini-cli/src/mcp/scheduler.ts                              │
+│ packages/core/src/mcp/scheduler.ts                          │
 │ - schedule()    : 调度工具执行                              │
 │ - execute()     : 执行并管理超时                            │
 │ - cancelAll()   : 取消所有任务                              │
@@ -67,11 +87,11 @@ Gemini CLI 的核心取舍：**状态机 + Promise.race 竞速**（对比 OpenCo
 
 | 组件 | 职责 | 代码位置 |
 |-----|------|---------|
-| `MCPServerConfig` | 定义超时配置接口 | `gemini-cli/src/mcp/config.ts:15-35` |
-| `MCPServer` | 超时参数初始化与读取 | `gemini-cli/src/mcp/server.ts:40-60` |
-| `ToolScheduler` | 工具执行状态机与超时竞速 | `gemini-cli/src/mcp/scheduler.ts:80-150` |
-| `ToolExecutionState` | 定义执行状态枚举 | `gemini-cli/src/mcp/types.ts:20-50` |
-| `MCPClient` | 提供 `cancelAll()` 取消接口 | `gemini-cli/src/mcp/client.ts:200-250` |
+| `MCPServerConfig` | 定义超时配置接口 | `packages/core/src/mcp/config.ts:15-35` |
+| `MCPServer` | 超时参数初始化与读取 | `packages/core/src/mcp/server.ts:40-60` |
+| `ToolScheduler` | 工具执行状态机与超时竞速 | `packages/core/src/mcp/scheduler.ts:80-150` |
+| `ToolExecutionState` | 定义执行状态枚举 | `packages/core/src/mcp/types.ts:20-50` |
+| `MCPClient` | 提供 `cancelAll()` 取消接口 | `packages/core/src/mcp/client.ts:200-250` |
 
 ### 2.3 核心组件交互关系
 
@@ -317,7 +337,7 @@ flowchart TD
 
 ### 5.1 核心数据结构
 
-**MCPServerConfig 接口**（`gemini-cli/src/mcp/config.ts:15-35`）
+**MCPServerConfig 接口**（`packages/core/src/mcp/config.ts:15-35`）
 
 ```typescript
 export interface MCPServerConfig {
@@ -341,7 +361,7 @@ export interface MCPServerConfig {
 | `timeout` | `number` | 工具执行超时时间（毫秒）|
 | `trust` | `boolean` | 是否跳过权限确认 |
 
-**ToolExecutionState 枚举**（`gemini-cli/src/mcp/types.ts:20-50`）
+**ToolExecutionState 枚举**（`packages/core/src/mcp/types.ts:20-50`）
 
 ```typescript
 export enum ToolExecutionState {
@@ -357,9 +377,42 @@ export enum ToolExecutionState {
 
 ### 5.2 主链路代码
 
-**Scheduler 核心逻辑**（`gemini-cli/src/mcp/scheduler.ts:80-150`）
+**关键代码**（核心逻辑）：
 
 ```typescript
+// packages/core/src/mcp/scheduler.ts:276-290
+async execute(execution: ToolExecution): Promise<void> {
+  execution.state = ToolExecutionState.Executing;
+  execution.startTime = Date.now();
+  const timeout = this.server.getToolTimeout();
+
+  try {
+    // Promise.race 竞速：工具执行 vs 超时
+    const result = await Promise.race([
+      this.callTool(execution.toolName, execution.args),
+      this.createTimeoutPromise(timeout, execution.id),
+    ]);
+    execution.state = ToolExecutionState.Success;
+    this.emitResult(execution.id, result);
+  } catch (error) {
+    execution.state = ToolExecutionState.Error;
+    execution.error = error as Error;
+    this.emitError(execution.id, execution.error);
+  }
+}
+```
+
+**设计意图**：
+
+1. **竞速模式**：`Promise.race` 简洁实现超时控制，无需手动清理定时器
+2. **状态原子性**：状态变更与结果发射同步进行
+3. **错误统一**：超时错误与普通执行错误统一处理，简化上层逻辑
+
+<details>
+<summary>查看完整实现（含队列管理）</summary>
+
+```typescript
+// packages/core/src/mcp/scheduler.ts:80-150
 export class ToolScheduler {
   private executions: Map<string, ToolExecution> = new Map();
   private queue: string[] = [];
@@ -402,25 +455,29 @@ export class ToolScheduler {
       this.emitError(execution.id, execution.error);
     }
   }
+
+  private createTimeoutPromise(timeout: number, id: string): Promise<never> {
+    return new Promise((_, reject) => {
+      setTimeout(() => {
+        reject(new TimeoutError(`Tool execution ${id} timed out after ${timeout}ms`));
+      }, timeout);
+    });
+  }
 }
 ```
 
-**代码要点**：
-
-1. **双层状态管理**：`executions` Map 存储所有执行记录，`queue` 数组管理待执行队列
-2. **竞速实现**：`Promise.race` 简洁实现超时控制，无需手动清理定时器
-3. **错误统一**：超时错误与普通执行错误统一处理，简化上层逻辑
+</details>
 
 ### 5.3 关键调用链
 
 ```text
-schedule()                    [scheduler.ts:80]
-  -> validatePermission()     [scheduler.ts:120]
-  -> processQueue()           [scheduler.ts:180]
-    -> execute()              [scheduler.ts:200]
-      -> Promise.race()       [scheduler.ts:276]
+schedule()                    [packages/core/src/mcp/scheduler.ts:80]
+  -> validatePermission()     [packages/core/src/mcp/scheduler.ts:120]
+  -> processQueue()           [packages/core/src/mcp/scheduler.ts:180]
+    -> execute()              [packages/core/src/mcp/scheduler.ts:200]
+      -> Promise.race()       [packages/core/src/mcp/scheduler.ts:276]
         - callTool()          [实际工具调用]
-        - createTimeoutPromise() [scheduler.ts:298]
+        - createTimeoutPromise() [packages/core/src/mcp/scheduler.ts:298]
           - setTimeout()      [定时器]
 ```
 
@@ -443,7 +500,7 @@ schedule()                    [scheduler.ts:80]
 
 **Gemini CLI 的解决方案**：
 
-- **代码依据**：`gemini-cli/src/mcp/scheduler.ts:276`
+- **代码依据**：`packages/core/src/mcp/scheduler.ts:276`
 - **设计意图**：通过 Promise.race 让超时与执行天然竞速，避免复杂的定时器管理
 - **带来的好处**：
   - 代码简洁，无需手动清理 setTimeout
@@ -455,12 +512,32 @@ schedule()                    [scheduler.ts:80]
 
 ### 6.3 与其他项目的对比
 
+```mermaid
+gitGraph
+    commit id: "基础超时"
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "Promise.race+状态机"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "resetTimeoutOnProgress"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "CancellationToken"
+    checkout main
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "Checkpoint超时回滚"
+```
+
 | 项目 | 核心差异 | 适用场景 |
 |-----|---------|---------|
-| Gemini CLI | Promise.race + 状态机 | 需要清晰状态追踪和可控取消 |
-| OpenCode | resetTimeoutOnProgress 动态续期 | 长时间任务需要进度反馈续期 |
-| Codex | CancellationToken 信号传递 | Rust 生态，强类型取消信号 |
-| Kimi CLI | 基于 Checkpoint 的超时回滚 | 需要超时后状态恢复 |
+| **Gemini CLI** | Promise.race + 状态机 | 需要清晰状态追踪和可控取消 |
+| **OpenCode** | resetTimeoutOnProgress 动态续期 | 长时间任务需要进度反馈续期 |
+| **Codex** | CancellationToken 信号传递 | Rust 生态，强类型取消信号 |
+| **Kimi CLI** | 基于 Checkpoint 的超时回滚 | 需要超时后状态恢复 |
 
 ---
 
@@ -478,7 +555,7 @@ schedule()                    [scheduler.ts:80]
 
 ### 7.2 超时/资源限制
 
-**超时 Promise 实现**（`gemini-cli/src/mcp/scheduler.ts:298-304`）
+**超时 Promise 实现**（`packages/core/src/mcp/scheduler.ts:298-304`）
 
 ```typescript
 private createTimeoutPromise(timeout: number, id: string): Promise<never> {
@@ -504,15 +581,15 @@ private createTimeoutPromise(timeout: number, id: string): Promise<never> {
 
 | 功能 | 文件 | 行号 | 说明 |
 |-----|------|------|------|
-| 配置定义 | `gemini-cli/src/mcp/config.ts` | 15-35 | MCPServerConfig 接口 |
-| 超时初始化 | `gemini-cli/src/mcp/server.ts` | 40-60 | 默认 600000ms |
-| 调度入口 | `gemini-cli/src/mcp/scheduler.ts` | 80 | schedule() 方法 |
-| 执行核心 | `gemini-cli/src/mcp/scheduler.ts` | 120 | execute() 方法 |
-| 超时竞速 | `gemini-cli/src/mcp/scheduler.ts` | 276 | Promise.race |
-| 超时 Promise | `gemini-cli/src/mcp/scheduler.ts` | 298 | createTimeoutPromise |
-| 取消实现 | `gemini-cli/src/mcp/scheduler.ts` | 347 | cancelAll() |
-| 状态定义 | `gemini-cli/src/mcp/types.ts` | 20-50 | ToolExecutionState 枚举 |
-| 客户端取消 | `gemini-cli/src/mcp/client.ts` | 200-250 | cancelAll() 封装 |
+| 配置定义 | `packages/core/src/mcp/config.ts` | 15-35 | MCPServerConfig 接口 |
+| 超时初始化 | `packages/core/src/mcp/server.ts` | 40-60 | 默认 600000ms |
+| 调度入口 | `packages/core/src/mcp/scheduler.ts` | 80 | schedule() 方法 |
+| 执行核心 | `packages/core/src/mcp/scheduler.ts` | 120 | execute() 方法 |
+| 超时竞速 | `packages/core/src/mcp/scheduler.ts` | 276 | Promise.race |
+| 超时 Promise | `packages/core/src/mcp/scheduler.ts` | 298 | createTimeoutPromise |
+| 取消实现 | `packages/core/src/mcp/scheduler.ts` | 347 | cancelAll() |
+| 状态定义 | `packages/core/src/mcp/types.ts` | 20-50 | ToolExecutionState 枚举 |
+| 客户端取消 | `packages/core/src/mcp/client.ts` | 200-250 | cancelAll() 封装 |
 
 ---
 
@@ -524,6 +601,5 @@ private createTimeoutPromise(timeout: number, id: string): Promise<never> {
 
 ---
 
-*✅ Verified: 基于 gemini-cli/src/mcp/scheduler.ts 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
-
+*✅ Verified: 基于 gemini-cli/packages/core/src/mcp/scheduler.ts 等源码分析*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

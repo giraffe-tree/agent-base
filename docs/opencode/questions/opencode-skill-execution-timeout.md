@@ -1,10 +1,31 @@
 # OpenCode Skill 执行超时机制
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | `docs/opencode/04-opencode-agent-loop.md`、`docs/opencode/06-opencode-mcp-integration.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Skill 执行超时机制是 OpenCode 中用于控制工具执行时长的核心机制，通过**毫秒级超时参数**和**动态超时重置**确保长时间运行的任务不会被误判为超时。
 
 OpenCode 的核心取舍：**毫秒级精度 + resetTimeoutOnProgress 动态重置**（对比其他项目的秒级固定超时）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 超时精度 | 毫秒级配置，支持精细控制 | `packages/opencode/src/tool/bash.ts:83` |
+| 动态重置 | resetTimeoutOnProgress 支持长任务 | `packages/opencode/src/mcp/index.ts:142-143` |
+| 进程终止 | killTree 终止整个进程树 | `packages/opencode/src/tool/bash.ts:211` |
+| 超时缓冲 | +100ms 避免边界条件误判 | `packages/opencode/src/tool/bash.ts:225-228` |
+| 默认超时 | 2 分钟（可环境变量配置） | `packages/opencode/src/tool/bash.ts:22` |
 
 ---
 
@@ -654,6 +675,10 @@ gitGraph
     branch "Gemini CLI"
     checkout "Gemini CLI"
     commit id: "Scheduler 超时控制"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "Rust 异步超时"
 ```
 
 | 项目 | 核心差异 | 适用场景 |
@@ -662,6 +687,17 @@ gitGraph
 | Kimi CLI | 命令级超时配置，通过参数传递 | 灵活配置单个命令超时 |
 | Gemini CLI | Scheduler 层统一超时控制 | 集中管理所有工具超时 |
 | Codex | 基于 Rust 的异步超时 | 高性能 + 系统级资源控制 |
+| SWE-agent | 无显式超时，依赖 shell 超时 | 简单场景，快速原型 |
+
+**详细对比**：
+
+| 特性 | OpenCode | Kimi CLI | Gemini CLI | Codex |
+|-----|----------|----------|-----------|-------|
+| 超时精度 | 毫秒级 | 秒级 | 毫秒级 | 毫秒级 |
+| 动态重置 | resetTimeoutOnProgress | 不支持 | 不支持 | 不支持 |
+| 配置方式 | 工具参数 + 环境变量 | 命令参数 | Scheduler 配置 | 代码配置 |
+| 进程终止 | killTree | 进程组终止 | 任务取消 | 沙箱终止 |
+| 默认超时 | 2 分钟 | 10 分钟 | 5 分钟 | 30 秒 |
 
 **对比分析**：
 
@@ -741,4 +777,4 @@ const DEFAULT_TIMEOUT = 30_000  // 30 秒
 ---
 
 *✅ Verified: 基于 opencode/packages/opencode/src/tool/bash.ts:78-274 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

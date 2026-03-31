@@ -1,10 +1,32 @@
 # Logging（OpenCode）
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `01-opencode-overview.md`、`02-opencode-cli-entry.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Logging 是 OpenCode 的日志记录机制，采用 **Bun-native 零依赖自定义实现**，通过 Zod 类型安全和 Key=value 结构化格式实现高性能日志系统。
 
 OpenCode 的核心取舍：**零依赖自定义实现**（对比 Kimi CLI 的 loguru、Codex 的 tracing、Gemini CLI 的 winston）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 日志框架 | Bun-native 零依赖自定义实现 | `opencode/packages/opencode/src/util/log.ts:1` |
+| 类型安全 | Zod 定义日志级别和配置 | `opencode/packages/opencode/src/util/log.ts:9` |
+| 输出格式 | Key=value 结构化格式 | `opencode/packages/opencode/src/util/log.ts:111` |
+| 日志轮转 | 数量-based 策略（保留10个） | `opencode/packages/opencode/src/util/log.ts:80` |
+| 性能测量 | 内置 time() 计时工具 | `opencode/packages/opencode/src/util/log.ts:157` |
+| 输出模式 | print/file 二选一 | `opencode/packages/opencode/src/util/log.ts:60` |
 
 ---
 

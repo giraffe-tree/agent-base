@@ -1,10 +1,31 @@
 # Kimi CLI 上下文压缩机制
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-35 分钟 |
+> | 前置文档 | `docs/kimi-cli/04-kimi-cli-agent-loop.md`、`docs/kimi-cli/07-kimi-cli-memory-context.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 **一句话定义**：Context Compaction 是 AI Coding Agent 解决上下文窗口超限的核心机制，通过将历史消息压缩为摘要来释放 token 预算。
 
 Kimi CLI 的核心取舍：**SimpleCompaction 策略 + 强制保留最近 N 条消息**（对比 Gemini CLI 的两阶段验证压缩、Codex 的渐进式截断兜底）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 压缩策略 | SimpleCompaction：保留最近 N 条，压缩更早历史 | `kimi-cli/src/kimi_cli/soul/compaction.py:42` |
+| 触发条件 | `token_count + reserved >= max_context_size` | `kimi-cli/src/kimi_cli/soul/kimisoul.py:342` |
+| LLM 调用 | 使用 kosong.step() + EmptyToolset 生成摘要 | `kimi-cli/src/kimi_cli/soul/compaction.py:54` |
+| 保留策略 | 默认保留最近 2 条 user/assistant 消息 | `kimi-cli/src/kimi_cli/soul/compaction.py:43` |
+| 失败处理 | 返回原始消息，安全回退 | `kimi-cli/src/kimi_cli/soul/compaction.py:96-97` |
 
 ---
 
@@ -626,43 +647,27 @@ _agent_loop()                    [kimisoul.py:302]
 ### 6.3 与其他项目的对比
 
 ```mermaid
-flowchart LR
-    subgraph Kimi["Kimi CLI"]
-        K1[单次生成]
-        K2[保留最近 N 条]
-        K3[无验证]
-        K4[EmptyToolset]
-    end
-
-    subgraph Gemini["Gemini CLI"]
-        G1[两阶段验证]
-        G2[Reverse Budget]
-        G3[独立工具预算]
-    end
-
-    subgraph Codex["Codex"]
-        C1[单次生成]
-        C2[渐进式截断兜底]
-        C3[统一处理]
-    end
-
-    subgraph SWE["SWE-agent"]
-        S1[无 LLM 压缩]
-        S2[滑动窗口]
-        S3[History Processors]
-    end
-
-    subgraph OpenCode["OpenCode"]
-        O1[Compaction + Prune]
-        O2[专用 CompactionAgent]
-        O3[Part 级别裁剪]
-    end
-
-    style Kimi fill:#e1f5e1
-    style Gemini fill:#fff3cd
-    style Codex fill:#d1ecf1
-    style SWE fill:#f8d7da
-    style OpenCode fill:#d4edda
+gitGraph
+    commit id: "传统方案: 截断"
+    branch "Kimi CLI"
+    checkout "Kimi CLI"
+    commit id: "SimpleCompaction + 保留N条"
+    checkout main
+    branch "Gemini CLI"
+    checkout "Gemini CLI"
+    commit id: "两阶段验证压缩"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "渐进式截断兜底"
+    checkout main
+    branch "OpenCode"
+    checkout "OpenCode"
+    commit id: "Compaction + Prune"
+    checkout main
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "滑动窗口"
 ```
 
 | 项目 | 核心差异 | 适用场景 |
@@ -750,7 +755,7 @@ async def _compact_with_retry() -> Sequence[Message]:
 
 - 前置知识：`docs/kimi-cli/07-kimi-cli-memory-context.md`
 - 相关机制：`docs/kimi-cli/04-kimi-cli-agent-loop.md`
-- D-Mail 机制：`docs/kimi-cli/questions/kimi-cli-dmail-mechanism.md`
+- D-Mail 机制：`docs/kimi-cli/questions/kimi-cli-checkpoint-implementation.md`
 - 跨项目对比：`docs/comm/comm-context-compaction.md`
 - 其他项目：
   - Gemini CLI: `docs/gemini-cli/questions/gemini-cli-context-compaction.md`
@@ -762,4 +767,4 @@ async def _compact_with_retry() -> Sequence[Message]:
 
 *✅ Verified: 基于 kimi-cli/src/kimi_cli/soul/compaction.py、kimisoul.py 等源码分析*
 *⚠️ Inferred: 部分设计意图基于代码结构推断*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

@@ -1,10 +1,31 @@
 # Session 管理（kimi-cli）
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `01-kimi-cli-overview.md`、`02-kimi-cli-cli-entry.md` |
+> | 文档结构 | 速览 → 架构 → 组件 → 数据流 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：kimi-cli 的 Session 是**"基于 checkpoint 的时间可逆执行单元"**，每轮对话前创建 checkpoint，支持随时回退到任意 checkpoint，配合 D-Mail 系统实现"向过去发送消息"的时间旅行功能。
 
 kimi-cli 的核心取舍：**append-only JSONL 日志 + 文件轮转备份 + Checkpoint 回滚**（对比 Codex 的 SQLite + Rollout、Gemini CLI 的 JSON 文件、OpenCode 的 SQLite 三层结构）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 存储格式 | append-only JSONL 日志 | `kimi-cli/src/kimi_cli/soul/context.py:16` |
+| Checkpoint | 嵌入消息流的标记点 | `kimi-cli/src/kimi_cli/soul/context.py:68` |
+| 回滚机制 | 文件轮转 + 历史重放 | `kimi-cli/src/kimi_cli/soul/context.py:80` |
+| 时间旅行 | D-Mail 异常驱动回滚 | `kimi-cli/src/kimi_cli/soul/denwarenji.py:16` |
+| 会话恢复 | --continue 显式恢复 | `kimi-cli/src/kimi_cli/session.py:231` |
 
 ---
 

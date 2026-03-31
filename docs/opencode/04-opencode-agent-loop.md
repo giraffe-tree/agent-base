@@ -1,10 +1,31 @@
 # Agent Loop（OpenCode）
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-35 分钟 |
+> | 前置文档 | `01-opencode-overview.md`、`03-opencode-session-runtime.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Agent Loop 是驱动多轮 LLM 调用与工具执行的循环控制机制，让模型从"一次性回答"变成"多轮迭代执行"。
 
 OpenCode 的核心取舍：**任务驱动的多分支 while 循环 + 流式事件处理**（对比 Kimi CLI 的 Checkpoint 回滚、Gemini CLI 的递归 continuation、Codex 的 Actor 消息驱动）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 核心机制 | while(true) 循环 + 三分支任务调度 | `packages/opencode/src/session/prompt.ts:274` |
+| 状态管理 | DB 实时持久化 + Event Bus 响应式 | `packages/opencode/src/session/processor.ts:26` |
+| 错误处理 | 指数退避重试 + ContextOverflow 压缩 | `packages/opencode/src/session/processor.ts:350-370` |
+| 循环检测 | Doom Loop 检测（最近 3 个 tool 对比） | `packages/opencode/src/session/processor.ts:151-176` |
+| 流式处理 | AI SDK 事件驱动 (for await) | `packages/opencode/src/session/processor.ts:55-348` |
 
 ---
 
@@ -160,6 +181,36 @@ sequenceDiagram
 #### 职责定位
 
 `loop()` 是 OpenCode Agent Loop 的核心编排器，负责：消息流读取、任务分支调度、终止条件判断、上下文压缩触发。
+
+#### 内部数据流
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  输入层                                                      │
+│  ├── 用户消息流 ──► MessageV2.stream()                       │
+│  └── 中止信号   ──► AbortController.signal                  │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  处理层                                                      │
+│  ├── 消息过滤: filterCompacted()                            │
+│  ├── 消息定位: lastUser / lastAssistant / lastFinished      │
+│  ├── 任务提取: tasks (subtask/compaction)                   │
+│  ├── 退出检查: finish reason 判断                           │
+│  ├── 分支处理:                                              │
+│  │   ├── Subtask  ──► TaskTool.execute()                    │
+│  │   ├── Compaction ──► SessionCompaction.process()         │
+│  │   └── Normal    ──► SessionProcessor.process()           │
+│  └── 结果决策: continue / stop / compact                    │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  输出层                                                      │
+│  ├── 更新消息状态 (DB)                                       │
+│  ├── 广播 Bus 事件                                           │
+│  └── 返回最终结果                                            │
+└─────────────────────────────────────────────────────────────┘
+```
 
 #### 状态机图
 
@@ -910,6 +961,10 @@ gitGraph
     branch "Codex"
     checkout "Codex"
     commit id: "Actor 消息驱动"
+    checkout main
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "命令式 + autosubmit"
 ```
 
 | 项目 | 核心差异 | 适用场景 |
@@ -918,18 +973,21 @@ gitGraph
 | Kimi CLI | Checkpoint 回滚机制 | 需要对话状态回滚、错误恢复 |
 | Gemini CLI | 递归 continuation + Scheduler 状态机 | 需要精细的工具调度、并行执行 |
 | Codex | Actor 消息驱动 + 原生沙箱 | 需要高安全性、企业级部署 |
+| SWE-agent | 命令式循环 + 自动提交 | 需要自动化代码修复 |
 
 **详细对比**：
 
-| 特性 | OpenCode | Kimi CLI | Gemini CLI | Codex |
-|-----|----------|----------|------------|-------|
-| 循环模式 | while 迭代 | while 迭代 | 递归 continuation | Actor 消息 |
-| 子 Agent | TaskTool 派发 | 不支持 | 支持 | 不支持 |
-| 上下文压缩 | Compaction + Prune | Checkpoint 回滚 | 上下文保护 | 窗口滑动 |
-| 流式处理 | 是 | 是 | 是 | 是 |
-| Doom Loop 检测 | 是 | 否 | 否 | 否 |
-| 工具并行 | 否 | 是 | 是 | 是 |
-| 状态持久化 | DB 实时 | Checkpoint 文件 | 内存 | 内存 |
+| 特性 | OpenCode | Kimi CLI | Gemini CLI | Codex | SWE-agent |
+|-----|----------|----------|------------|-------|-----------|
+| 循环模式 | while 迭代 | while 迭代 | 递归 continuation | Actor 消息 | while 迭代 |
+| 子 Agent | TaskTool 派发 | 不支持 | 支持 | 不支持 | 不支持 |
+| 上下文压缩 | Compaction + Prune | Checkpoint 回滚 | 上下文保护 | 窗口滑动 | 截断 |
+| 流式处理 | 是 | 是 | 是 | 是 | 否 |
+| Doom Loop 检测 | 是 | 否 | 是 | 否 | 否 |
+| 工具并行 | 否 | 是 | 是 | 是 | 否 |
+| 状态持久化 | DB 实时 | Checkpoint 文件 | 内存 | 内存 | 内存 |
+| 错误恢复 | 指数退避重试 | Checkpoint 回滚 | InvalidStream 恢复 | 错误传播 | forward_with_handling |
+| 最大步数 | 可配置 | 50/turn | 无显式限制 | 可配置 | 无显式限制 |
 
 ---
 

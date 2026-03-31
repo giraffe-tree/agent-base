@@ -1,10 +1,31 @@
 # OpenCode 推理内容保留机制
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | `docs/opencode/04-opencode-agent-loop.md`、`docs/opencode/07-opencode-memory-context.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：推理内容保留机制是 OpenCode 用于**流式增量更新**、**上下文压缩决策**和**长时间任务保护**的核心设计，使 LLM 在长时间运行的会话中保持高效的实时推理能力。
 
 OpenCode 的核心取舍：**完整保留 reasoning-delta 流式数据**（对比其他项目可能直接丢弃或仅保留摘要），通过数据库持久化支持实时 UI 展示、智能压缩决策和 Doom Loop 检测。
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 存储方式 | 完整保留 reasoning-delta | `packages/opencode/src/session/processor.ts:81-94` |
+| 更新策略 | 增量 delta 更新 | `packages/opencode/src/session/processor.ts:86-92` |
+| 内存管理 | reasoningMap 临时缓存 | `packages/opencode/src/session/processor.ts:52` |
+| 压缩决策 | 基于完整历史内容 | `packages/opencode/src/session/compaction.ts:32-48` |
+| 超时保护 | resetTimeoutOnProgress | `packages/opencode/src/mcp/index.ts:142` |
 
 ---
 
@@ -599,16 +620,20 @@ SessionProcessor.process()     [processor.ts:45]
 gitGraph
     commit id: "传统方案: 仅保留最终输出"
     branch "OpenCode"
-    checkout OpenCode
+    checkout "OpenCode"
     commit id: "完整保留 reasoning-delta"
     checkout main
     branch "Kimi CLI"
-    checkout Kimi CLI
+    checkout "Kimi CLI"
     commit id: "Checkpoint + 消息历史"
     checkout main
     branch "Gemini CLI"
-    checkout Gemini CLI
+    checkout "Gemini CLI"
     commit id: "递归 continuation + 摘要"
+    checkout main
+    branch "Codex"
+    checkout "Codex"
+    commit id: "Actor 消息驱动"
 ```
 
 | 项目 | 核心差异 | 推理内容处理 | 适用场景 |
@@ -617,6 +642,17 @@ gitGraph
 | Kimi CLI | Checkpoint 回滚机制 | 推理内容随消息历史保留 | 需要对话回滚和状态恢复 |
 | Gemini CLI | 递归 continuation | 推理内容在 continuation 中传递 | 多轮复杂任务分解 |
 | Codex | Actor 消息驱动 | 依赖具体 provider 实现 | 企业级安全沙箱环境 |
+| SWE-agent | 无显式推理保留 | 仅保留工具调用和结果 | 简单场景，关注结果 |
+
+**详细对比**：
+
+| 特性 | OpenCode | Kimi CLI | Gemini CLI | Codex |
+|-----|----------|----------|-----------|-------|
+| 推理保留 | 完整 delta 流 | 随消息历史 | continuation 传递 | Provider 依赖 |
+| 实时展示 | 支持 | 不支持 | 不支持 | 不支持 |
+| 存储方式 | SQLite 增量 | Checkpoint 文件 | 内存传递 | 消息队列 |
+| 压缩决策 | 基于完整内容 | 基于摘要 | 基于 truncation | 基于配置 |
+| Doom Loop | 支持检测 | 不支持 | 不支持 | 不支持 |
 
 **关键差异分析**：
 
@@ -698,4 +734,4 @@ return client.callTool(
 ---
 
 *✅ Verified: 基于 opencode/packages/opencode/src/session/processor.ts:81-94 等源码分析*
-*基于版本：2026-02-08 | 最后更新：2026-02-24*
+*基于版本：2026-02-08 | 最后更新：2026-03-03*

@@ -1,10 +1,31 @@
 # Kimi CLI 如何避免 Tool 无限循环调用
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 15-20 分钟 |
+> | 前置文档 | `docs/kimi-cli/04-kimi-cli-agent-loop.md` |
+> | 文档结构 | 结论 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 Kimi CLI 通过**硬上限（max_steps_per_turn）+ 有限重试（max_retries_per_step）+ D-Mail 显式回退**三层机制防止 tool 无限循环。
 
 Kimi CLI 的核心取舍：**简单计数限制 + 工具驱动的显式状态回滚**（对比 Gemini CLI 的智能检测、Codex 的审批介入、SWE-agent 的 Autosubmit）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| Step 上限 | 单次 turn 最大 100 步，硬限制 | `src/kimi_cli/config.py:71` |
+| 重试机制 | 每步最多 3 次重试，指数退避 | `src/kimi_cli/config.py:77` |
+| 可重试错误 | 白名单机制（网络/5xx 错误） | `src/kimi_cli/soul/kimisoul.py:508-517` |
+| 状态回滚 | Checkpoint + D-Mail 显式触发 | `src/kimi_cli/soul/kimisoul.py:377-380` |
+| 循环检测 | 无智能检测，依赖硬限制 | - |
 
 ---
 
@@ -718,4 +739,5 @@ max_retries_per_step: int = Field(default=3, ge=1)  # 至少 1 次重试
 ---
 
 *✅ Verified: 基于 kimi-cli/src/kimi_cli/config.py:68-84、kimi-cli/src/kimi_cli/soul/kimisoul.py:302-540、kimi-cli/src/kimi_cli/soul/denwarenji.py:1-40 源码分析*
+
 *基于版本：kimi-cli (baseline 2026-02-08) | 最后更新：2026-02-24*

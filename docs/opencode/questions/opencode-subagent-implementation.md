@@ -1,8 +1,31 @@
 # OpenCode Subagent/Task Implementation
 
+> 📋 **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 20-25 分钟 |
+> | 前置文档 | `docs/opencode/04-opencode-agent-loop.md`、`docs/opencode/07-opencode-memory-context.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
-OpenCode 通过 **`task` 工具** 实现子代理（Subagent）功能，允许主代理动态创建具有独立会话、权限和工具集的子代理来并行处理复杂任务；核心设计取舍是**会话级隔离 + 权限继承控制**（对比 Kimi CLI 的 Checkpoint 回滚、Gemini CLI 的递归 continuation）。
+一句话定义：OpenCode 通过 **`task` 工具** 实现子代理（Subagent）功能，允许主代理动态创建具有独立会话、权限和工具集的子代理来并行处理复杂任务。
+
+OpenCode 的核心取舍：**会话级隔离 + 权限继承控制**（对比 Kimi CLI 的 Checkpoint 回滚、Gemini CLI 的递归 continuation、Codex 的 Actor 模型）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 子代理模型 | Task 工具创建独立 Session | `packages/opencode/src/tool/task.ts:45` |
+| 权限控制 | 运行时 PermissionNext.evaluate | `packages/opencode/src/tool/task.ts:50-58` |
+| 会话关联 | parentID 建立父子关系 | `packages/opencode/src/tool/task.ts:84` |
+| 嵌套控制 | 可选禁止嵌套 task | `packages/opencode/src/tool/task.ts:90` |
+| 代理类型 | primary/subagent/all 三种模式 | `packages/opencode/src/agent/agent.ts:76-203` |
 
 ---
 
@@ -143,6 +166,19 @@ stateDiagram-v2
     Error --> [*]: 返回错误
     Denied --> [*]: 抛出权限错误
 ```
+
+**状态说明**：
+
+| 状态 | 说明 | 进入条件 | 退出条件 |
+|-----|------|---------|---------|
+| Idle | 空闲等待 | 工具初始化 | 收到 task 调用 |
+| PermissionCheck | 权限检查 | 收到 task 调用 | 权限判定完成 |
+| SessionLookup | 会话查找 | 权限通过 | 确定会话策略 |
+| ResumeSession | 恢复会话 | task_id 存在且有效 | 开始执行 |
+| CreateSession | 创建会话 | task_id 不存在 | 会话创建完成 |
+| ExecutePrompt | 执行提示 | 会话就绪 | 执行完成 |
+| Success | 成功 | 执行成功 | 返回结果 |
+| Error | 错误 | 执行失败 | 返回错误 |
 
 #### 内部数据流
 
@@ -354,7 +390,7 @@ sequenceDiagram
 | 阶段 | 输入 | 处理 | 输出 | 代码位置 |
 |-----|------|------|------|---------|
 | 接收 | task 工具参数 | 验证参数合法性 | 结构化参数 | `task.ts:45` |
-| 权限 | subagent_type + caller 权限 | PermissionNext.evaluate | allow/ask/deny | `task.ts:31-34` |
+| 权限 | subagent_type + caller 权限 | PermissionNext.evaluate | allow/ask/deny | `task.ts:50-58` |
 | 会话 | parentID + title + permission | Session.create | 子会话 Info | `task.ts:66-102` |
 | 执行 | prompt + model + tools | SessionPrompt.prompt | 消息 parts | `task.ts:128-143` |
 | 输出 | 子代理返回 parts | 提取最后文本 | task_id + 结果 | `task.ts:145-162` |
@@ -550,13 +586,13 @@ SessionPrompt.loop()           [prompt.ts:350]
 
 **OpenCode 的解决方案**：
 
-- 代码依据：`packages/opencode/src/tool/task.ts:66-102`
-- 设计意图：通过数据库级会话隔离 + 权限继承，实现"沙盒子代理"
-- 带来的好处：
+- **代码依据**：`packages/opencode/src/tool/task.ts:66-102`
+- **设计意图**：通过数据库级会话隔离 + 权限继承，实现"沙盒子代理"
+- **带来的好处**：
   - 子代理崩溃不影响主代理
   - 子代理权限可被严格限制（如 explore 只有只读权限）
   - 父子关系清晰，支持级联操作
-- 付出的代价：
+- **付出的代价**：
   - 每个子代理需要独立的数据库会话
   - 结果传递通过文本，大数据量需截断处理
 
@@ -588,6 +624,23 @@ gitGraph
 | Kimi CLI | Checkpoint 回滚机制，D-Mail 状态传递 | 需要状态回滚的复杂任务 |
 | Gemini CLI | 递归 continuation，单层架构 | 状态管理简单，偏好函数式风格 |
 | Codex | Rust 沙箱 + TypeScript Agent | 企业级安全要求 |
+| SWE-agent | 无显式子代理，依赖 shell 脚本 | 简单场景，快速原型 |
+
+**详细对比**：
+
+| 特性 | OpenCode | Kimi CLI | Gemini CLI | Codex |
+|-----|----------|----------|-----------|-------|
+| 子代理模型 | Task 工具 + Session 隔离 | Checkpoint + 命令式 | 递归 continuation | Actor 模型 |
+| 权限控制 | 运行时规则引擎 | 配置文件 | 无显式控制 | 沙箱隔离 |
+| 会话管理 | parentID 层级 | Checkpoint 文件 | 无（单层） | 进程隔离 |
+| 嵌套支持 | 可选禁止 | 支持 | 递归自然支持 | 消息传递 |
+| 结果传递 | 文本返回 | D-Mail | continuation 参数 | 消息返回 |
+
+**对比分析**：
+
+- **vs Kimi CLI**：Kimi 使用 Checkpoint 文件实现状态回滚，OpenCode 使用数据库会话隔离，两者都支持子任务但侧重点不同
+- **vs Gemini CLI**：Gemini 的递归 continuation 是函数式风格，OpenCode 的 Task 工具是命令式风格，更直观易理解
+- **vs Codex**：Codex 的 Actor 模型提供更强的隔离性，但 OpenCode 的 Session 隔离更轻量，适合快速迭代
 
 ---
 
@@ -644,9 +697,12 @@ steps: z.number().int().positive().optional(),  // 子代理最大步数
 - 前置知识：`docs/opencode/04-opencode-agent-loop.md`
 - 相关机制：`docs/opencode/07-opencode-memory-context.md`
 - 深度分析：`docs/opencode/questions/opencode-permission-system.md`
-- 跨项目对比：`docs/comm/comm-subagent-comparison.md` (如存在)
+- 跨项目对比：
+  - `docs/kimi-cli/04-kimi-cli-agent-loop.md`
+  - `docs/gemini-cli/04-gemini-cli-agent-loop.md`
+  - `docs/codex/04-codex-agent-loop.md`
 
 ---
 
 *✅ Verified: 基于 opencode/packages/opencode/src/tool/task.ts:27-165 等源码分析*
-*基于版本：2026-02-08 baseline | 最后更新：2026-02-24*
+*基于版本：2026-02-08 baseline | 最后更新：2026-03-03*

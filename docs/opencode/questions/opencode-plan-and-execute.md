@@ -1,10 +1,31 @@
 # OpenCode Plan and Execute 模式
 
+> **阅读指南**
+>
+> | 属性 | 说明 |
+> |-----|------|
+> | 预计阅读 | 25-35 分钟 |
+> | 前置文档 | `docs/opencode/04-opencode-agent-loop.md`、`docs/opencode/06-opencode-mcp-integration.md` |
+> | 文档结构 | 速览 → 架构 → 机制 → 实现 → 对比 |
+> | 代码呈现 | 关键代码直接展示，完整代码可折叠查看 |
+
+---
+
 ## TL;DR（结论先行）
 
 一句话定义：Plan and Execute 是一种**双 Agent 架构模式**，通过权限隔离将"规划阶段"与"执行阶段"分离，确保在充分理解需求并制定详细计划后再进行修改。
 
-OpenCode 的核心取舍：**显式模式切换 + 权限强制隔离**（对比其他项目的隐式规划或单 Agent 模式）
+OpenCode 的核心取舍：**显式模式切换 + 权限强制隔离**（对比 Gemini CLI 的隐式规划、Kimi CLI 的 Checkpoint 回滚、Codex 的审批模式）
+
+### 核心要点速览
+
+| 维度 | 关键决策 | 代码位置 |
+|-----|---------|---------|
+| 模式实现 | 双 Agent（build + plan）+ 权限隔离 | `opencode/packages/opencode/src/agent/agent.ts:77-114` |
+| 切换机制 | 显式工具调用 + 用户确认 | `opencode/packages/opencode/src/tool/plan.ts:75-130` |
+| 权限控制 | Plan Agent 禁止 edit（计划文件除外） | `opencode/packages/opencode/src/agent/agent.ts:92-114` |
+| 规划流程 | 五阶段工作流（探索→设计→审查→写入→退出） | `opencode/packages/opencode/src/session/prompt.ts:1392-1452` |
+| 子代理并行 | Phase 1 最多 3 个 explore agents | `opencode/packages/opencode/src/session/prompt.ts:1397` |
 
 ---
 
@@ -866,14 +887,19 @@ gitGraph
     branch "Codex"
     checkout "Codex"
     commit id: "Approval模式"
+    checkout main
+    branch "SWE-agent"
+    checkout "SWE-agent"
+    commit id: "隐式规划+错误处理"
 ```
 
-| 项目 | 核心差异 | 适用场景 |
-|-----|---------|---------|
-| OpenCode | 显式双 Agent + 权限强制隔离 + 五阶段工作流 | 需要严格规划的大型重构任务 |
-| Kimi CLI | Checkpoint 文件系统回滚，无显式 Plan Mode | 需要频繁试错和回滚的场景 |
-| Gemini CLI | 隐式规划，通过提示词引导 | 快速迭代、轻量级规划 |
-| Codex | 基于审批的模式（ask/allow） | 企业安全环境，人工审批流程 |
+| 项目 | 规划模式 | 权限控制 | 用户介入 | 适用场景 |
+|-----|---------|---------|---------|---------|
+| **OpenCode** | 显式双 Agent + 五阶段工作流 | Agent 级别隔离 | 模式切换确认 | 需要严格规划的大型重构任务 |
+| **Kimi CLI** | 隐式规划 | Checkpoint 回滚 | 回滚确认 | 需要频繁试错和回滚的场景 |
+| **Gemini CLI** | 隐式规划 + 提示词引导 | 无特殊隔离 | 无 | 快速迭代、轻量级规划 |
+| **Codex** | 单 Agent + 审批模式 | 操作级别审批 | 每操作确认 | 企业安全环境，人工审批流程 |
+| **SWE-agent** | 隐式规划 | 无特殊隔离 | 错误处理 | 研究/实验场景 |
 
 **关键差异分析**：
 
@@ -888,6 +914,10 @@ gitGraph
 3. **OpenCode vs Codex**：
    - OpenCode 的权限控制是 Agent 级别的（Plan Agent 完全禁止编辑）
    - Codex 的权限控制是操作级别的（每个操作可配置 ask/allow/deny）
+
+4. **OpenCode vs SWE-agent**：
+   - OpenCode 提供显式规划阶段，强制结构化思考
+   - SWE-agent 依赖隐式规划，通过 `forward_with_handling` 处理错误
 
 ---
 
