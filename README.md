@@ -33,7 +33,6 @@
 
 - Ink 终端 React 组件化 UI
 - 统一 `query()` AsyncGenerator 驱动
-- 多层上下文压缩 (MicroCompact/AutoCompact/Collapse)
 
 📄 [概览](./docs/claude-code/01-claude-code-overview.md) · [Agent Loop](./docs/claude-code/04-claude-code-agent-loop.md) · [Memory](./docs/claude-code/07-claude-code-memory-context.md)
 
@@ -44,7 +43,6 @@
 > *适合研究: 企业级安全机制*
 
 - 完善的安全沙箱和权限分级
-- 支持 OpenAI / Azure OpenAI 提供商
 - **推荐入门首选**
 
 📄 [概览](./docs/codex/01-codex-overview.md) · [循环](./docs/codex/04-codex-agent-loop.md) · [MCP](./docs/codex/06-codex-mcp-integration.md)
@@ -56,7 +54,6 @@
 > *适合研究: 内存管理和上下文策略*
 
 - 三层分层内存架构
-- JIT 子目录懒加载
 - 状态机驱动的调度器
 
 📄 [概览](./docs/gemini-cli/01-gemini-cli-overview.md) · [循环](./docs/gemini-cli/04-gemini-cli-agent-loop.md) · [内存](./docs/gemini-cli/07-gemini-cli-memory-context.md)
@@ -67,8 +64,7 @@
 **🌙 Kimi CLI** (Python)
 > *适合研究: 状态持久化和回滚*
 
-- D-Mail 时间旅行机制
-- Checkpoint 完整实现
+- Checkpoint 完整实现（时间旅行）
 - 命令级撤销/重做
 
 📄 [概览](./docs/kimi-cli/01-kimi-cli-overview.md) · [循环](./docs/kimi-cli/04-kimi-cli-agent-loop.md) · [Checkpoint](./docs/kimi-cli/07-kimi-cli-memory-context.md)
@@ -83,7 +79,6 @@
 
 - Vercel AI SDK 架构
 - 流式响应处理
-- 超时和进度管理
 
 📄 [概览](./docs/opencode/01-opencode-overview.md) · [循环](./docs/opencode/04-opencode-agent-loop.md) · [MCP](./docs/opencode/06-opencode-mcp-integration.md)
 
@@ -95,7 +90,6 @@
 
 - 可配置 History Processors
 - 专为软件工程任务设计
-- 丰富的实验追踪
 
 📄 [概览](./docs/swe-agent/01-swe-agent-overview.md) · [循环](./docs/swe-agent/04-swe-agent-agent-loop.md) · [Prompt](./docs/swe-agent/11-swe-agent-prompt-organization.md)
 
@@ -105,8 +99,7 @@
 **🎯 Qwen Code** (TypeScript)
 > *适合研究: 工程化架构与循环检测*
 
-- 基于 Gemini CLI 的架构演进
-- 完善的循环检测服务 (LoopDetectionService)
+- 完善的循环检测服务
 - 结构化 Agent 设计模式
 
 📄 [概览](./docs/qwen-code/01-qwen-code-overview.md) · [循环](./docs/qwen-code/04-qwen-code-agent-loop.md) · [MCP](./docs/qwen-code/06-qwen-code-mcp-integration.md)
