@@ -775,7 +775,7 @@ context.setAppState(prev => {
 flowchart TD
     subgraph Codex["Codex"]
         C1[/plan 命令] --> C2[ModeKind::Plan]
-        C2 --> C3[<proposed_plan> XML]
+        C2 --> C3["<proposed_plan> XML"]
         C3 --> C4[用户确认]
         C4 --> C5[ModeKind::Default]
     end

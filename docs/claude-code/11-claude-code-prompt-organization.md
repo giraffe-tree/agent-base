@@ -451,7 +451,7 @@ flowchart LR
     end
 
     subgraph Boundary["边界"]
-        B1[__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__]
+        B1["__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"]
     end
 
     subgraph Dynamic["动态层（会话特定）"]
@@ -462,7 +462,7 @@ flowchart LR
     end
 
     subgraph Output["输出层"]
-        O1[string[]] --> O2[API 请求]
+        O1["string[]"] --> O2["API 请求"]
     end
 
     I1 --> Static

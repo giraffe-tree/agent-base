@@ -585,7 +585,7 @@ flowchart LR
 
     subgraph Output["输出"]
         O1[ConversationRecord]
-        O2[Content[] for API]
+        O2["Content[] for API"]
     end
 
     I1 --> R1

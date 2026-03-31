@@ -212,7 +212,7 @@ flowchart TD
     F --> H{还有更多?}
     G --> H
     H -->|是| B
-    H -->|否| I[返回 Batch[]]
+    H -->|否| I["返回 Batch[]"]
 
     style D fill:#90EE90
     style E fill:#87CEEB

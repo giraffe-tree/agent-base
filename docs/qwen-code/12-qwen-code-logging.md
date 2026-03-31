@@ -503,7 +503,7 @@ flowchart LR
     subgraph Storage["存储层"]
         St1[debug.log]
         St2[内存指标]
-        St3[<session>.jsonl]
+        St3["<session>.jsonl"]
     end
 
     subgraph Consumer["消费者"]

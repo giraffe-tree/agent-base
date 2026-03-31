@@ -628,7 +628,7 @@ flowchart LR
     end
 
     subgraph Storage["存储层"]
-        S1[history: Content[]]
+        S1["history: Content[]"]
         S2[lastSentIdeContext]
     end
 

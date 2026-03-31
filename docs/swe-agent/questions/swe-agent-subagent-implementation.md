@@ -373,7 +373,7 @@ sequenceDiagram
 flowchart LR
     subgraph Input["输入阶段"]
         I1[ProblemStatement] --> I2[RetryLoopConfig]
-        I2 --> I3[AgentConfig[]]
+        I2 --> I3["AgentConfig[]"]
     end
 
     subgraph Attempts["尝试阶段（串行）"]

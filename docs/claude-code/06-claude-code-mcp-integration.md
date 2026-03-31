@@ -224,7 +224,7 @@ const MAX_BACKOFF_MS = 30000
 ```mermaid
 flowchart LR
     A[MCP Tool] --> B[buildMcpToolName]
-    B --> C[生成 mcp__server__tool 名称]
+    B --> C["生成 mcp__server__tool 名称"]
     C --> D[合并 MCPTool 模板]
     D --> E[覆盖属性]
     E --> F[内部 Tool 对象]
