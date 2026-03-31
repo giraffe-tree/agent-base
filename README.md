@@ -154,7 +154,7 @@
 | [swe-agent](./docs/swe-agent/) | 12 | 11 | [概览](./docs/swe-agent/01-swe-agent-overview.md) / [Loop](./docs/swe-agent/04-swe-agent-agent-loop.md) / [Tools](./docs/swe-agent/05-swe-agent-tools-system.md) |
 | [qwen-code](./docs/qwen-code/) | 12 | 4 | [概览](./docs/qwen-code/01-qwen-code-overview.md) / [Loop](./docs/qwen-code/04-qwen-code-agent-loop.md) / [Safety](./docs/qwen-code/10-qwen-code-safety-control.md) |
 | [cursor](./docs/cursor/) | 1 | 2 | [Checkpoint 映射](./docs/cursor/questions/cursor-checkpoint-official-description-and-state-vscdb-mapping.md) / [state.vscdb 分析](./docs/cursor/questions/cursor-state-vscdb-checkpoint-analysis.md) |
-| [claude](./docs/claude/) | 0 | 1 | [消息上下文保留](./docs/claude/questions/claude-message-context-retention.md) |
+| [claude](docs/claude-code/) | 0 | 1 | [消息上下文保留](docs/claude-code/questions/claude-message-context-retention.md) |
 
 > 完整目录导航请看：[`_sidebar.md`](./_sidebar.md)
 
@@ -171,7 +171,7 @@
 | Plan and Execute | [跨项目总览](./docs/comm/comm-plan-and-execute.md) / [Codex](./docs/codex/questions/codex-plan-and-execute.md) / [Gemini CLI](./docs/gemini-cli/questions/gemini-cli-plan-and-execute.md) / [Kimi CLI](./docs/kimi-cli/questions/kimi-cli-plan-and-execute.md) / [OpenCode](./docs/opencode/questions/opencode-plan-and-execute.md) / [SWE-agent](./docs/swe-agent/questions/swe-agent-plan-and-execute.md) |
 | Checkpoint 与回滚 | [Kimi 实现](./docs/kimi-cli/questions/kimi-cli-checkpoint-implementation.md) / [Kimi 权衡](./docs/kimi-cli/questions/kimi-cli-checkpoint-no-file-rollback-tradeoffs.md) / [OpenCode 实现](./docs/opencode/questions/opencode-checkpoint-implementation.md) / [SWE-agent 实现](./docs/swe-agent/questions/swe-agent-checkpoint-implementation.md) / [SWE-agent 权衡](./docs/swe-agent/questions/swe-agent-checkpoint-no-file-rollback-tradeoffs.md) / [Cursor 映射分析](./docs/cursor/questions/cursor-checkpoint-official-description-and-state-vscdb-mapping.md) |
 | Subagent / 多代理 | [Codex](./docs/codex/questions/codex-subagent-implementation.md) / [Gemini CLI](./docs/gemini-cli/questions/gemini-cli-subagent-implementation.md) / [Kimi CLI](./docs/kimi-cli/questions/kimi-cli-subagent-implementation.md) / [OpenCode](./docs/opencode/questions/opencode-subagent-implementation.md) / [SWE-agent](./docs/swe-agent/questions/swe-agent-subagent-implementation.md) / [Qwen Code](./docs/qwen-code/questions/qwen-code-subagent-implementation.md) |
-| Why keep reasoning | [Gemini CLI](./docs/gemini-cli/questions/gemini-cli-why-keep-reasoning.md) / [Kimi CLI](./docs/kimi-cli/questions/kimi-cli-why-keep-reasoning.md) / [OpenCode](./docs/opencode/questions/opencode-why-keep-reasoning.md) / [SWE-agent](./docs/swe-agent/questions/swe-agent-why-keep-reasoning.md) / [Claude](./docs/claude/questions/claude-message-context-retention.md) |
+| Why keep reasoning | [Gemini CLI](./docs/gemini-cli/questions/gemini-cli-why-keep-reasoning.md) / [Kimi CLI](./docs/kimi-cli/questions/kimi-cli-why-keep-reasoning.md) / [OpenCode](./docs/opencode/questions/opencode-why-keep-reasoning.md) / [SWE-agent](./docs/swe-agent/questions/swe-agent-why-keep-reasoning.md) / [Claude](docs/claude-code/questions/claude-message-context-retention.md) |
 | ACP 协议实现 | [跨项目 ACP 对比](./docs/comm/13-comm-acp-integration.md) / [什么是 ACP](./docs/comm/comm-what-is-acp.md) |
 
 ---

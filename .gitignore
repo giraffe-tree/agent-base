@@ -4,6 +4,7 @@ codex/
 opencode/
 SWE-agent/
 qwen-code/
+claude-code
 .DS_Store
 
 !docs/kimi-cli
@@ -12,6 +13,7 @@ qwen-code/
 !docs/opencode
 !docs/SWE-agent
 !docs/qwen-code
+!docs/claude-code
 .claude
 .cursor
 .env
