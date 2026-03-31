@@ -26,7 +26,19 @@
 
 <table>
 <tr>
-<td width="33%">
+<td width="25%">
+
+**🔮 Claude Code** (TypeScript)
+> *适合研究: React TUI 与 AsyncGenerator 模式*
+
+- Ink 终端 React 组件化 UI
+- 统一 `query()` AsyncGenerator 驱动
+- 多层上下文压缩 (MicroCompact/AutoCompact/Collapse)
+
+📄 [概览](./docs/claude-code/01-claude-code-overview.md) · [Agent Loop](./docs/claude-code/04-claude-code-agent-loop.md) · [Memory](./docs/claude-code/07-claude-code-memory-context.md)
+
+</td>
+<td width="25%">
 
 **🦀 Codex** (Rust)
 > *适合研究: 企业级安全机制*
@@ -38,7 +50,7 @@
 📄 [概览](./docs/codex/01-codex-overview.md) · [循环](./docs/codex/04-codex-agent-loop.md) · [MCP](./docs/codex/06-codex-mcp-integration.md)
 
 </td>
-<td width="33%">
+<td width="25%">
 
 **🔷 Gemini CLI** (TypeScript)
 > *适合研究: 内存管理和上下文策略*
@@ -50,7 +62,7 @@
 📄 [概览](./docs/gemini-cli/01-gemini-cli-overview.md) · [循环](./docs/gemini-cli/04-gemini-cli-agent-loop.md) · [内存](./docs/gemini-cli/07-gemini-cli-memory-context.md)
 
 </td>
-<td width="33%">
+<td width="25%">
 
 **🌙 Kimi CLI** (Python)
 > *适合研究: 状态持久化和回滚*
@@ -64,7 +76,7 @@
 </td>
 </tr>
 <tr>
-<td width="33%">
+<td width="25%">
 
 **⚡ OpenCode** (TypeScript)
 > *适合研究: 现代 Web 集成*
@@ -76,7 +88,7 @@
 📄 [概览](./docs/opencode/01-opencode-overview.md) · [循环](./docs/opencode/04-opencode-agent-loop.md) · [MCP](./docs/opencode/06-opencode-mcp-integration.md)
 
 </td>
-<td width="33%">
+<td width="25%">
 
 **🔬 SWE-agent** (Python)
 > *适合研究: 学术研究/自动化修复*
@@ -88,7 +100,7 @@
 📄 [概览](./docs/swe-agent/01-swe-agent-overview.md) · [循环](./docs/swe-agent/04-swe-agent-agent-loop.md) · [Prompt](./docs/swe-agent/11-swe-agent-prompt-organization.md)
 
 </td>
-<td width="33%">
+<td width="25%">
 
 **🎯 Qwen Code** (TypeScript)
 > *适合研究: 工程化架构与循环检测*
@@ -100,25 +112,17 @@
 📄 [概览](./docs/qwen-code/01-qwen-code-overview.md) · [循环](./docs/qwen-code/04-qwen-code-agent-loop.md) · [MCP](./docs/qwen-code/06-qwen-code-mcp-integration.md)
 
 </td>
-</tr>
-<tr>
-<td width="33%">
+<td width="25%">
 
-**🔮 Claude Code** (TypeScript)
-> *适合研究: React TUI 与 AsyncGenerator 模式*
+**📚 快速入口**
+> *不想纠结？从这里开始*
 
-- Ink 终端 React 组件化 UI
-- 统一 `query()` AsyncGenerator 驱动
-- 多层上下文压缩 (MicroCompact/AutoCompact/Collapse)
-- 背景任务与 Session Memory
+- [快速开始指南](./CLAUDE.md)
+- [Agent Loop 对比](./docs/comm/04-comm-agent-loop.md)
+- [MCP 集成对比](./docs/comm/06-comm-mcp-integration.md)
+- [高频问题索引](#高频-questions-专题入口)
 
-📄 [入门](./docs/claude-code/00-claude-code-onboarding.md) · [概览](./docs/claude-code/01-claude-code-overview.md) · [Agent Loop](./docs/claude-code/04-claude-code-agent-loop.md) · [Memory](./docs/claude-code/07-claude-code-memory-context.md)
-
-</td>
-<td width="33%">
-
-</td>
-<td width="33%">
+📄 [总览](./docs/comm/01-comm-overview.md) · [对比](./docs/comm/04-comm-agent-loop.md)
 
 </td>
 </tr>
