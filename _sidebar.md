@@ -20,6 +20,7 @@
   - [技术点文档规范](docs/comm/comm-technical-point-template.md)
   - [技术点审阅指南](docs/comm/comm-technical-point-reviewer.md)
   - **Questions**
+    - [WebSearch 实现对比](docs/comm/questions/comm-websearch-comparison.md)
     - [工具调用错误处理](docs/comm/questions/comm-tool-error-handling.md)
     - [Skill 执行超时](docs/comm/questions/comm-skill-execution-timeout.md)
 
@@ -39,6 +40,7 @@
   - [日志记录机制](docs/claude-code/12-claude-code-logging.md)
   - [ACP 集成](docs/claude-code/13-claude-code-acp-integration.md)
   - **Questions**
+    - [WebSearch 实现](docs/claude-code/questions/claude-websearch-implementation.md)
     - [消息上下文保留](docs/claude-code/questions/claude-message-context-retention.md)
     - [无限循环防护](docs/claude-code/questions/claude-infinite-loop-prevention.md)
     - [工具错误处理](docs/claude-code/questions/claude-tool-error-handling.md)
@@ -66,6 +68,7 @@
   - [ACP 集成](docs/codex/13-codex-acp-integration.md)
   - [无限循环预防](docs/codex/q02-codex-infinite-loop-prevention.md)
   - **Questions**
+    - [WebSearch 实现](docs/codex/questions/codex-websearch-implementation.md)
     - [并发 Tool 调用](docs/codex/questions/codex-tool-call-concurrency.md)
     - [用户编辑冲突回退](docs/codex/questions/codex-revert-user-edit-conflict.md)
     - [工具调用错误处理](docs/codex/questions/codex-tool-error-handling.md)
@@ -91,6 +94,7 @@
   - [ACP 集成](docs/gemini-cli/13-gemini-cli-acp-integration.md)
   - [Skill 执行超时](docs/gemini-cli/q05-gemini-cli-skill-execution-timeout.md)
   - **Questions**
+    - [WebSearch 实现](docs/gemini-cli/questions/gemini-cli-websearch-implementation.md)
     - [并发 Tool 调用](docs/gemini-cli/questions/gemini-cli-tool-call-concurrency.md)
     - [用户编辑冲突回退](docs/gemini-cli/questions/gemini-cli-revert-user-edit-conflict.md)
     - [工具调用错误处理](docs/gemini-cli/questions/gemini-cli-tool-error-handling.md)
@@ -119,6 +123,7 @@
   - [并发 Tool 调用](docs/kimi-cli/q10-kimi-cli-tool-call-concurrency.md)
   - [工具调用错误处理](docs/kimi-cli/q11-kimi-cli-tool-error-handling.md)
   - **Questions**
+    - [WebSearch 实现](docs/kimi-cli/questions/kimi-cli-websearch-implementation.md)
     - [Checkpoint 实现](docs/kimi-cli/questions/kimi-cli-checkpoint-implementation.md)
     - [Checkpoint 无文件回滚权衡](docs/kimi-cli/questions/kimi-cli-checkpoint-no-file-rollback-tradeoffs.md)
     - [用户编辑冲突回退](docs/kimi-cli/questions/kimi-cli-revert-user-edit-conflict.md)
@@ -147,6 +152,7 @@
   - [ACP 集成](docs/opencode/13-opencode-acp-integration.md)
   - [防止 Tool 无限循环](docs/opencode/q03-opencode-infinite-loop-prevention.md)
   - **Questions**
+    - [WebSearch 实现](docs/opencode/questions/opencode-websearch-implementation.md)
     - [并发 Tool 调用](docs/opencode/questions/opencode-tool-call-concurrency.md)
     - [Checkpoint 实现](docs/opencode/questions/opencode-checkpoint-implementation.md)
     - [用户编辑冲突回退](docs/opencode/questions/opencode-revert-user-edit-conflict.md)
@@ -173,6 +179,7 @@
   - [日志记录机制](docs/swe-agent/12-swe-agent-logging.md)
   - [ACP 集成](docs/swe-agent/13-swe-agent-acp-integration.md)
   - **Questions**
+    - [WebSearch 实现](docs/swe-agent/questions/swe-agent-websearch-implementation.md)
     - [并发 Tool 调用](docs/swe-agent/questions/swe-agent-tool-call-concurrency.md)
     - [Checkpoint 实现](docs/swe-agent/questions/swe-agent-checkpoint-implementation.md)
     - [Checkpoint 无文件回滚权衡](docs/swe-agent/questions/swe-agent-checkpoint-no-file-rollback-tradeoffs.md)
@@ -200,6 +207,7 @@
   - [日志记录机制](docs/qwen-code/12-qwen-code-logging.md)
   - [ACP 集成](docs/qwen-code/13-qwen-code-acp-integration.md)
   - **Questions**
+    - [WebSearch 实现](docs/qwen-code/questions/qwen-code-websearch-implementation.md)
     - [工具调用错误处理](docs/qwen-code/questions/qwen-code-tool-error-handling.md)
     - [上下文压缩机制](docs/qwen-code/questions/qwen-code-context-compaction.md)
     - [循环检测机制](docs/qwen-code/questions/qwen-code-loop-detection.md)
